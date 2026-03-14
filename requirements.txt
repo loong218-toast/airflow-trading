@@ -1,0 +1,10 @@
+requests
+pandas
+sqlalchemy
+psycopg2-binary
+numba==0.64.0
+numpy>=1.22,<2.5
+polars>=1.21.0
+adbc-driver-postgresql
+adbc-driver-manager
+psycopg2-binary

@@ -1,0 +1,11 @@
+# Ignore the data lake
+data_lake/
+
+# Ignore Airflow logs
+logs/
+
+# Ignore the Postgres database files (if stored locally)
+postgres_data/
+
+# Ignore environment variables (sensitive info)
+.env
