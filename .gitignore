@@ -9,3 +9,5 @@ postgres_data/
 
 # Ignore environment variables (sensitive info)
 .env
+
+personal_only/
