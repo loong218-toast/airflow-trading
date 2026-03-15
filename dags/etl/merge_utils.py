@@ -215,161 +215,75 @@ def combine_results_to_master(session_dir: str) -> Dict[str, Any]:
       2) Aggregate equity partition streaming and left-join aggregates into master.
       3) Write final master (canonical types).
     """
-    from etl.schema import MASTER_SCHEMA
+    from etl.schema import MASTER_SCHEMA, enforce_schema
 
     session_dir = Path(session_dir)
     results_dir = session_dir / "results"
     master_metrics_path = session_dir / "master_metrics.parquet"
     equity_part_dir = session_dir / "equity_partitioned"
 
+    has_equity_data = (
+        equity_part_dir.exists() and 
+        any(equity_part_dir.rglob("*.parquet"))
+    )
+
+    if not has_equity_data:
+        _LOG.info("Equity dataset skipped or empty. Finalizing master metrics as-is.")
+
     # 1) discover batch master parts and merge streaming (or create empty canonical)
     batch_files = sorted(results_dir.glob("batch_*_master_metrics.parquet")) if results_dir.exists() else []
     nonempty = []
     for p in batch_files:
         try:
-            if p.exists() and pq.ParquetFile(str(p)).metadata.num_rows > 0:
+            # This check detects corruption/truncation
+            meta = pq.ParquetFile(str(p)).metadata
+            if meta.num_rows > 0:
                 nonempty.append(p)
-        except Exception:
-            # If metadata can't be read, still include for attempt
-            nonempty.append(p)
+        except Exception as e:
+            _LOG.error("Skipping corrupted master batch file %s: %s", p.name, e)
 
     master_cols = list(MASTER_SCHEMA.keys())
 
     if nonempty:
-        _LOG.info("combine_results_to_master: merging %d batch masters -> %s", len(nonempty), master_metrics_path.name)
-        try:
-            schema_cols = _gather_parquet_schema_names(nonempty)
-            casts = _master_cast_exprs_for(schema_cols)
-            pl.scan_parquet([str(p) for p in nonempty]).with_columns(casts).select(master_cols).sink_parquet(
-                str(master_metrics_path), compression="snappy"
-            )
-        except Exception as e:
-            _LOG.exception("combine_results_to_master: streaming merge of batch masters FAILED: %s", e)
-            # diagnostics: list schemas for debugging
-            try:
-                schemas = []
-                for p in nonempty:
-                    try:
-                        s = pq.read_schema(str(p))
-                        schemas.append((str(p), list(s.names)))
-                    except Exception as ex:
-                        schemas.append((str(p), f"schema-read-failed: {ex}"))
-                _LOG.error("Master batch file schemas: %s", schemas)
-            except Exception:
-                _LOG.exception("Failed to gather master batch schemas for diagnostics.")
-            raise RuntimeError("Streaming merge of batch masters failed; aborting.") from e
+        _LOG.info("Merging %d batch masters...", len(nonempty))
+        # Use a lazy scan and cast using the schema helper logic
+
+        df_master = pl.scan_parquet([str(p) for p in nonempty]).collect()
+        df_master = enforce_schema(df_master, "master", strict=True)
+        df_master.write_parquet(master_metrics_path)
+
+        _LOG.info("✅ Successfully merged %d batches into master_metrics (Rows: %d)", len(nonempty), df_master.height)
     else:
-        # write an empty canonical master
-        empty_df = pl.DataFrame({k: [] for k in MASTER_SCHEMA.keys()})
-        try:
-            empty_df = empty_df.select([pl.lit(None).cast(dt).alias(k) for k, dt in MASTER_SCHEMA.items()])
-        except Exception:
-            pass
-        empty_df.write_parquet(str(master_metrics_path), compression="snappy")
-        _LOG.info("combine_results_to_master: wrote empty master_metrics.parquet (no batch files).")
+        df_master = pl.DataFrame([], schema=MASTER_SCHEMA)
+        df_master.write_parquet(master_metrics_path)
+
+        _LOG.info("⚠️ No batch data found. Created empty master_metrics.")
+
+    if not has_equity_data:
+        _LOG.info("Equity dataset skipped. Finalizing.")
+        return {"status": "complete_no_equity", "path": str(master_metrics_path)}
 
     # 2) Aggregate equity partition (if exists) and join to master
-    final_master = pl.read_parquet(str(master_metrics_path))
+    valid_equity_paths = []
     if equity_part_dir.exists():
-        try:
-            _LOG.info("combine_results_to_master: aggregating equity partition (streaming).")
-            equity_paths = sorted(Path(equity_part_dir).rglob("*.parquet"))
-            if not equity_paths:
-                _LOG.info("No equity parquet files found under equity_partitioned.")
-            else:
-                # inspect columns present across equity files to decide grouping strategy
-                equity_cols = _gather_parquet_schema_names(equity_paths)
-                has_sl_tp = ("SL" in equity_cols) and ("TP" in equity_cols)
-                # choose grouping keys: prefer full (regime_id, SL, TP, side, era_int) else fallback to (regime_id, side, era_int)
-                preferred_keys = ["regime_id", "SL", "TP", "side", "era_int"]
-                fallback_keys = ["regime_id", "side", "era_int"]
-                group_keys = preferred_keys if has_sl_tp else fallback_keys
 
-                # streaming aggregation
-                q = pl.scan_parquet([str(p) for p in equity_paths])
-                # ensure pnl_pct/equity exist so aggregations don't fail
-                if "pnl_pct" not in equity_cols:
-                    _LOG.warning("pnl_pct missing from equity files; win_pos will be computed as 0.")
-                    q = q.with_columns(pl.lit(0.0).alias("pnl_pct"))
-                if "equity" not in equity_cols and "balance" in equity_cols:
-                    q = q.with_columns(pl.col("balance").alias("equity"))
+        all_equity = sorted(equity_part_dir.rglob("*.parquet"))
+        for p in all_equity:
+            try:
+                # Check for corruption
+                pq.ParquetFile(str(p)).metadata
+                valid_equity_paths.append(p)
+            except Exception as e:
+                _LOG.error("Skipping corrupted equity file %s: %s", p.name, e)
 
-                agg_exprs = [
-                    pl.count().alias("total_pos"),
-                    (pl.col("pnl_pct") > 0).sum().alias("win_pos"),
-                    pl.col("equity").last().alias("balance"),
-                ]
-                equity_agg = q.group_by(group_keys).agg(agg_exprs).collect()
+    has_equity_data = len(valid_equity_paths) > 0
 
-                # join into master: ensure regime_id is always part of the join key
-                master_join_on = ["regime_id", "era_int", "side"]
-                # if equity_agg includes SL/TP and master has SL/TP, join on those also
-                if has_sl_tp and set(["SL", "TP"]).issubset(set(final_master.columns)):
-                    master_join_on = ["regime_id", "SL", "TP", "side", "era_int"]
-                    # ensure equity_agg has the same order/names
-                else:
-                    # fallback: equity_agg aggregated without SL/TP -> collapse aggregates per regime/side/era
-                    # To avoid duplicate columns and mismatch, drop SL/TP from equity_agg if present
-                    for c in ("SL", "TP"):
-                        if c in equity_agg.columns:
-                            equity_agg = equity_agg.drop(c)
+    if not has_equity_data:
+        _LOG.info("No valid equity data found (skipped or corrupted). Finalizing.")
+        return {"status": "complete_no_equity", "path": str(master_metrics_path), "rows": df_master.height}
 
-                # drop existing aggregate cols on master (to replace with aggregated results)
-                for c in ("total_pos", "win_pos", "balance"):
-                    if c in final_master.columns:
-                        final_master = final_master.drop(c)
-
-                joined = final_master.join(equity_agg, on=master_join_on, how="left")
-
-                # fill missing aggregate values and cast to canonical master types
-                # create expressions for casting and fill defaults
-                from etl.schema import MASTER_SCHEMA
-                cast_exprs = []
-                for k, dt in MASTER_SCHEMA.items():
-                    if k in joined.columns:
-                        # ensure aggregate columns filled with defaults
-                        if k == "total_pos" or k == "win_pos":
-                            cast_exprs.append(pl.col(k).fill_null(0).cast(dt).alias(k))
-                        elif k == "balance" or k == "max_drawdown":
-                            cast_exprs.append(pl.col(k).fill_null(pl.lit(float("nan"))).cast(dt).alias(k))
-                        else:
-                            cast_exprs.append(pl.col(k).cast(dt).alias(k))
-                    else:
-                        # inject nulls if missing
-                        cast_exprs.append(pl.lit(None).cast(dt).alias(k))
-
-                final_master = joined.with_columns(cast_exprs).select(list(MASTER_SCHEMA.keys()))
-        except Exception as e:
-            _LOG.exception("combine_results_to_master: equity aggregation/join FAILED: %s", e)
-            raise RuntimeError("Equity aggregation/join failed (streaming) - aborting.") from e
-
-    # 3) Write final master metrics (overwrite) - canonical types already applied
-    try:
-        final_master.write_parquet(str(master_metrics_path), compression="snappy")
-    except Exception as e:
-        _LOG.exception("combine_results_to_master: failed writing final master: %s", e)
-        raise RuntimeError("Failed to write final master_metrics.parquet") from e
-
-    # counts (best-effort)
-    metrics_rows = 0
-    try:
-        if master_metrics_path.exists():
-            metrics_rows = int(pq.ParquetFile(str(master_metrics_path)).metadata.num_rows)
-    except Exception:
-        metrics_rows = 0
-
-    equity_rows = 0
-    if Path(equity_part_dir).exists():
-        try:
-            q = pl.scan_parquet(f"{equity_part_dir}/**/*.parquet")
-            equity_rows = int(q.select(pl.count()).collect().item())
-        except Exception:
-            equity_rows = 0
-
-    _LOG.info("combine_results_to_master: complete: master_metrics rows=%d, equity_rows=%d", metrics_rows, equity_rows)
     return {
-        "metrics_rows": metrics_rows,
-        "equity_rows": equity_rows,
+        "status": "complete_with_equity",
         "master_metrics_path": str(master_metrics_path),
-        "equity_partition_dir": str(equity_part_dir),
+        "rows": df_master.height
     }

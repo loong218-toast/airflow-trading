@@ -166,19 +166,35 @@ def load_cached(kind: str, months: int, era_label: str, regime_id: str) -> Optio
         return None
 
     try:
-        # read parquet; for worker-level large files you may prefer scan_parquet().collect()
+        # 1. Peek at the file's metadata (very fast)
+        file_schema = pl.read_parquet_schema(str(p))
+        target_schema = get_schema(kind)
+        
+        # 2. Check: Does the file have every column we currently need?
+        required_cols = set(target_schema.keys())
+        existing_cols = set(file_schema.keys())
+        
+        missing_from_file = required_cols - existing_cols
+        
+        if missing_from_file:
+            _LOG.info(
+                "Cache Invalidation for %s: Missing new columns %s. Re-generating...", 
+                p.name, missing_from_file
+            )
+            # Delete so the worker knows it must generate a fresh version
+            p.unlink(missing_ok=True)
+            return None
+
+        # 3. Load if valid
         df = pl.read_parquet(str(p))
+        # Ensure correct dtypes in case of historical float/int shifts
         df = enforce_schema(df, kind, strict=True)
         return df
-    except Exception as exc:
-        _LOG.warning("Failed reading %s cached file %s: %s", kind, p, exc)
-        # best to remove corrupted file so next run can recompute
-        try:
-            p.unlink(missing_ok=True)
-        except Exception as e:
-            _LOG.debug("Failed to remove corrupted cache file %s: %s", p, e)
-        raise
 
+    except Exception as exc:
+        _LOG.warning("Cache read error for %s: %s", p, exc)
+        p.unlink(missing_ok=True)
+        return None
 
 def stage_for_flush(kind: str, months: int, era_label: str, regime_id: str, df_new: pl.DataFrame) -> None:
     """

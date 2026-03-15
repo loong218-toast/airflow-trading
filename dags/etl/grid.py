@@ -58,7 +58,7 @@ from etl.master_io_utils import (
     _flush_master_rows_buffer,
 )
 
-from etl.schema import enforce_schema, get_schema
+from etl.schema import enforce_schema, get_schema, cast_to_schema
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -202,120 +202,6 @@ def _split_period_windows_from_pl(df: pl.DataFrame, months: int,
         cur = end
     return windows
 
-
-class EquityStager:
-    def __init__(self, equity_part_base: Path, batch_id: int, flush_rows: int, partition_by: str,
-                 max_total_rows: int = 200_000, max_partitions: int = 128):
-        self.base = Path(equity_part_base)
-        self.batch_id = batch_id
-        self.flush_rows = int(flush_rows)
-        self.partition_by = partition_by
-        self._staging = {}
-        self._staging_rows = {}
-        self._total_rows = 0
-        self.max_total_rows = int(max_total_rows)
-        self.max_partitions = int(max_partitions)
-
-    def stage(self, part_key: str, df_small: pl.DataFrame):
-        try:
-            df_small = enforce_schema(df_small, "equity")
-        except Exception:
-            logger.debug("EquityStager: enforce_schema failed for partition %s; staging without enforcement", part_key)
-
-        lst = self._staging.get(part_key)
-        if lst is None:
-            lst = []
-            self._staging[part_key] = lst
-            self._staging_rows[part_key] = 0
-        lst.append(df_small)
-        self._staging_rows[part_key] += int(df_small.height)
-        self._total_rows += int(df_small.height)
-
-        if self._staging_rows[part_key] >= self.flush_rows:
-            self.flush(part_key)
-            return
-
-        if self._total_rows >= self.max_total_rows or len(self._staging) > self.max_partitions:
-            self.flush(part_key)
-
-    def flush(self, part_key: str):
-        lst = self._staging.get(part_key)
-        if not lst:
-            self._staging_rows[part_key] = 0
-            return
-        to_write = pl.concat(lst, how='vertical') if len(lst) > 1 else lst[0]
-        try:
-            to_write = enforce_schema(to_write, "equity")
-        except Exception:
-            logger.debug("EquityStager.flush: enforce_schema failed; continuing with original DF")
-        part_dir = self.base / f"{self.partition_by}={part_key}"
-        part_dir.mkdir(parents=True, exist_ok=True)
-        out_file = part_dir / f"batch_{self.batch_id:04d}_{part_key}_{int(time.time()*1000)}.parquet"
-        _atomic_write_parquet(to_write, out_file)
-        removed_rows = self._staging_rows.get(part_key, 0)
-        self._total_rows = max(0, self._total_rows - removed_rows)
-        self._staging[part_key] = []
-        self._staging_rows[part_key] = 0
-        try:
-            gc.collect()
-        except Exception:
-            pass
-
-    def flush_all(self):
-        for k in list(self._staging.keys()):
-            try:
-                self.flush(k)
-            except Exception as e:
-                logger.exception("EquityStager.flush_all: failed for %s: %s", k, e)
-
-
-class NoopStager:
-    """A lightweight noop stager used when equity dataset generation is disabled."""
-    def __init__(self, *args, **kwargs):
-        self.partition_by = ""
-    def stage(self, *args, **kwargs):
-        return None
-    def flush(self, *args, **kwargs):
-        return None
-    def flush_all(self, *args, **kwargs):
-        return None
-
-
-# SL/TP helpers (unchanged)
-def _expand_sl_tp(run_cfg: Dict) -> Tuple[List[float], List[float]]:
-    def _get_vals(key):
-        if f"{key}_values" in run_cfg:
-            return [float(x) for x in run_cfg[f"{key}_values"]]
-        if f"{key}_range" in run_cfg:
-            r = run_cfg[f"{key}_range"]
-            mn = float(r["min"]); mx = float(r["max"]); step = float(r["step"])
-            vals = []
-            v = mn
-            while v <= mx + 1e-9:
-                vals.append(round(float(v), 8))
-                v += step
-            return vals
-        raise ValueError(f"Missing '{key}_range' or '{key}_values' in run_config.")
-    sl_vals = _get_vals("sl")
-    tp_vals = _get_vals("tp")
-    return sl_vals, tp_vals
-
-
-def _prune_by_min_rr(sl_vals: List[float], tp_vals: List[float], min_rr: float) -> List[tuple]:
-    combos = []
-    for s in sl_vals:
-        for t in tp_vals:
-            if t >= (min_rr * s):
-                combos.append((s, t))
-    return combos
-
-
-def _partition_list(items: List, chunk_size: int) -> List[List]:
-    if chunk_size <= 0:
-        return [items]
-    return [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
-
-
 def generate_configs(session_dir: Path) -> List[Path]:
     run_cfg = _load_run_config()
     for key in ("CACHE_USE_STREAMING_MERGE",
@@ -405,6 +291,154 @@ def list_pending_config_paths(session_dir: Path) -> List[str]:
     logger.info("🔍 Checked %d batches: %d still pending.", len(batch_files), len(pending_batches))
     return pending_batches
 
+
+class EquityStager:
+    def __init__(self, equity_part_base: Path, batch_id: int, flush_rows: int, partition_by: str,
+                 max_total_rows: int = 200_000, max_partitions: int = 128):
+        self.base = Path(equity_part_base)
+        self.batch_id = batch_id
+        self.flush_rows = int(flush_rows)
+        self.partition_by = partition_by
+        self._staging = {}
+        self._staging_rows = {}
+        self._total_rows = 0
+        self.max_total_rows = int(max_total_rows)
+        self.max_partitions = int(max_partitions)
+
+    def stage(self, part_key: str, df_small: pl.DataFrame):
+        try:
+            df_small = enforce_schema(df_small, "equity")
+        except Exception:
+            logger.debug("EquityStager: enforce_schema failed for partition %s; staging without enforcement", part_key)
+
+        lst = self._staging.get(part_key)
+        if lst is None:
+            lst = []
+            self._staging[part_key] = lst
+            self._staging_rows[part_key] = 0
+        lst.append(df_small)
+        self._staging_rows[part_key] += int(df_small.height)
+        self._total_rows += int(df_small.height)
+
+        if self._staging_rows[part_key] >= self.flush_rows:
+            self.flush(part_key)
+            return
+
+        if self._total_rows >= self.max_total_rows or len(self._staging) > self.max_partitions:
+            self.flush(part_key)
+
+    def flush(self, part_key: str):
+        lst = self._staging.get(part_key)
+        if not lst:
+            self._staging_rows[part_key] = 0
+            return
+        to_write = pl.concat(lst, how='vertical') if len(lst) > 1 else lst[0]
+        try:
+            to_write = enforce_schema(to_write, "equity")
+        except Exception:
+            logger.debug("EquityStager.flush: enforce_schema failed; continuing with original DF")
+        part_dir = self.base / f"{self.partition_by}={part_key}"
+        part_dir.mkdir(parents=True, exist_ok=True)
+        out_file = part_dir / f"batch_{self.batch_id:04d}_{part_key}_{int(time.time()*1000)}.parquet"
+        _atomic_write_parquet(to_write, out_file)
+        removed_rows = self._staging_rows.get(part_key, 0)
+        self._total_rows = max(0, self._total_rows - removed_rows)
+        self._staging[part_key] = []
+        self._staging_rows[part_key] = 0
+        try:
+            gc.collect()
+        except Exception:
+            pass
+
+    def flush_all(self):
+        for k in list(self._staging.keys()):
+            try:
+                self.flush(k)
+            except Exception as e:
+                logger.exception("EquityStager.flush_all: failed for %s: %s", k, e)
+
+
+class NoopStager:
+    """Truly silent stager that mimics the EquityStager interface."""
+    def __init__(self, *args, **kwargs):
+        self.partition_by = ""
+        self.base = Path("/dev/null") # Safety fallback
+        self._staging = {}
+        self._total_rows = 0
+
+    def stage(self, *args, **kwargs): pass
+    def flush(self, *args, **kwargs): pass
+    def flush_all(self, *args, **kwargs): pass
+
+
+# SL/TP helpers (unchanged)
+def _expand_sl_tp(run_cfg: Dict) -> Tuple[List[float], List[float]]:
+    def _get_vals(key):
+        if f"{key}_values" in run_cfg:
+            return [float(x) for x in run_cfg[f"{key}_values"]]
+        if f"{key}_range" in run_cfg:
+            r = run_cfg[f"{key}_range"]
+            mn = float(r["min"]); mx = float(r["max"]); step = float(r["step"])
+            vals = []
+            v = mn
+            while v <= mx + 1e-9:
+                vals.append(round(float(v), 8))
+                v += step
+            return vals
+        raise ValueError(f"Missing '{key}_range' or '{key}_values' in run_config.")
+    sl_vals = _get_vals("sl")
+    tp_vals = _get_vals("tp")
+    return sl_vals, tp_vals
+
+
+def _prune_by_min_rr(sl_vals: List[float], tp_vals: List[float], min_rr: float) -> List[tuple]:
+    """
+    Return list of (SL, TP) pairs where TP >= min_rr * SL.
+
+    Implementation notes:
+    - Avoids O(n*m) nested Python loops and large boolean matrices by sorting TP once
+      and using np.searchsorted to find the first acceptable TP for each SL.
+    - Filters out non-positive SL/TP values (they cannot satisfy a positive RR).
+    - If min_rr <= 0, returns the Cartesian product (behaves like no pruning).
+    """
+    import numpy as np
+
+    if not sl_vals or not tp_vals:
+        return []
+
+    sl_arr = np.asarray(sl_vals, dtype=np.float32)
+    tp_arr = np.asarray(tp_vals, dtype=np.float32)
+
+    # Fast path: if min_rr <= 0, nothing to prune (return full cartesian product)
+    if float(min_rr) <= 0.0:
+        return [(float(s), float(t)) for s in sl_arr for t in tp_arr]
+
+    # Exclude non-positive values (can't satisfy positive RR)
+    sl_arr = sl_arr[sl_arr > 0.0]
+    tp_arr = tp_arr[tp_arr > 0.0]
+    if sl_arr.size == 0 or tp_arr.size == 0:
+        return []
+
+    # Sort TP once and use searchsorted to find the first TP >= threshold for each SL
+    tp_sorted = np.sort(tp_arr)
+    combos: List[tuple] = []
+    rr = float(min_rr)
+
+    for s in sl_arr:
+        threshold = rr * float(s)
+        pos = int(np.searchsorted(tp_sorted, threshold, side="left"))
+        if pos < tp_sorted.size:
+            # extend with only acceptable TP values (keeps memory usage minimal)
+            # convert to Python floats for downstream compatibility
+            combos.extend([(float(s), float(t)) for t in tp_sorted[pos:]])
+
+    return combos
+
+
+def _partition_list(items: List, chunk_size: int) -> List[List]:
+    if chunk_size <= 0:
+        return [items]
+    return [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
 
 def _to_numpy_ensure(arr_series: pl.Series, dtype):
     try:
@@ -551,27 +585,52 @@ def _get_or_generate_signals(months: int, era_label: str, regime_id: int, regime
     # 3. Final Safety Check & Schema Enforcement
     # We pass strict=True to ensure the cache-flush doesn't save any indicator columns
     df_signals = enforce_schema(df_signals, "signals", strict=True)
+    # --- PURE POLARS LOGGING BLOCK ---
+    if not df_signals.is_empty():
+        # 1. Scalar counts using Polars sum
+        buys = int((df_signals["side"] == 1).sum())
+        sells = int((df_signals["side"] == -1).sum())
+        
+        # 2. Extract bounds and convert to human-readable strings without Pandas
+        # We convert ns (integer) -> Datetime -> String
+        t_min = df_signals["time_ns"].min()
+        t_max = df_signals["time_ns"].max()
+        
+        # We create a Series, cast it, format it, then grab the single value with .item()
+        first_sig = (
+            pl.Series([t_min])
+            .cast(pl.Datetime("ns"))
+            .dt.strftime("%Y-%m-%d")
+            .item()
+        )
+        last_sig = (
+            pl.Series([t_max])
+            .cast(pl.Datetime("ns"))
+            .dt.strftime("%Y-%m-%d")
+            .item()
+        )
+
+        logger.info(
+            "✨ SIGS [Cfg:%s | %s] Total:%d | 🟢B:%d 🔴S:%d | Range: %s to %s",
+            regime_id, era_label, df_signals.height, buys, sells, first_sig, last_sig
+        )
+    else:
+        logger.warning("⚠️ SIGS [Cfg:%s | %s] - EMPTY SIGNAL SET", regime_id, era_label)
     
     # 4. Persistence
     if not df_signals.is_empty():
         stage_for_flush("signals", months, era_label, str(regime_id), df_signals)
 
-    logger.info("SIGS cfg=%s era=%s -> rows=%d", regime_id, era_label, df_signals.height)
     return df_signals
 
 
 # New helper: build and stage equity time-series rows when requested
-def build_and_stage_equity(closed_rets: np.ndarray, closed_entry_idxs: np.ndarray, closed_exit_idxs: np.ndarray, main_close_arr: np.ndarray, main_time_ns_arr: np.ndarray, main_spread_arr: np.ndarray, main_funding_arr: np.ndarray, sl_val: float, tp_val: float, run_cfg: dict, regime_id: int, era_int: int, side_flag: int, stager) -> Tuple[Optional[float], int]:
+def build_and_stage_equity(closed_rets: np.ndarray, closed_entry_idxs: np.ndarray, closed_exit_idxs: np.ndarray, main_close_arr: np.ndarray, main_time_ns_arr: np.ndarray, main_spread_arr: np.ndarray, main_funding_arr: np.ndarray, sl_val: float, tp_val: float, run_cfg: dict, regime_id: int, era_int: int, side_flag: int, stager) -> Tuple[Optional[float], int, float]:
     """
     Build equity time-series (pnl_pct, equity) and stage using stager iff run_cfg['Equity_dataset'] is truthy.
     Returns (final_balance or None, win_pos)
     This helper centralizes equity creation and staging; when Equity_dataset is False it avoids heavy computations.
     """
-    equity_enabled = bool(run_cfg.get("Equity_dataset", True))
-    win_pos = int(np.count_nonzero(closed_rets > 0.0)) if closed_rets.size else 0
-    if not equity_enabled:
-        # Skip heavy calculations; user will get leaner/faster run. final_balance intentionally None.
-        return None, win_pos
 
     # Compute pnl_pct vectorized and compound equity
     pnl_pct_arr, exit_times_ns = compute_pnl_pct_vectorized(
@@ -603,30 +662,25 @@ def build_and_stage_equity(closed_rets: np.ndarray, closed_entry_idxs: np.ndarra
             "regime_id": int(regime_id),
             "era_int": int(era_int),
             "side": int(side_flag),
+            "SL": float(sl_val),
+            "TP": float(tp_val),
             "time_ns": exit_times_ns.astype(np.int64),
             "pnl_pct": pnl_pct_arr.astype(np.float32), 
             "equity": equity_arr.astype(np.float32),  
         }
         
-        # Use the schema from etl.schema
-        equity_df = pl.DataFrame(equity_data, schema=get_schema("equity"))
-        try:
-            # stager will enforce schema; do not duplicate enforcement here
-            stager.stage(str(regime_id) if getattr(stager, "partition_by", "") == "regime_id" else str(era_int), equity_df)
-        except Exception:
-            logger.debug("build_and_stage_equity: staging failed; continuing")
+        equity_df = cast_to_schema(equity_data, "equity")
 
-    if equity_arr.size:
-        last_val = equity_arr[-1]
-        # Check for infinity or NaN before returning to the grid master
-        if np.isfinite(last_val):
-            final_balance = float(last_val)
-        else:
-            final_balance = 0.0 # Or 1e10 if you want to represent "blown up"
-    else:
-        final_balance = None
+        equity_enabled = bool(run_cfg.get("Equity_dataset", True))
+        if equity_enabled:
+            partition_val = str(regime_id) if getattr(stager, "partition_by", "") == "regime_id" else str(era_int)
+            stager.stage(partition_val, equity_df)
 
-    return final_balance, win_pos
+
+    win_pos = int(np.count_nonzero(closed_rets > 0.0)) if closed_rets.size else 0
+    final_balance = float(equity_arr[-1]) if equity_arr.size else 100.0
+
+    return final_balance, win_pos, float(max_dd)
 
 
 def _run_backtest_grid(
@@ -775,7 +829,7 @@ def _run_backtest_grid(
                 closed_exit_idxs = exit_idx[mask_closed].astype(np.int64)
 
                 # Build and stage equity only if enabled in run config; helper returns final balance and win_pos
-                final_balance, win_pos = build_and_stage_equity(
+                final_balance, win_pos, max_dd = build_and_stage_equity(
                     closed_rets=closed_rets,
                     closed_entry_idxs=closed_entry_idxs,
                     closed_exit_idxs=closed_exit_idxs,
@@ -792,13 +846,11 @@ def _run_backtest_grid(
                     stager=stager,
                 )
 
-                # when equity generation is skipped, we can still compute max_dd conservatively as 0
-                max_dd = 0.0
             else:
                 closed_rets = np.array([], dtype=np.float64)
                 closed_entry_idxs = np.array([], dtype=np.int64)
                 closed_exit_idxs = np.array([], dtype=np.int64)
-                final_balance = None
+                final_balance = 100.0
                 win_pos = 0
                 max_dd = 0.0
 
@@ -807,7 +859,7 @@ def _run_backtest_grid(
                 continue
 
             master_row_raw = {
-                "balance": None if final_balance is None else float(final_balance),
+                "balance": float(final_balance),
                 "SL": float(sl_val),
                 "TP": float(tp_val),
                 "win_pos": int(win_pos),
@@ -823,7 +875,7 @@ def _run_backtest_grid(
                 "ma_price_gap_c": None if ma_price_gap_c is None else float(ma_price_gap_c),
                 "ma_reversion": bool(regime_cfg.get("ma_reversion", False)),
                 "entry_lookback_h": int(regime_cfg.get("entry_lookback_h", 0)),
-                "max_drawdown": None if (not isinstance(max_dd, float) or math.isnan(max_dd)) else float(max_dd)
+                "max_drawdown": float(max_dd)
             }
 
             canonical = pl.DataFrame([master_row_raw]).pipe(enforce_schema, "master").to_dicts()[0]
@@ -981,10 +1033,18 @@ def compute_config_and_save(batch_path: str, session_dir: str, compute_backtest:
     partition_by = str(run_cfg.get("EQUITY_PARTITION_BY", "era_int"))
 
     # create either real stager or noop depending on Equity_dataset flag
-    if not bool(run_cfg.get("Equity_dataset", True)):
+    equity_enabled = bool(run_cfg.get("Equity_dataset", True))
+
+    if not equity_enabled:
         stager = NoopStager()
     else:
-        stager = EquityStager(session_dir / "equity_partitioned", batch_id, flush_rows, partition_by)
+        # Only the real stager gets the path and creates the directory
+        stager = EquityStager(
+            equity_part_base=session_dir / "equity_partitioned", 
+            batch_id=batch_id, 
+            flush_rows=flush_rows, 
+            partition_by=partition_by
+        )
 
     processed_count = 0
     skipped_count = 0

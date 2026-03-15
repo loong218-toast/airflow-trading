@@ -59,16 +59,21 @@ def _atomic_write_parquet(df: pl.DataFrame, path: Path):
 # --- Session Logic ---
 
 def is_session_finished(session_dir: Path) -> bool:
-    """Checks for presence of final metrics or summaries."""
-    results_dir = session_dir / "results"
-    if results_dir.exists():
-        # JSON or Parquet markers
-        if any(results_dir.glob("cfg_*_summary.json")): return True
-        if _any_parquet_with_rows_under(results_dir): return True
-
-    equity_dir = session_dir / "equity_partitioned"
-    if equity_dir.exists() and _any_parquet_with_rows_under(equity_dir): return True
+    """
+    Checks if the final consolidation has completed.
+    In the streaming architecture, master_metrics.parquet is the final artifact.
+    """
+    master_path = session_dir / "master_metrics.parquet"
     
+    # If the master file exists and isn't a 0-byte ghost file, we are done.
+    if master_path.exists():
+        try:
+            if pq.ParquetFile(str(master_path)).metadata.num_rows > 0:
+                return True
+        except Exception:
+            # If the file is corrupted or currently being written, don't skip yet
+            return False
+
     return False
 
 def prune_old_sessions(base_root: Optional[str] = None, keep: int = 10) -> Dict[str, Any]:

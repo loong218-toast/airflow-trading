@@ -10,10 +10,13 @@
     "step": 0.2
   },
   "tp_range": {
-    "min": 2.0,
+    "min": 0.0,
     "max": 4.0,
     "step": 0.2
   },
+  "sl_decay_pct": 0.001,
+  "sl_decay_interval": 1,
+  "sl_exit_at_zero": true,
   "exit_windows": [1, 4, 12, 24, 48, 72, 168],
   "entry_lookback_h": [1, 4, 8, 12, 16, 20, 24, 48, 72, 168],
   "ma_timeframe": "1h",

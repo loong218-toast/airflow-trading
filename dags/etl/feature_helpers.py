@@ -211,14 +211,18 @@ def generate_filtered_signals(df_slice: pl.DataFrame, cfg: dict, df_main: Option
 
     # --- THE CRITICAL CHANGE IS HERE ---
     # 2. ULTRA-LEAN CACHE: Attach ONLY regime_id and drop all other indicator bloat
-    df_out = df_out.with_columns(
-        pl.lit(cfg.get("regime_id", 0)).cast(pl.Int32).alias("regime_id")
-    ).select([
-        "idx",
-        "time_ns",
-        "side",
-        "regime_id"
-    ])
+    df_out = df_out.with_columns([
+        pl.lit(cfg.get("regime_id", 0)).cast(pl.Int32).alias("regime_id"),
+        pl.lit(cfg.get("ma_int", 0)).cast(pl.Int32).alias("ma_int"),
+        pl.lit(cfg.get("ma_reversion", False)).cast(pl.Boolean).alias("ma_reversion")
+    ]).select([
+            "idx",
+            "time_ns",
+            "side",
+            "regime_id",
+            "ma_int",
+            "ma_reversion"
+        ])
 
     return enforce_schema(df_out, "signals", strict=True)
 

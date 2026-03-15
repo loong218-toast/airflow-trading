@@ -51,16 +51,20 @@ EQUITY_SCHEMA: Dict[str, pl.DataType] = {
     "regime_id": pl.Int32,
     "era_int": pl.Int64,
     "side": pl.Int8,
+    "SL": pl.Float32,
+    "TP": pl.Float32,
     "time_ns": pl.Int64,
     "pnl_pct": pl.Float32,
     "equity": pl.Float32,
 }
 
-CACHE_CACHE_SIGNAL_SCHEMA: Dict[str, pl.DataType] = {
-    "idx": pl.Int64,          # Pointer to the exact row in df_main
-    "time_ns": pl.Int64,      # Universal timestamp for safety
-    "side": pl.Int8,          # 1 for Buy, -1 for Sell
-    "regime_id": pl.Int32,    # The ONLY foreign key you need to link back to your config
+CACHE_SIGNAL_SCHEMA: Dict[str, pl.DataType] = {
+    "idx": pl.Int64,           # Pointer to the exact row in df_main
+    "time_ns": pl.Int64,       # Universal timestamp for safety
+    "side": pl.Int8,           # 1 for Buy, -1 for Sell
+    "regime_id": pl.Int32,     # Linking ID for the regime
+    "ma_int": pl.Int32,        # Bitmask for active MAs (00, 01, 10, 11 etc.)
+    "ma_reversion": pl.Boolean # Strategy mode: True (Mean Rev), False (Trend)
 }
 
 CACHE_BACKTEST_SCHEMA: Dict[str, pl.DataType] = {
@@ -97,7 +101,7 @@ DF_MAIN_SCHEMA: Dict[str, pl.DataType] = {
 SCHEMA_REGISTRY: Dict[str, Dict[str, pl.DataType]] = {
     "master": MASTER_SCHEMA,
     "equity": EQUITY_SCHEMA,
-    "signals": CACHE_CACHE_SIGNAL_SCHEMA,
+    "signals": CACHE_SIGNAL_SCHEMA,
     "backtest": CACHE_BACKTEST_SCHEMA,
     "df_main": DF_MAIN_SCHEMA,
 }
@@ -140,8 +144,10 @@ def enforce_schema(df: Optional[pl.DataFrame], schema_type: str, strict: bool = 
             
             if curr_dtype in (pl.Int8, pl.Int16, pl.Int32, pl.Int64, pl.Float32, pl.Float64):
                 if target_dtype in (pl.Int8, pl.Int16, pl.Int32, pl.Int64):
-                    # For ints, we must clear NaNs before casting or it crashes
-                    expr = expr.fill_nan(None).fill_null(0)
+                    # Ensure we handle BOTH NaNs and Nulls before casting to Int
+                    if curr_dtype in (pl.Float32, pl.Float64):
+                        expr = expr.fill_nan(None)
+                    expr = expr.fill_null(0).cast(target_dtype)
 
             # Direct cast is the safest way to move from `null` -> `Float32`
             cast_exprs.append(expr.cast(target_dtype).alias(col_name))
@@ -200,21 +206,3 @@ def validate_dataframe(df: pl.DataFrame, schema_type: str) -> List[Tuple[str, Op
             if actual != dtype:
                 mismatches.append((col, dtype, actual))
     return mismatches
-
-# -------------------------
-# Exports
-# -------------------------
-__all__ = [
-    "CLEAN_SCHEMA",
-    "MASTER_SCHEMA",
-    "EQUITY_SCHEMA",
-    "BACKTEST_SCHEMA",
-    "SIGNAL_SCHEMA",
-    "DF_MAIN_SCHEMA",
-    "SCHEMA_REGISTRY",
-    "enforce_schema",
-    "get_schema",
-    "cast_to_master",
-    "cast_to_schema",
-    "validate_dataframe",
-]
