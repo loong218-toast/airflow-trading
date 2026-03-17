@@ -11,6 +11,8 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 from numba import njit, prange
 
+from etl.feature_helpers import get_ma_price_gaps_for_indices
+
 # -------------------------
 # small helpers
 # -------------------------
@@ -147,14 +149,21 @@ def compute_pnl_pct_vectorized(
     if n == 0:
         return np.empty(0, dtype=np.float64), np.empty(0, dtype=np.int64)
 
-    # Use views instead of copies where possible
-    entry_prices = entry_prices_arr if entry_prices_arr is not None else main_close_arr[closed_entry_idxs]
-    spreads = spread_arr[closed_entry_idxs] if spread_arr is not None else np.zeros(n, dtype=np.float64)
-    funding_raw = funding_arr[closed_entry_idxs] if funding_arr is not None else np.zeros(n, dtype=np.float64)
+    # SCHEMA MATCH: Force float64 promotion for funding and price math
+    # even if input_arr was downcast to float32 in worker prep.
+    entry_prices = (entry_prices_arr if entry_prices_arr is not None 
+                    else main_close_arr[closed_entry_idxs]).astype(np.float64)
+    
+    spreads = (spread_arr[closed_entry_idxs] if spread_arr is not None 
+               else np.zeros(n, dtype=np.float64)).astype(np.float64)
+    
+    # Ensure tiny funding rates are treated as float64
+    funding_raw = (funding_arr[closed_entry_idxs] if funding_arr is not None 
+                   else np.zeros(n, dtype=np.float64)).astype(np.float64)
     
     # Single Numba call - all heavy lifting moved inside
     pnl_pct = _numba_pnl_kernel_optimized(
-        closed_masked_rets, 
+        closed_masked_rets.astype(np.float64), # Precision promotion, 
         entry_prices, 
         spreads, 
         funding_raw,
@@ -464,7 +473,7 @@ def precompute_kernel_arrays(df_main, side_df, exit_window_h: int, base_minutes:
 
     steps = max(1, int((exit_window_h * 60) / base_minutes))
 
-    entry_idxs = np.searchsorted(main_time_ns, sig_time_ns, side='right')
+    entry_idxs = np.searchsorted(main_time_ns, sig_time_ns, side='left')
     entry_idxs = np.clip(entry_idxs, 0, max(0, main_time_ns.shape[0] - 1)).astype(np.int64)
 
     cl, mi, ma, t_mi, t_ma = _compute_windows_numba(main_close, main_time_ns, entry_idxs, np.int32(steps))

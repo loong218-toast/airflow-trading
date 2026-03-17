@@ -33,6 +33,7 @@ from etl.feature_helpers import (
     normalize_signals_times,
     generate_filtered_signals,
     selected_gap_col_for_ma_int,
+    get_ma_price_gaps_for_indices
 )
 from etl.db import get_engine
 
@@ -91,7 +92,6 @@ DEFAULT_RUN_CONFIG = {
     "PARQUET_FLUSH_ROWS": 50000,
     "EQUITY_PARTITION_BY": "era_int",
     "force_rebuild_cache": False,
-    "cache_lookback_minutes": None,
     "CACHE_USE_STREAMING_MERGE": True,
     "CACHE_FLUSH_ROWS": 50000,
     "CACHE_MAX_INMEM_ROWS": 20000,
@@ -106,36 +106,6 @@ def heartbeat_log(tag: str, extra: dict | None = None):
     cpu = psutil.cpu_percent(interval=None)
     extra = extra or {}
     logger.info(f"💓 {tag} | cpu={cpu:.1f}% mem={mem//1024//1024}MB {extra}")
-
-
-def _load_run_config() -> Dict:
-    raw = None
-    try:
-        from airflow.sdk import Variable
-        raw = Variable.get("run_config", default=None)
-    except Exception:
-        pass
-    if not raw:
-        f = Path("/opt/airflow/airflow-trading/run_config.json")
-        if f.exists():
-            raw = f.read_text(encoding="utf8")
-    user_cfg = json.loads(raw) if raw else {}
-    merged = DEFAULT_RUN_CONFIG.copy()
-    if isinstance(user_cfg, dict):
-        merged.update(user_cfg)
-    if "sl" not in merged and "sl_range" in merged:
-        merged["sl"] = None
-    if "tp" not in merged and "tp_range" in merged:
-        merged["tp"] = None
-    return merged
-
-
-def log_mem(label: str):
-    process = psutil.Process(os.getpid())
-    mem_mb = process.memory_info().rss / (1024 * 1024)
-    sys_mem = psutil.virtual_memory().percent
-    print(f"DEBUG_MEM | {sys_mem}% Sys | {mem_mb:.2f} MB Proc | {label}", flush=True)
-
 
 def _split_period_windows_from_pl(df: pl.DataFrame, months: int,
                                   min_dt: Optional[datetime.datetime] = None,
@@ -202,47 +172,70 @@ def _split_period_windows_from_pl(df: pl.DataFrame, months: int,
         cur = end
     return windows
 
-def generate_configs(session_dir: Path) -> List[Path]:
-    run_cfg = _load_run_config()
-    for key in ("CACHE_USE_STREAMING_MERGE",
-                "CACHE_FLUSH_ROWS",
-                "CACHE_MAX_INMEM_ROWS",
-                "CACHE_TMP_DIR",
-                "CACHE_MERGE_CHUNK_SIZE",
-                "DATA_LAKE_ROOT"):
-        if key in run_cfg and run_cfg.get(key) is not None:
-            os.environ[key] = str(run_cfg.get(key))
-
+def generate_configs(session_dir: Path, run_cfg: dict) -> List[Path]:
     cfg_dir = session_dir / "configs"
     cfg_dir.mkdir(parents=True, exist_ok=True)
     exit_windows = run_cfg.get("exit_windows", [24])
     lookbacks = run_cfg.get("entry_lookback_h", [24])
+    
     sl_vals, tp_vals = _expand_sl_tp(run_cfg)
     combos = _prune_by_min_rr(sl_vals, tp_vals, float(run_cfg.get("min_rr", 3.0)))
+
     ma_periods = run_cfg.get("ma_periods", []) or []
     if not isinstance(ma_periods, list):
-        ma_periods = list(ma_periods) if ma_periods else []
-    n_bits = max(1, len(ma_periods))
-    max_ma_int = (1 << n_bits)
+        ma_periods = list(ma_periods)
+    # Sort to ensure ma_a = smallest, ma_b = next smallest
+    ma_periods_sorted = sorted({int(x) for x in ma_periods})
+    n_bits = len(ma_periods_sorted)
+    max_ma_int = (1 << n_bits) if n_bits > 0 else 1 # range(0, 1) if no MAs
+
+    stoch_ks = run_cfg.get("stoch_k", [12])
+    stoch_thresholds = run_cfg.get("stoch_thresholds", [[20, 80]])
+    use_stoch_list = run_cfg.get("use_stochastic", [False, True])
+
     all_regime_configs = []
     idx = 0
     ma_reversion_list = run_cfg.get("ma_reversion", [False, True])
+    use_stoch_list = run_cfg.get("use_stochastic", [False, True])
     for ma_rev in ma_reversion_list:
         for ma_int in range(0, max_ma_int):
-            for use_stoch in [False, True]:
-                for lb_h in lookbacks:
-                    for exit_h in exit_windows:
-                        regime = {
-                            "regime_id": f"{idx:05d}",
-                            "ma_int": ma_int,
-                            "ma_reversion": ma_rev,
-                            "use_stochastic": use_stoch,
-                            "use_entry_lookback": bool(lb_h > 0),
-                            "entry_lookback_h": int(lb_h),
-                            "exit_window_h": int(exit_h),
-                        }
-                        all_regime_configs.append(regime)
-                        idx += 1
+            for use_stoch in use_stoch_list:
+
+                stoch_branches = []
+                if not use_stoch:
+                    stoch_branches.append({
+                        "stoch_key": "OFF",
+                        "col": None, "low": None, "high": None
+                    })
+                else:
+                    for k in stoch_ks:
+                        for t in stoch_thresholds:
+                            key = f"k{k}_l{t[0]}_u{t[1]}"
+                            stoch_branches.append({
+                                "stoch_key": key,
+                                "col": f"stoch_k{k}_d3_s3", 
+                                "low": float(t[0]),
+                                "high": float(t[1])
+                            })
+
+                for branch in stoch_branches:
+                    for lb_h in lookbacks:
+                        for exit_h in exit_windows:
+                            regime = {
+                                "regime_id": f"{idx:05d}",
+                                "ma_int": ma_int,
+                                "ma_reversion": ma_rev,
+                                "use_stochastic": use_stoch,
+                                "stoch_key": branch["stoch_key"],
+                                "stoch_col": branch["col"],
+                                "stoch_lower": branch["low"],
+                                "stoch_upper": branch["high"],
+                                "entry_lookback_h": int(lb_h),
+                                "exit_window_h": int(exit_h),
+                                "ma_periods": ma_periods_sorted
+                            }
+                            all_regime_configs.append(regime)
+                            idx += 1
 
     total_regimes = len(all_regime_configs)
     batch_size = int(run_cfg.get("BATCH_SIZE", 150))
@@ -266,17 +259,29 @@ def generate_configs(session_dir: Path) -> List[Path]:
             logger.info("📝 Written %d batch files...", len(saved_batch_paths))
     return saved_batch_paths
 
-
 def list_pending_config_paths(session_dir: Path) -> List[str]:
     cfg_dir = session_dir / "configs"
     results_dir = session_dir / "results"
     batch_files = sorted(cfg_dir.glob("batch_*.json"))
     pending_batches = []
+
+    sample_logged = False
+
     for batch_path in batch_files:
         try:
             with open(batch_path, "r", encoding="utf8") as f:
                 batch_data = json.load(f)
+
             regimes = batch_data.get("regimes", [])
+
+            if not sample_logged and regimes:
+                sample_r = regimes[0]
+                logger.info("🛠️ SAMPLE REGIME FROM BATCH %s:", batch_path.name)
+                logger.info("   > Lookback: %s", sample_r.get("entry_lookback_h"))
+                logger.info("   > MA Int: %s | MA Periods: %s", sample_r.get("ma_int"), sample_r.get("ma_periods"))
+                logger.info("   > Stoch: %s | MA Rev: %s", sample_r.get("use_stochastic"), sample_r.get("ma_reversion"))
+                sample_logged = True
+
             is_batch_complete = True
             for r in regimes:
                 regime_id = r.get("regime_id")
@@ -290,7 +295,6 @@ def list_pending_config_paths(session_dir: Path) -> List[str]:
             pending_batches.append(str(batch_path))
     logger.info("🔍 Checked %d batches: %d still pending.", len(batch_files), len(pending_batches))
     return pending_batches
-
 
 class EquityStager:
     def __init__(self, equity_part_base: Path, batch_id: int, flush_rows: int, partition_by: str,
@@ -357,7 +361,6 @@ class EquityStager:
             except Exception as e:
                 logger.exception("EquityStager.flush_all: failed for %s: %s", k, e)
 
-
 class NoopStager:
     """Truly silent stager that mimics the EquityStager interface."""
     def __init__(self, *args, **kwargs):
@@ -369,7 +372,6 @@ class NoopStager:
     def stage(self, *args, **kwargs): pass
     def flush(self, *args, **kwargs): pass
     def flush_all(self, *args, **kwargs): pass
-
 
 # SL/TP helpers (unchanged)
 def _expand_sl_tp(run_cfg: Dict) -> Tuple[List[float], List[float]]:
@@ -389,7 +391,6 @@ def _expand_sl_tp(run_cfg: Dict) -> Tuple[List[float], List[float]]:
     sl_vals = _get_vals("sl")
     tp_vals = _get_vals("tp")
     return sl_vals, tp_vals
-
 
 def _prune_by_min_rr(sl_vals: List[float], tp_vals: List[float], min_rr: float) -> List[tuple]:
     """
@@ -434,7 +435,6 @@ def _prune_by_min_rr(sl_vals: List[float], tp_vals: List[float], min_rr: float) 
 
     return combos
 
-
 def _partition_list(items: List, chunk_size: int) -> List[List]:
     if chunk_size <= 0:
         return [items]
@@ -452,7 +452,6 @@ def _to_numpy_ensure(arr_series: pl.Series, dtype):
             return a.astype(dtype, copy=True)
     return a
 
-
 def prepare_worker_data(session_dir: Path, run_cfg: dict):
     base_file = Path(FULL_LAKE_DIR) / "base_data_full.parquet"
     if not base_file.exists():
@@ -461,6 +460,8 @@ def prepare_worker_data(session_dir: Path, run_cfg: dict):
     # Read once (collect) then normalize
     logger.debug("prepare_worker_data: reading base file %s", str(base_file))
     df_main = pl.read_parquet(str(base_file))
+
+    df_main = df_main.sort("time")
 
     # Normalize core columns and types
     norm_exprs = []
@@ -475,14 +476,18 @@ def prepare_worker_data(session_dir: Path, run_cfg: dict):
         norm_exprs.append(pl.col("close").cast(pl.Float32).alias("close"))
     else:
         raise RuntimeError("df_main missing required 'close' column")
-    norm_exprs.append(pl.col("spread").fill_null(0.0).cast(pl.Float32).alias("spread") if "spread" in df_main.columns else pl.lit(0.0).cast(pl.Float32).alias("spread"))
-    norm_exprs.append(pl.col("funding_rate").fill_null(0.0).cast(pl.Float32).alias("funding_rate") if "funding_rate" in df_main.columns else pl.lit(0.0).cast(pl.Float32).alias("funding_rate"))
+    norm_exprs.append(
+        pl.col("spread").fill_null(0.0).cast(pl.Float32).alias("spread")
+        if "spread" in df_main.columns
+        else pl.lit(0.0).cast(pl.Float32).alias("spread")
+    )
+    norm_exprs.append(
+        pl.col("funding_rate").fill_null(0.0).cast(pl.Float32).alias("funding_rate")
+        if "funding_rate" in df_main.columns
+        else pl.lit(0.0).cast(pl.Float32).alias("funding_rate")
+    )
 
     df_main = df_main.with_columns(norm_exprs).with_row_count("idx").with_columns(pl.col("idx").cast(pl.Int64))
-
-    # Precompute features (safe, ordered)
-    df_main = precompute_all_possible_features(df_main, run_cfg)
-    logger.debug("prepare_worker_data: after precompute cols=%s", df_main.columns)
 
     # Downcast any Float64 to Float32
     float64_cols = [c for c, dt in df_main.schema.items() if dt == pl.Float64]
@@ -490,142 +495,203 @@ def prepare_worker_data(session_dir: Path, run_cfg: dict):
         df_main = df_main.with_columns([pl.col(c).cast(pl.Float32) for c in float64_cols])
 
     try:
-        df_main = enforce_schema(df_main, "df_main")
-    except Exception:
-        logger.debug("prepare_worker_data: enforce_schema(df_main) failed - continuing")
+        # Keep feature columns: non-strict enforcement (casts base cols but keeps extras)
+        df_main = enforce_schema(df_main, "df_main", strict=False)
+    except Exception as e:
+        logger.error(f"CRITICAL: enforce_schema failed: {e}")
+        raise
 
-    logger.info("prepare_worker_data: df_main rows=%d cols=%d sample_cols=%s", int(df_main.height), len(df_main.columns), df_main.columns[:20])
+    base_cols = set(df_main.columns)
 
+    # --- IMPORTANT: call the single-source precompute function to *add feature cols* ---
+    # precompute_all_possible_features is the canonical place that creates ma_a/ma_b, pct_d_slow, breakout_Xh, etc.
+    # prepare_worker_data should call it so df_main contains the precomputed feature columns.
+    df_main, updated_cfg = precompute_all_possible_features(df_main, run_cfg)
+    run_cfg["lookback_map"] = updated_cfg.get("lookback_map")
+    logger.debug("prepare_worker_data: after precompute cols=%s", df_main.columns)
+
+    # feature columns are anything not in DF_MAIN base set
+    feature_cols = [c for c in df_main.columns if c not in base_cols]
+
+    # Ensure numeric columns are Float32 to save memory
+    df_main = df_main.with_columns(
+        [pl.col(c).cast(pl.Float32) for c in df_main.columns if df_main.schema[c] in (pl.Float64, pl.Float32)]
+    )
+
+    logger.info(
+        "prepare_worker_data: df_main rows=%d cols=%d sample_cols=%s",
+        int(df_main.height),
+        len(df_main.columns),
+        df_main.columns[:20],
+    )
+
+    # ---------------------
+    # Load lookback_map (HOURS) — MUST be produced by precompute step (no worker computation)
+    #   - Try run_cfg["lookback_map"], then session_dir/lookback_map.json.
+    #   - If missing, fail loudly and instruct operator to run precompute stage.
+    # ---------------------
+    lookback_map = None
+    if "lookback_map" in run_cfg and isinstance(run_cfg["lookback_map"], dict) and run_cfg["lookback_map"]:
+        lookback_map = dict(run_cfg["lookback_map"])
+    else:
+        lb_file = Path(session_dir) / "lookback_map.json"
+        if lb_file.exists():
+            try:
+                lookback_map = json.loads(lb_file.read_text(encoding="utf8"))
+            except Exception as e:
+                logger.exception("Failed to read lookback_map from %s: %s", lb_file, e)
+                lookback_map = None
+
+    if not isinstance(lookback_map, dict) or not lookback_map:
+        # fail loudly: precompute must produce lookback_map
+        raise RuntimeError(
+            "Missing required lookback_map (era_label -> hours). "
+            "This must be produced by your precompute step (the single source of truth) and placed into run_cfg['lookback_map'] "
+            "or saved as session_dir/lookback_map.json. Worker will not compute defaults."
+        )
+
+    # Normalize and validate lookback_map values (hours)
+    normalized_lb_map: Dict[str, int] = {}
+    for k, v in lookback_map.items():
+        try:
+            vh = int(v)
+        except Exception:
+            raise RuntimeError(f"Invalid lookback_map value for '{k}': must be integer hours, got {v!r}")
+        if vh < 0:
+            raise RuntimeError(f"Invalid lookback_map value for '{k}': hours must be non-negative, got {vh}")
+        normalized_lb_map[str(k)] = vh
+
+    # return context
     return {
         "df_main": df_main,
+        "feature_cols": feature_cols,
+        "base_cols": base_cols,
+        "lookback_map": normalized_lb_map,  # hours
         "main_close_arr": _to_numpy_ensure(df_main["close"], np.float32),
         "main_time_ns_arr": _to_numpy_ensure(df_main["time_ns"], np.int64),
         "main_spread_arr": _to_numpy_ensure(df_main["spread"], np.float32),
         "main_funding_arr": _to_numpy_ensure(df_main["funding_rate"], np.float32),
     }
 
-
-def _compute_era_gap_stats(df_input_slice: pl.DataFrame, df_main: pl.DataFrame, regime_cfg: dict, era_label: str):
+def _get_or_generate_signals(
+    era_label: str,
+    regime_id: int,
+    regime_cfg: dict,
+    run_cfg: dict,
+    data_ctx: dict,
+    start_idx: int,
+    end_idx: int,
+) -> pl.DataFrame:
     """
-    Returns tuple: (ma_price_gap, ma_price_gap_a, ma_price_gap_b, ma_price_gap_c)
+    Strict signal loader/generator.
+
+    - data_ctx must include 'df_main' and 'feature_cols'.
+    - start_idx/end_idx computed by caller (no lookback calculation here).
+    - Caching behavior is controlled via run_cfg.
+    - Persist canonical signals to cache (strict schema), return annotated df_signals for in-memory use.
     """
-    if df_input_slice is None or df_input_slice.height == 0:
-        logger.debug("ERA %s: input slice empty for gap stats", era_label)
-        return (None, None, None, None)
+    # --- validate required context ---
+    if "df_main" not in data_ctx:
+        raise RuntimeError("data_ctx missing required key: 'df_main' (precomputed from prepare_worker_data)")
+    if "feature_cols" not in data_ctx:
+        raise RuntimeError("data_ctx missing required key: 'feature_cols' (precomputed from prepare_worker_data)")
 
-    ma_int_val = int(regime_cfg.get("ma_int", 0) or 0)
-    sel_gap_col = selected_gap_col_for_ma_int(ma_int_val)
+    df_main: pl.DataFrame = data_ctx["df_main"]
+    feature_cols: list = data_ctx["feature_cols"]
 
-    exprs = []
-    for cname in ("ma_price_gap_a", "ma_price_gap_b", "ma_price_gap_c"):
-        if cname in df_input_slice.columns:
-            exprs.append(pl.col(cname).median().alias(cname))
-        else:
-            exprs.append(pl.lit(None).cast(pl.Float32).alias(cname))
+    # Strict read from run_cfg (no external overrides)
+    months = int(run_cfg["sl_tp_interval_months"])  # intentionally KeyError if absent
+    force_rebuild_cache = bool(run_cfg.get("force_rebuild_cache", False))
 
-    if sel_gap_col in df_input_slice.columns:
-        exprs.append(pl.col(sel_gap_col).median().alias("ma_price_gap_sel"))
-    else:
-        exprs.append(pl.lit(None).cast(pl.Float32).alias("ma_price_gap_sel"))
+    # Validate indices
+    if start_idx is None or end_idx is None:
+        raise ValueError("start_idx and end_idx must be provided (no internal lookback computation allowed).")
+    if end_idx <= start_idx:
+        # empty era window -> return empty canonical signals DF
+        return pl.DataFrame([], schema=get_schema("signals"))
 
-    df_med = df_input_slice.select(exprs)
-    if df_med.height == 0:
-        a = b = c = sel = None
-    else:
-        row = df_med.row(0)
-        a = None if row[0] is None else float(row[0])
-        b = None if row[1] is None else float(row[1])
-        c = None if row[2] is None else float(row[2])
-        sel = None if row[3] is None else float(row[3])
-
-    # Debug counts/samples for investigation
-    try:
-        counts = {}
-        samples = {}
-        cols_to_check = [c for c in ("ma_price_gap_a", "ma_price_gap_b", "ma_price_gap_c") if c in df_input_slice.columns] + ([sel_gap_col] if sel_gap_col in df_input_slice.columns else [])
-        for col in cols_to_check:
-            non_null_count = int(df_input_slice.select(pl.col(col).drop_nulls().count()).row(0)[0])
-            counts[col] = non_null_count
-            samples[col] = None
-            if non_null_count > 0:
-                samples[col] = df_input_slice.filter(pl.col(col).is_not_null()).select(pl.col(col)).row(0)[0]
-        logger.debug("ERA %s gap counts: %s sample_first: %s", era_label, counts, samples)
-    except Exception:
-        logger.debug("ERA %s: gap debug info failed", era_label)
-
-    return (sel, a, b, c)
-
-
-def _get_or_generate_signals(months: int, era_label: str, regime_id: int, regime_cfg: dict, run_cfg: dict, df_input_slice: pl.DataFrame, df_main: pl.DataFrame, base_minutes: int, force_rebuild_cache: bool):
-    """
-    Returns canonical signals DF (or empty DF with schema).
-    Now optimized to lean on the helper's internal normalization.
-    """
-    df_signals = None
-    
-    # 1. Attempt Cache Load
+    # 1) attempt to load canonical cached signals (strict schema)
+    df_signals_cached = None
     if not force_rebuild_cache:
         try:
-            df_signals = load_signals_cached(months, era_label, str(regime_id))
+            df_signals_cached = load_signals_cached(months, era_label, str(regime_id))
         except Exception as e:
-            logger.debug("signals cache read failed for cfg=%s era=%s: %s", regime_id, era_label, e)
-            df_signals = None
+            logger.debug("signals cache read failed (will regenerate) cfg=%s era=%s: %s", regime_id, era_label, e)
+            df_signals_cached = None
 
-    # 2. Re-Normalize if Loaded OR Generate if Missing
-    if df_signals is not None and not df_signals.is_empty():
-        # Even cached signals need re-alignment to the current df_main (idxs might change if data history grew)
-        df_signals = normalize_signals_times(df_signals, df_main=df_main)
-    else:
-        if df_input_slice is None or df_input_slice.height == 0:
-            return pl.DataFrame([], schema=get_schema("signals"))
-        
-        # This helper already calls normalize_signals_times and handles the idx/time_ns logic
-        df_signals = generate_filtered_signals(df_input_slice, {**run_cfg, **regime_cfg, "regime_id": regime_id}, df_main=df_main)
+    # 2) if cached -> normalize, annotate with feature cols, and return
+    if df_signals_cached is not None and not df_signals_cached.is_empty():
+        df_signals_cached = normalize_signals_times(df_signals_cached, df_main=df_main)
+        if feature_cols:
+            # join feature columns for in-memory downstream work
+            df_signals_cached = df_signals_cached.join(df_main.select(["idx"] + feature_cols), on="idx", how="left")
+        return enforce_schema(df_signals_cached, "signals", strict=False)
 
-    # 3. Final Safety Check & Schema Enforcement
-    # We pass strict=True to ensure the cache-flush doesn't save any indicator columns
-    df_signals = enforce_schema(df_signals, "signals", strict=True)
-    # --- PURE POLARS LOGGING BLOCK ---
+    # 3) generate signals from df slice (strict: caller provided indices)
+    slice_len = max(0, end_idx - start_idx)
+    if slice_len == 0:
+        return pl.DataFrame([], schema=get_schema("signals"))
+
+    df_input_slice = df_main.slice(start_idx, slice_len)
+    if df_input_slice is None or df_input_slice.height == 0:
+        return pl.DataFrame([], schema=get_schema("signals"))
+
+    try:
+        #df_signals = generate_filtered_signals(df_input_slice, {**run_cfg, **regime_cfg, "regime_id": regime_id}, df_main=df_main)
+    except Exception as e:
+        # generation failure is critical — raise so caller can decide
+        raise RuntimeError(f"generate_filtered_signals failed for regime={regime_id} era={era_label}: {e}") from e
+
+    # annotate signals with precomputed feature columns for in-memory use
+    if not df_signals.is_empty() and feature_cols:
+        df_signals = df_signals.join(df_main.select(["idx"] + feature_cols), on="idx", how="left")
+
+    # Build canonical cache DF (strict schema) and stage it (so caches remain small)
     if not df_signals.is_empty():
-        # 1. Scalar counts using Polars sum
-        buys = int((df_signals["side"] == 1).sum())
-        sells = int((df_signals["side"] == -1).sum())
-        
-        # 2. Extract bounds and convert to human-readable strings without Pandas
-        # We convert ns (integer) -> Datetime -> String
-        t_min = df_signals["time_ns"].min()
-        t_max = df_signals["time_ns"].max()
-        
-        # We create a Series, cast it, format it, then grab the single value with .item()
-        first_sig = (
-            pl.Series([t_min])
-            .cast(pl.Datetime("ns"))
-            .dt.strftime("%Y-%m-%d")
-            .item()
-        )
-        last_sig = (
-            pl.Series([t_max])
-            .cast(pl.Datetime("ns"))
-            .dt.strftime("%Y-%m-%d")
-            .item()
-        )
+        try:
+            signals_for_cache = df_signals.select(["idx", "time_ns", "side", "regime_id"])
+        except Exception:
+            # fallback: enforce canonical schema via explicit construction
+            signals_for_cache = df_signals.with_columns(
+                [
+                    pl.col("idx").cast(pl.Int64),
+                    pl.col("time_ns").cast(pl.Int64),
+                    pl.col("side").cast(pl.Int8),
+                    pl.col("regime_id").cast(pl.Int32),
+                ]
+            ).select(["idx", "time_ns", "side", "regime_id"])
 
-        logger.info(
-            "✨ SIGS [Cfg:%s | %s] Total:%d | 🟢B:%d 🔴S:%d | Range: %s to %s",
-            regime_id, era_label, df_signals.height, buys, sells, first_sig, last_sig
-        )
-    else:
-        logger.warning("⚠️ SIGS [Cfg:%s | %s] - EMPTY SIGNAL SET", regime_id, era_label)
-    
-    # 4. Persistence
-    if not df_signals.is_empty():
-        stage_for_flush("signals", months, era_label, str(regime_id), df_signals)
+        signals_for_cache = enforce_schema(signals_for_cache, "signals", strict=True)
 
-    return df_signals
+        try:
+            stage_for_flush("signals", months, era_label, str(regime_id), signals_for_cache)
+        except Exception as e:
+            logger.debug("stage_for_flush(signals) failed: %s", e)
 
+    # Return annotated DF for downstream (non-strict so features persist in-memory)
+    return enforce_schema(df_signals, "signals", strict=False) if not df_signals.is_empty() else pl.DataFrame([], schema=get_schema("signals"))
 
 # New helper: build and stage equity time-series rows when requested
-def build_and_stage_equity(closed_rets: np.ndarray, closed_entry_idxs: np.ndarray, closed_exit_idxs: np.ndarray, main_close_arr: np.ndarray, main_time_ns_arr: np.ndarray, main_spread_arr: np.ndarray, main_funding_arr: np.ndarray, sl_val: float, tp_val: float, run_cfg: dict, regime_id: int, era_int: int, side_flag: int, stager) -> Tuple[Optional[float], int, float]:
+def build_and_stage_equity(
+    closed_rets: np.ndarray,
+    closed_entry_idxs: np.ndarray,
+    closed_exit_idxs: np.ndarray,
+    main_close_arr: np.ndarray,
+    main_time_ns_arr: np.ndarray,
+    main_spread_arr: np.ndarray,
+    main_funding_arr: np.ndarray,
+    sl_val: float,
+    tp_val: float,
+    run_cfg: dict,
+    regime_id: int,
+    era_int: int,
+    side_flag: int,
+    stager,
+    ma_p_gap_a_entry: Optional[np.ndarray] = None,
+    ma_p_gap_b_entry: Optional[np.ndarray] = None,
+    ma_p_gap_a_exit: Optional[np.ndarray] = None,
+    ma_p_gap_b_exit: Optional[np.ndarray] = None,
+) -> Tuple[Optional[float], int, float]:
     """
     Build equity time-series (pnl_pct, equity) and stage using stager iff run_cfg['Equity_dataset'] is truthy.
     Returns (final_balance or None, win_pos)
@@ -658,6 +724,27 @@ def build_and_stage_equity(closed_rets: np.ndarray, closed_entry_idxs: np.ndarra
 
     # Create the lean DataFrame and stage
     if equity_arr.size:
+
+        # Prepare gap arrays (convert to float32 and ensure proper length)
+        def _prepare_gap(arr):
+            if arr is None or arr.size == 0:
+                return np.full(equity_arr.shape[0], np.nan, dtype=np.float32)
+            # ensure float32 and same length
+            a = np.asarray(arr, dtype=np.float32)
+            if a.shape[0] != equity_arr.shape[0]:
+                # Defensive: truncate or pad with nan
+                if a.shape[0] > equity_arr.shape[0]:
+                    a = a[:equity_arr.shape[0]]
+                else:
+                    pad = np.full(equity_arr.shape[0] - a.shape[0], np.nan, dtype=np.float32)
+                    a = np.concatenate([a, pad])
+            return a
+
+        gap_a_entry = _prepare_gap(ma_p_gap_a_entry)
+        gap_b_entry = _prepare_gap(ma_p_gap_b_entry)
+        gap_a_exit  = _prepare_gap(ma_p_gap_a_exit)
+        gap_b_exit  = _prepare_gap(ma_p_gap_b_exit)
+
         equity_data = {
             "regime_id": int(regime_id),
             "era_int": int(era_int),
@@ -667,6 +754,10 @@ def build_and_stage_equity(closed_rets: np.ndarray, closed_entry_idxs: np.ndarra
             "time_ns": exit_times_ns.astype(np.int64),
             "pnl_pct": pnl_pct_arr.astype(np.float32), 
             "equity": equity_arr.astype(np.float32),  
+            "ma_p_gap_a_entry": gap_a_entry,
+            "ma_p_gap_b_entry": gap_b_entry,
+            "ma_p_gap_a_exit":  gap_a_exit,
+            "ma_p_gap_b_exit":  gap_b_exit
         }
         
         equity_df = cast_to_schema(equity_data, "equity")
@@ -682,36 +773,35 @@ def build_and_stage_equity(closed_rets: np.ndarray, closed_entry_idxs: np.ndarra
 
     return final_balance, win_pos, float(max_dd)
 
-
 def _run_backtest_grid(
     regime_id: int,
     regime_cfg: dict,
     run_cfg: dict,
-    df_main: pl.DataFrame,
-    main_close_arr: np.ndarray,
-    main_time_ns_arr: np.ndarray,
-    main_spread_arr: np.ndarray,
-    main_funding_arr: np.ndarray,
+    data_ctx: dict,
     df_signals: pl.DataFrame,
     months: int,
     era_label: str,
     era_int: int,
-    ma_price_gap_vals: Tuple[Optional[float], Optional[float], Optional[float], Optional[float]],
     results_dir: Path,
     batch_id: int,
     stager,
-    base_minutes: int,
     max_dd_threshold: float,
-    force_rebuild_cache: bool,
     combos: List[Tuple[float, float]],
 ):
-    (ma_price_gap, ma_price_gap_a, ma_price_gap_b, ma_price_gap_c) = ma_price_gap_vals
+
+    months = int(run_cfg["sl_tp_interval_months"])
+
+    df_main = data_ctx["df_main"]
+    main_close_arr = data_ctx["main_close_arr"]
+    main_time_ns_arr = data_ctx["main_time_ns_arr"]
+    main_spread_arr = data_ctx["main_spread_arr"]
+    main_funding_arr = data_ctx["main_funding_arr"]
 
     buys = df_signals.filter(pl.col("side") == 1) if (df_signals is not None and not df_signals.is_empty()) else pl.DataFrame([], schema=get_schema("signals"))
     sells = df_signals.filter(pl.col("side") == -1) if (df_signals is not None and not df_signals.is_empty()) else pl.DataFrame([], schema=get_schema("signals"))
 
     bucket_df = None
-    if not force_rebuild_cache:
+    if not bool(run_cfg.get("force_rebuild_cache", False)):
         try:
             bucket_df = load_backtest_cached(months, era_label, str(regime_id))
             if bucket_df is not None:
@@ -719,6 +809,11 @@ def _run_backtest_grid(
         except Exception as e:
             logger.debug("load_backtest_cached failed for cfg=%s era=%s: %s", regime_id, era_label, e)
             bucket_df = None
+
+    logger.info(f"DEBUG: era={era_label} regime={regime_id} total_signals={df_signals.height}")
+    if not df_signals.is_empty():
+        logger.info(f"DEBUG: unique_sides={df_signals['side'].unique().to_list()}")
+        logger.info(f"DEBUG: signal_sample={df_signals.head(2).to_dicts()}")
 
     for sl_val, tp_val in combos:
         for side_df_pl, side_flag in ((buys, 1), (sells, -1)):
@@ -734,14 +829,12 @@ def _run_backtest_grid(
                     "side": int(side_flag),
                     "ma_int": int(regime_cfg.get("ma_int", 0)),
                     "ma_reversion": bool(regime_cfg.get("ma_reversion", False)),
+                    "use_stochastic": bool(regime_cfg.get("use_stochastic", False)),
+                    "stoch_key": str(regime_cfg.get("stoch_key", "OFF")),
                     "entry_lookback_h": int(regime_cfg.get("entry_lookback_h", 0)),
                     "exit_window_h": int(regime_cfg.get("exit_window_h", 0)),
                     "SL": float(sl_val),
                     "TP": float(tp_val),
-                    "ma_price_gap": ma_price_gap, # Let enforce_schema handle None/Float32
-                    "ma_price_gap_a": ma_price_gap_a,
-                    "ma_price_gap_b": ma_price_gap_b,
-                    "ma_price_gap_c": ma_price_gap_c,
                     "total_pos": 0,
                     "win_pos": 0,
                     "balance": 100.0, # Or None, but usually 100.0 is better for baseline
@@ -822,11 +915,35 @@ def _run_backtest_grid(
                     logger.error("Backtest kernel error cfg=%s era=%s: %s", regime_id, era_label, e)
                     continue
 
+            def _safe_take_col_as_float32(df: pl.DataFrame, colname: str, idxs: np.ndarray) -> np.ndarray:
+                if idxs is None or idxs.size == 0:
+                    return np.empty(0, dtype=np.float32)
+                if colname not in df.columns:
+                    return np.full(idxs.shape[0], np.nan, dtype=np.float32)
+                # use zero-copy numpy view where possible then advanced-index
+                try:
+                    col_arr = df[colname].to_numpy()
+                    # clip out-of-bound indices to produce nan for invalid positions
+                    out = np.full(idxs.shape[0], np.nan, dtype=np.float32)
+                    valid_mask = (idxs >= 0) & (idxs < col_arr.shape[0])
+                    if valid_mask.any():
+                        out[valid_mask] = col_arr[idxs[valid_mask]].astype(np.float32)
+                    return out
+                except Exception:
+                    # fallback slower path via Polars take -> to_numpy
+                    try:
+                        s = df[colname].take(idxs.tolist())
+                        return s.to_numpy().astype(np.float32)
+                    except Exception:
+                        return np.full(idxs.shape[0], np.nan, dtype=np.float32)
+
             mask_closed = np.asarray([]) if exit_idx is None else (exit_idx >= 0)
             if mask_closed.size and mask_closed.any():
                 closed_rets = rets[mask_closed]
                 closed_entry_idxs = entry_idx[mask_closed].astype(np.int64)
                 closed_exit_idxs = exit_idx[mask_closed].astype(np.int64)
+
+                gap_entry_a, gap_entry_b, gap_exit_a, gap_exit_b = get_ma_price_gaps_for_indices(df_main, closed_entry_idxs, closed_exit_idxs)
 
                 # Build and stage equity only if enabled in run config; helper returns final balance and win_pos
                 final_balance, win_pos, max_dd = build_and_stage_equity(
@@ -844,6 +961,10 @@ def _run_backtest_grid(
                     era_int=era_int,
                     side_flag=side_flag,
                     stager=stager,
+                    ma_p_gap_a_entry=gap_entry_a,
+                    ma_p_gap_b_entry=gap_entry_b,
+                    ma_p_gap_a_exit=gap_exit_a,
+                    ma_p_gap_b_exit=gap_exit_b,
                 )
 
             else:
@@ -869,75 +990,85 @@ def _run_backtest_grid(
                 "era_int": int(era_int),
                 "regime_id": int(regime_id),
                 "ma_int": int(regime_cfg.get("ma_int", 0)),
-                "ma_price_gap": None if ma_price_gap is None else float(ma_price_gap),
-                "ma_price_gap_a": None if ma_price_gap_a is None else float(ma_price_gap_a),
-                "ma_price_gap_b": None if ma_price_gap_b is None else float(ma_price_gap_b),
-                "ma_price_gap_c": None if ma_price_gap_c is None else float(ma_price_gap_c),
                 "ma_reversion": bool(regime_cfg.get("ma_reversion", False)),
                 "entry_lookback_h": int(regime_cfg.get("entry_lookback_h", 0)),
+                "use_stochastic": bool(regime_cfg.get("use_stochastic", False)),
+                "stoch_key": str(regime_cfg.get("stoch_key", "OFF")),
                 "max_drawdown": float(max_dd)
             }
 
             canonical = pl.DataFrame([master_row_raw]).pipe(enforce_schema, "master").to_dicts()[0]
             buffer_master_row(results_dir, batch_id, canonical)
 
-
 def process_era_combos(
     regime_id: int,
     regime_cfg: dict,
     run_cfg: dict,
-    df_main: pl.DataFrame,
-    main_close_arr: np.ndarray,
-    main_time_ns_arr: np.ndarray,
-    main_spread_arr: np.ndarray,
-    main_funding_arr: np.ndarray,
+    data_ctx: dict,
     results_dir: Path,
     batch_id: int,
     stager,
-    force_rebuild_cache: bool,
-    cache_lookback_minutes_cfg,
-    base_minutes: int,
     max_dd_threshold: float,
 ) -> Tuple[int, int]:
+    """
+    Strict per-era processing loop.
+
+    Requirements (no legacy or fallback logic):
+      - `data_ctx` MUST contain:
+         * "df_main" (polars DataFrame)
+         * "main_time_ns_arr" (numpy int64 array of timestamps in ns)
+         * "feature_cols" (list of precomputed feature column names)
+         * "lookback_map" (dict mapping era_label -> lookback_minutes)  <-- MANDATORY
+      - `run_cfg` MUST contain "sl_tp_interval_months" (int) and other grid params.
+      - No internal computation of lookback; an absent lookback_map entry is an error.
+    """
+    # validate data_ctx
+    required_keys = ("df_main", "main_time_ns_arr", "feature_cols", "lookback_map")
+    missing = [k for k in required_keys if k not in data_ctx]
+    if missing:
+        raise RuntimeError(f"data_ctx missing required keys: {missing}. This system enforces precomputed lookback_map and features.")
+
+    df_main: pl.DataFrame = data_ctx["df_main"]
+    main_time_ns_arr: np.ndarray = data_ctx["main_time_ns_arr"]
+    lookback_map: dict = data_ctx["lookback_map"]  # strict: must exist and cover all eras
+    feature_cols: list = data_ctx["feature_cols"]
+
+    # grid params (strict read)
+    months = int(run_cfg["sl_tp_interval_months"])  # KeyError if absent intentionally
+    grid_start = pd.to_datetime(run_cfg["grid_start_date"]).to_pydatetime()
+    grid_end = pd.to_datetime(run_cfg["grid_end_date"]).to_pydatetime()
+
     processed_inc = 0
     skipped_inc = 0
 
     sl_vals, tp_vals = _expand_sl_tp({**run_cfg, **regime_cfg})
     combos = _prune_by_min_rr(sl_vals, tp_vals, float(run_cfg.get("min_rr", 3.0)))
 
-    months = int(run_cfg.get("sl_tp_interval_months", 6))
-    grid_start = pd.to_datetime(run_cfg.get("grid_start_date")).to_pydatetime()
-    grid_end = pd.to_datetime(run_cfg.get("grid_end_date")).to_pydatetime()
-
     windows = _split_period_windows_from_pl(df_main, months, min_dt=grid_start, max_dt=grid_end)
-    logger.debug("process_era_combos: config=%s windows=%d", regime_id, len(windows))
+    logger.debug("process_era_combos: regime=%s windows=%d", regime_id, len(windows))
 
+    # iterate strictly over precomputed windows (eras)
     for (start, end) in windows:
         if hasattr(start, "tzinfo") and start.tzinfo is not None:
             start = start.replace(tzinfo=None)
         if hasattr(end, "tzinfo") and end.tzinfo is not None:
             end = end.replace(tzinfo=None)
+
         era_label = start.strftime("%Y-%m")
         try:
             era_int = int(start.strftime("%Y%m%d"))
         except Exception:
             era_int = 0
 
-        # compute lookback
-        if cache_lookback_minutes_cfg is not None:
-            lookback_minutes = int(cache_lookback_minutes_cfg)
-        elif (full_cfg_lookback := (regime_cfg.get("lookback_minutes") or run_cfg.get("lookback_minutes"))):
-            lookback_minutes = int(full_cfg_lookback)
-        else:
-            ma_periods = run_cfg.get("ma_periods", []) or []
-            max_ma_period = int(max(ma_periods)) if ma_periods else 0
-            entry_lookbacks = run_cfg.get("entry_lookback_h", []) or []
-            max_entry_lb_minutes = int(max(entry_lookbacks) * 60) if entry_lookbacks else 0
-            default_lookback_minutes = max(max_ma_period * base_minutes, max_entry_lb_minutes) + (24 * 60)
-            lookback_minutes = int(default_lookback_minutes)
+        # require lookback entry for this era (no fallback allowed)
+        if era_label not in lookback_map:
+            raise RuntimeError(f"Missing precomputed lookback for era '{era_label}' in data_ctx['lookback_map']. Aborting; no fallback allowed.")
+        lookback_hours = int(lookback_map[era_label])
 
-        lookback_delta = datetime.timedelta(minutes=lookback_minutes)
+        lookback_delta = datetime.timedelta(hours=lookback_hours)
         input_start = start - lookback_delta
+
+        # convert to ns and clamp to df_main range
         start_ns = np.datetime64(input_start).astype("datetime64[ns]").astype(np.int64)
         end_ns = np.datetime64(end).astype("datetime64[ns]").astype(np.int64)
 
@@ -948,47 +1079,61 @@ def process_era_combos(
         if end_ns > max_ns:
             end_ns = max_ns
 
+        # 1. Convert to ns and clamp
+        start_ns = np.datetime64(input_start).astype("datetime64[ns]").astype(np.int64)
+        end_ns = np.datetime64(end).astype("datetime64[ns]").astype(np.int64)
+
+        min_data_ns = int(main_time_ns_arr[0])
+        max_data_ns = int(main_time_ns_arr[-1])
+
+        # LOGICAL CHECK: Is this era even inside our data?
+        if end_ns < min_data_ns or start_ns > max_data_ns:
+            logger.warning(f"SKIP Era {era_label}: Entirely outside data range. "
+                        f"Data: {pd.to_datetime(min_data_ns)} to {pd.to_datetime(max_data_ns)}")
+            continue
+
         start_idx = int(np.searchsorted(main_time_ns_arr, start_ns, side="left"))
         end_idx = int(np.searchsorted(main_time_ns_arr, end_ns, side="left"))
-        df_input_slice = df_main.slice(start_idx, max(0, end_idx - start_idx))
 
-        logger.debug("ERA %s slice rows=%d start_idx=%d end_idx=%d", era_label, (df_input_slice.height if df_input_slice is not None else 0), start_idx, end_idx)
+        if start_idx == end_idx:
+            # This happens if the timestamps are so close they fall into the same candle 
+            # OR if the range is in a gap in your data.
+            logger.error(f"⚠️ INDEX COLLISION for Era {era_label}: start_idx and end_idx are both {start_idx}. "
+                        f"Search range: {input_start} to {end}. Slice will be empty!")
 
-        # compute gap stats
-        ma_price_gap_vals = _compute_era_gap_stats(df_input_slice, df_main, regime_cfg, era_label)
-        logger.debug("ERA %s gap stats -> selected=%s a=%s b=%s c=%s", era_label, ma_price_gap_vals[0], ma_price_gap_vals[1], ma_price_gap_vals[2], ma_price_gap_vals[3])
+        logger.debug("ERA %s start_idx=%d end_idx=%d lookback=%d", era_label, start_idx, end_idx, lookback_hours)
 
-        # get or generate signals
-        df_signals = _get_or_generate_signals(months, era_label, regime_id, regime_cfg, run_cfg, df_input_slice, df_main, base_minutes, force_rebuild_cache)
+        # generate or load signals (slicing done inside)
+        df_signals = _get_or_generate_signals(
+            era_label=era_label,
+            regime_id=regime_id,
+            regime_cfg=regime_cfg,
+            run_cfg=run_cfg,
+            data_ctx=data_ctx,
+            start_idx=start_idx,
+            end_idx=end_idx,
+        )
 
-        # run backtests
+        # run backtests (this function reads arrays and flags from data_ctx / run_cfg)
         _run_backtest_grid(
             regime_id=regime_id,
             regime_cfg=regime_cfg,
             run_cfg=run_cfg,
-            df_main=df_main,
-            main_close_arr=main_close_arr,
-            main_time_ns_arr=main_time_ns_arr,
-            main_spread_arr=main_spread_arr,
-            main_funding_arr=main_funding_arr,
+            data_ctx=data_ctx,
             df_signals=df_signals,
             months=months,
             era_label=era_label,
             era_int=era_int,
-            ma_price_gap_vals=ma_price_gap_vals,
             results_dir=results_dir,
             batch_id=batch_id,
             stager=stager,
-            base_minutes=base_minutes,
             max_dd_threshold=max_dd_threshold,
-            force_rebuild_cache=force_rebuild_cache,
             combos=combos,
         )
 
         processed_inc += 1
 
     return processed_inc, skipped_inc
-
 
 def compute_config_and_save(batch_path: str, session_dir: str, compute_backtest: bool = True) -> Dict:
     try:
@@ -1010,23 +1155,31 @@ def compute_config_and_save(batch_path: str, session_dir: str, compute_backtest:
     if not session_dir.exists():
         raise AirflowFailException(f"FATAL: session_dir NOT FOUND at {session_dir}")
 
+    session_snapshot = session_dir / "run_config.json"
+    if not session_snapshot.exists():
+        # Fallback for safety, though it should exist from init_session_task
+        logger.warning("⚠️ Session run_config.json missing, falling back to global loader.")
+        run_cfg = _load_run_config()
+    else:
+        with open(session_snapshot, "r", encoding="utf8") as f:
+            run_cfg = json.load(f)
+        logger.info("✅ Loaded session-specific run_config from snapshot.")
+
     results_dir = session_dir / "results"
     results_dir.mkdir(parents=True, exist_ok=True)
 
     with open(batch_path, "r", encoding="utf8") as f:
         batch_data = json.load(f)
 
-    run_cfg = _load_run_config()
     regimes = batch_data["regimes"]
     batch_id = int(batch_data.get("batch_id", 0))
     logger.info("🧵 Worker started: %s | Regimes to process: %d (batch_id=%d)", batch_path.name, len(regimes), batch_id)
 
     prepared = prepare_worker_data(session_dir, run_cfg)
-    df_main = prepared["df_main"]
-    main_close_arr = prepared["main_close_arr"]
-    main_time_ns_arr = prepared["main_time_ns_arr"]
-    main_spread_arr = prepared["main_spread_arr"]
-    main_funding_arr = prepared["main_funding_arr"]
+    data_ctx = prepared  # keep the entire prepared dict intact; pass around as context
+
+    if "lookback_map" not in data_ctx or not isinstance(data_ctx["lookback_map"], dict):
+        raise RuntimeError("prepare_worker_data did not return a valid 'lookback_map'. Ensure precompute produced it.")
 
     max_dd_threshold = float(run_cfg.get("max_dd_threshold", 0.20))
     flush_rows = int(run_cfg.get("PARQUET_FLUSH_ROWS", 100_000))
@@ -1048,9 +1201,6 @@ def compute_config_and_save(batch_path: str, session_dir: str, compute_backtest:
 
     processed_count = 0
     skipped_count = 0
-    force_rebuild_cache = bool(run_cfg.get("force_rebuild_cache", False))
-    cache_lookback_minutes_cfg = run_cfg.get("cache_lookback_minutes", None)
-    base_minutes = int(run_cfg.get("BASE_MINUTES", 5))
 
     try:
         total_in_batch = len(regimes)
@@ -1076,7 +1226,6 @@ def compute_config_and_save(batch_path: str, session_dir: str, compute_backtest:
             regime_cfg["entry_lookback_h"] = int(regime_cfg.get("entry_lookback_h", 0) or 0)
             regime_cfg["exit_window_h"] = int(regime_cfg.get("exit_window_h", 0) or 0)
             regime_cfg["use_stochastic"] = bool(regime_cfg.get("use_stochastic", False))
-            regime_cfg["use_entry_lookback"] = bool(regime_cfg.get("use_entry_lookback", False))
 
             regime_id = regime_cfg.get("regime_id")
             summary_path = results_dir / f"cfg_{regime_id}_summary.json"
@@ -1091,17 +1240,10 @@ def compute_config_and_save(batch_path: str, session_dir: str, compute_backtest:
                 regime_id=regime_id,
                 regime_cfg=regime_cfg,
                 run_cfg=run_cfg,
-                df_main=df_main,
-                main_close_arr=main_close_arr,
-                main_time_ns_arr=main_time_ns_arr,
-                main_spread_arr=main_spread_arr,
-                main_funding_arr=main_funding_arr,
+                data_ctx=data_ctx,
                 results_dir=results_dir,
                 batch_id=batch_id,
                 stager=stager,
-                force_rebuild_cache=force_rebuild_cache,
-                cache_lookback_minutes_cfg=cache_lookback_minutes_cfg,
-                base_minutes=base_minutes,
                 max_dd_threshold=max_dd_threshold,
             )
             processed_count += p_inc

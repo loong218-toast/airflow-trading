@@ -48,6 +48,7 @@ def grid_search_pipeline():
             raise ValueError(f"Config at {path} must be a JSON object/dict")
         return cfg
 
+
     def apply_performance_and_run_config():
         """
         Strict loader: chooses which performance config to apply based on Airflow Variable PERFORMANCE_PROFILE.
@@ -90,13 +91,6 @@ def grid_search_pipeline():
         cur_end = current_cfg.get("grid_end_date")
         pair = current_cfg.get("pair", "unknown")
 
-        perf_map = {
-            "CACHE_USE_STREAMING_MERGE": "CACHE_USE_STREAMING_MERGE",
-            "CACHE_FLUSH_ROWS": "CACHE_FLUSH_ROWS",
-            "CACHE_MAX_INMEM_ROWS": "CACHE_MAX_INMEM_ROWS",
-            "CACHE_TMP_DIR": "CACHE_TMP_DIR",
-            "DATA_LAKE_ROOT": "DATA_LAKE_ROOT"
-        }
         for vkey in ("CACHE_USE_STREAMING_MERGE", "CACHE_FLUSH_ROWS", "CACHE_MAX_INMEM_ROWS", "CACHE_TMP_DIR"):
             if vkey in current_cfg:
                 os.environ[vkey] = str(current_cfg[vkey])
@@ -148,9 +142,7 @@ def grid_search_pipeline():
             except Exception as e:
                 logger.warning(f"Could not write run_config snapshot to {snapshot_path}: {e}")
 
-        # Generate config batches (uses current run_config)
-        p = Path(session_dir)
-        generate_configs(p)
+        generate_configs(Path(session_dir), current_cfg)
 
         return str(session_dir)
 
@@ -172,11 +164,10 @@ def grid_search_pipeline():
 
         db_uri = f"postgresql+psycopg2://{db_user}:{db_pass}@{db_host}/{db_db}"
 
-        # load run_config (strict)
-        run_cfg = _load_json_file_strict(RUN_CONFIG_PATH)
+        session_snapshot = Path(session_dir) / "run_config.json"
+        with open(session_snapshot, "r") as f:
+            run_cfg = json.load(f)
 
-        # call the session helper (no transforms inside; data already prepared in DB)
-        from etl.session import prepare_base_data as _prepare_base_data  # local import to avoid top-level cycles
         res = _prepare_base_data(session_dir=str(session_dir), db_uri=db_uri, run_cfg=run_cfg, force=False, make_full=False)
 
         logger.info("✅ Base data ready: %d rows -> %s", int(res.get("rows", 0)), res.get("path"))

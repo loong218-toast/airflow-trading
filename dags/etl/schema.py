@@ -31,14 +31,10 @@ MASTER_SCHEMA: Dict[str, pl.DataType] = {
     "ma_reversion": pl.Boolean,
     "entry_lookback_h": pl.Int32,
     "exit_window_h": pl.Int32,
+    "use_stochastic": pl.Boolean,
+    "stoch_key": pl.String,   # "12-3-3 (20/80)" (Easy for Humans)
     "SL": pl.Float32,
     "TP": pl.Float32,
-
-    # 3. Market State / Features (Gaps)
-    "ma_price_gap": pl.Float32,
-    "ma_price_gap_a": pl.Float32,
-    "ma_price_gap_b": pl.Float32,
-    "ma_price_gap_c": pl.Float32,
 
     # 4. Performance Metrics
     "total_pos": pl.Int32,
@@ -56,6 +52,10 @@ EQUITY_SCHEMA: Dict[str, pl.DataType] = {
     "time_ns": pl.Int64,
     "pnl_pct": pl.Float32,
     "equity": pl.Float32,
+    "ma_p_gap_a_entry": pl.Float32,
+    "ma_p_gap_b_entry": pl.Float32,
+    "ma_p_gap_a_exit":  pl.Float32,
+    "ma_p_gap_b_exit": pl.Float32
 }
 
 CACHE_SIGNAL_SCHEMA: Dict[str, pl.DataType] = {
@@ -63,8 +63,6 @@ CACHE_SIGNAL_SCHEMA: Dict[str, pl.DataType] = {
     "time_ns": pl.Int64,       # Universal timestamp for safety
     "side": pl.Int8,           # 1 for Buy, -1 for Sell
     "regime_id": pl.Int32,     # Linking ID for the regime
-    "ma_int": pl.Int32,        # Bitmask for active MAs (00, 01, 10, 11 etc.)
-    "ma_reversion": pl.Boolean # Strategy mode: True (Mean Rev), False (Trend)
 }
 
 CACHE_BACKTEST_SCHEMA: Dict[str, pl.DataType] = {
@@ -158,9 +156,21 @@ def enforce_schema(df: Optional[pl.DataFrame], schema_type: str, strict: bool = 
     if not strict:
         for c in df.columns:
             if c not in target_schema:
-                cast_exprs.append(pl.col(c))
+                # Cast dynamic features to Float32 by default to keep memory low
+                if df.schema[c] == pl.Float64:
+                    cast_exprs.append(pl.col(c).cast(pl.Float32))
+                else:
+                    cast_exprs.append(pl.col(c))
 
-    return df.select(cast_exprs)
+    result = df.select(cast_exprs)
+    
+    # NEW DEBUG BLOCK
+    if schema_type == "signals" and result.height > 0:
+        null_count = result["side"].null_count()
+        if null_count == result.height:
+             _LOG.error(f"⚠️ SCHEMA CRASH: 'side' column is 100% NULL after enforcing {schema_type}!")
+
+    return result
 
 def cast_to_schema(data: Any, schema_type: str) -> pl.DataFrame:
     """

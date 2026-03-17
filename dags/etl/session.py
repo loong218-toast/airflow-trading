@@ -13,7 +13,6 @@ import numpy as np
 
 from etl.db import get_engine
 from etl.transform import build_df_main_from_5m_polars, load_candles_from_db_polars
-from etl.grid import _load_run_config # Assuming config loader stays in grid or move to session
 
 from etl.io_utils import (
     _atomic_write_parquet,
@@ -162,9 +161,8 @@ def prepare_base_data(session_dir: str, db_uri: str, run_cfg: Dict[str, Any], fo
     base_full_dir.mkdir(parents=True, exist_ok=True)
     global_base_file = base_full_dir / "base_data_full.parquet"
 
-    # Validate run_cfg
-    if not isinstance(run_cfg, dict):
-        run_cfg = _load_run_config()
+    if not isinstance(run_cfg, dict) or not run_cfg:
+        raise ValueError("prepare_base_data MUST receive a valid run_cfg dictionary from the session snapshot.")
 
     # dates
     if not run_cfg.get("grid_start_date") or not run_cfg.get("grid_end_date"):
@@ -187,16 +185,10 @@ def prepare_base_data(session_dir: str, db_uri: str, run_cfg: Dict[str, Any], fo
     engine = get_engine(db_uri)
     pair = run_cfg.get("pair", "XXBTZUSD")
     market_type = run_cfg.get("market_type", "spot")
-    base_minutes = int(run_cfg.get("BASE_MINUTES", 5))
 
-    # compute padded start
-    ma_periods = run_cfg.get("ma_periods", []) or []
-    ma_max = int(max(ma_periods)) if ma_periods else 200
-    entry_lookbacks = run_cfg.get("entry_lookback_h", []) or []
-    lb_max = int(max(entry_lookbacks)) if entry_lookbacks else 24
-    pad_min = (ma_max * base_minutes) + (lb_max * 60) + 60
-    padded_start = grid_start - pd.Timedelta(minutes=int(pad_min))
-
+    grid_start = pd.to_datetime(run_cfg["grid_start_date"], utc=True)
+    grid_end = pd.to_datetime(run_cfg["grid_end_date"], utc=True)
+    
     # If requested to build full historical base (rare), read entire table range
     if make_full:
         logger.info("Building global full base_data (make_full=True). This may take time.")
@@ -232,7 +224,13 @@ def prepare_base_data(session_dir: str, db_uri: str, run_cfg: Dict[str, Any], fo
     if "time" in df_main.columns:
         df_main = df_main.filter(pl.col("time").is_between(padded_start, grid_end, closed="left"))
 
+    logger.info("Enforcing chronological sort order on df_main...")
+    df_main = df_main.sort("time")
+
     # atomically write the global base file
     _atomic_write_parquet(df_main, global_base_file)
-    logger.info("Wrote global base_data_full.parquet rows=%d path=%s", int(df_main.height), str(global_base_file))
+
+    actual_start = df_main["time"][0]
+    actual_end = df_main["time"][-1]
+    logger.info(f"✅ Verified Range: {actual_start} TO {actual_end} (Rows: {df_main.height})")
     return {"status": "written", "path": str(global_base_file), "rows": int(df_main.height)}

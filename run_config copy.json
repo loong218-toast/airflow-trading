@@ -2,17 +2,17 @@
   "pair": "XXBTZUSD",
   "BASE_MINUTES": 5,
   "sl_tp_in_pct": true,
-  "min_rr": 4.0,
+  "min_rr": 3.0,
   "sl_tp_interval_months": 6,
   "sl_range": {
     "min": 0.1,
-    "max": 1.0,
-    "step": 0.2
+    "max": 2.0,
+    "step": 0.3
   },
   "tp_range": {
-    "min": 0.7,
+    "min": 0.0,
     "max": 4.0,
-    "step": 0.2
+    "step": 0.5
   },
   "sl_decay_pct": 0.001,
   "sl_decay_interval": 1,
@@ -21,12 +21,7 @@
   "entry_lookback_h": [1, 4, 8, 12, 16, 20, 24, 48, 72, 168],
   "ma_timeframe": "1h",
   "ma_periods": [50, 600],
-  "ma_reversion": [false, true],
-  "stoch_k": [6, 12, 18],
-  "stoch_d": [3],
-  "stoch_s": [3],
-  "stoch_thresholds": [[20, 80], [40, 60]],
-  "use_stochastic": [false, true],
+  "ma_reversion": [true, false],
   "BTC_SETTINGS": {
     "spread": 0.0002
   },
@@ -37,6 +32,6 @@
   "funding_rate_unit": "per_period",
   "force_rebuild_cache": false,
   "Equity_dataset": true,
-  "grid_start_date": "2023-09-01T00:00:00Z",
+  "grid_start_date": "2024-09-01T00:00:00Z",
   "grid_end_date": "2025-09-15T23:59:59Z"
 }

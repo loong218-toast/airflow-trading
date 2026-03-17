@@ -11,3 +11,7 @@ postgres_data/
 .env
 
 personal_only/
+
+__pycache__/
+*.pyc
+analysis/.ipynb_checkpoints/

@@ -1,0 +1,15 @@
+# Check if worker can connect to api server
+
+docker compose exec airflow-worker curl airflow-apiserver:8080/health
+
+# See grid_search dag running
+
+docker exec -it $(docker ps -qf "name=scheduler") airflow dags list-runs grid_search --state running
+
+# Grid search dag tasks
+
+docker exec -it $(docker ps -qf "name=scheduler") airflow dags list-runs grid_search --state running
+
+# List all tasks inside grid run
+
+$LATEST_RUN = docker exec $(docker ps -qf "name=scheduler") airflow dags list-runs grid_search --state running --output plain | Select-String -Pattern "(manual__\S+|scheduled__\S+)" | ForEach-Object { $_.Matches.Value }; if ($LATEST_RUN) { docker exec -it $(docker ps -qf "name=scheduler") airflow tasks states-for-dag-run grid_search $LATEST_RUN } else { Write-Host "Could not parse Run ID. Try running: airflow dags list-runs grid_search --state running" -ForegroundColor Red }

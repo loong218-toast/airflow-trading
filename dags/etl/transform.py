@@ -16,22 +16,6 @@ os.environ["POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR"] = "load_as_storage"
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
-DEFAULT_RUN_CONFIG = {
-    "BASE_MINUTES": 5,
-    "ma_timeframe": "1h",             # Base for MA calculation
-    "ma_periods": [50, 600],          # maps to ma_a (50h) and ma_b (600h)
-    "use_ma_filter": True,            # enables trend filtering in signal gen
-    "use_stochastic": True,
-    "stochastic": {
-        "stoch_k": 12,
-        "stoch_d": 12,
-        "stoch_slow": 8
-    },
-    "entry_lookback_h": 12,
-    "use_entry_lookback": True,
-    "grid_end_date": "2025-09-15T23:59:59Z"
-}
-
 def load_candles_from_db_polars(
     engine,
     pair: str,
