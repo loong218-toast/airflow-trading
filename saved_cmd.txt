@@ -13,3 +13,11 @@ docker exec -it $(docker ps -qf "name=scheduler") airflow dags list-runs grid_se
 # List all tasks inside grid run
 
 $LATEST_RUN = docker exec $(docker ps -qf "name=scheduler") airflow dags list-runs grid_search --state running --output plain | Select-String -Pattern "(manual__\S+|scheduled__\S+)" | ForEach-Object { $_.Matches.Value }; if ($LATEST_RUN) { docker exec -it $(docker ps -qf "name=scheduler") airflow tasks states-for-dag-run grid_search $LATEST_RUN } else { Write-Host "Could not parse Run ID. Try running: airflow dags list-runs grid_search --state running" -ForegroundColor Red }
+
+# Fail grid search
+
+# 1. Get the current Run ID
+$run_id = (docker exec $(docker ps -qf "name=scheduler") airflow dags list-runs --dag-id grid_search --state running --output plain | Select-Object -First 1).Split(" ")[0]
+
+# 2. Mark it as failed
+docker exec -it $(docker ps -qf "name=scheduler") airflow dags state grid_search $run_id failed

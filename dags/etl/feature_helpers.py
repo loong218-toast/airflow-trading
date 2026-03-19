@@ -114,7 +114,8 @@ def precompute_all_possible_features(df: pl.DataFrame, run_cfg: dict) -> pl.Data
     df = df.clone()
 
     base_min = int(run_cfg.get("BASE_MINUTES", 5))
-    bar_mult = max(1, 60 // base_min)
+    modifier = int(run_cfg.get("signal_timeframe_modifier", 3)) # Default to 3 (15m)
+    unit_mult = modifier
 
     # --- 1. MA Periods (Compute ALL as ma_a, ma_b, ma_c...) ---
     raw_ma_periods = run_cfg.get("ma_periods", []) or []
@@ -123,22 +124,35 @@ def precompute_all_possible_features(df: pl.DataFrame, run_cfg: dict) -> pl.Data
 
     ma_periods_used = sorted({int(x) for x in raw_ma_periods})
 
-    ma_exprs = []
+    # KAMA Constants (Fixed)
+    fast_sc = 2 / (2 + 1)
+    slow_sc = 2 / (30 + 1)
+
     for i, period in enumerate(ma_periods_used):
-        ma_name = f"ma_{chr(97 + i)}"  # ma_a, ma_b, ma_c...
-        window = max(1, int(period) * bar_mult)
-        ma_exprs.append(
-            pl.col("close").rolling_mean(window, min_periods=1)
-            .shift(1).cast(pl.Float32).alias(ma_name)
-        )
-    if ma_exprs:
-        df = df.with_columns(ma_exprs)
+        ma_name = f"kama_{chr(97 + i)}"
+        # The 'n' period scaled by our modifier
+        n = max(1, period * unit_mult)
+        
+        # Polars calculation for ER (Efficiency Ratio)
+        change = (pl.col("close") - pl.col("close").shift(n)).abs()
+        volatility = (pl.col("close") - pl.col("close").shift(1)).abs().rolling_sum(n)
+        er = (change / volatility).fill_nan(0.0)
+        
+        # Calculate Smoothing Constant
+        sc = (er * (fast_sc - slow_sc) + slow_sc).pow(2)
+        
+        # Note: True KAMA is recursive. In Polars precompute, we use an EWM 
+        # approximation or a scan. For high-speed trading scripts, 
+        # a weighted mean over the period is often used as a proxy.
+        df = df.with_columns([
+            pl.col("close").ewm_mean(span=n, adjust=False).alias(ma_name)
+        ])
 
     # --- 2. Stochastic (pct_d_slow) ---
     use_stoch_val = run_cfg.get("use_stochastic", False)
     should_compute_stoch = use_stoch_val if isinstance(use_stoch_val, bool) else any(use_stoch_val)
     
-    if should_compute_stoch:
+    if should_compute_stoch:    
         ks = run_cfg.get("stoch_k", [12])
         ds = run_cfg.get("stoch_d", [3])
         ss = run_cfg.get("stoch_s", [3])
@@ -146,62 +160,83 @@ def precompute_all_possible_features(df: pl.DataFrame, run_cfg: dict) -> pl.Data
         for k in ks:
             for d in ds:
                 for s in ss:
+                    k_window = k * unit_mult
+                    d_window = d * unit_mult
+                    s_window = s * unit_mult
+
                     # Consistent naming: stoch_k12_d3_s3
                     col_name = f"stoch_k{k}_d{d}_s{s}"
                     
-                    s_min = pl.col("close").rolling_min(k, min_periods=1)
-                    s_max = pl.col("close").rolling_max(k, min_periods=1)
+                    s_min = pl.col("close").rolling_min(k_window, min_periods=1)
+                    s_max = pl.col("close").rolling_max(k_window, min_periods=1)
                     
                     # We use a temporary scope to avoid column name collisions
                     df = df.with_columns([
                         (100.0 * (pl.col("close") - s_min) / (s_max - s_min)).fill_nan(50.0).alias("_k")
                     ]).with_columns([
-                        pl.col("_k").rolling_mean(d, min_periods=1).alias("_d")
+                        pl.col("_k").rolling_mean(d_window, min_periods=1).alias("_d")
                     ]).with_columns([
-                        pl.col("_d").rolling_mean(s, min_periods=1).alias(col_name)
+                        pl.col("_d").rolling_mean(s_window, min_periods=1).alias(col_name)
                     ]).drop(["_k", "_d"])
 
     # --- 3. Breakouts (precompute for every requested entry_lookback_h) ---
-    lookbacks = run_cfg.get("entry_lookback_h", [])
+    lookbacks = run_cfg.get("entry_lookback_units", [])
     if isinstance(lookbacks, int):
         lookbacks = [lookbacks]
-    for lb_h in lookbacks:
-        if lb_h < 0:
+
+    for lb_units in lookbacks:
+        if lb_units < 0:
             continue
-        periods = max(1, int((lb_h * 60) / base_min))
+        periods = lb_units * unit_mult
         hi = pl.col("high").rolling_max(periods).shift(1)
         lo = pl.col("low").rolling_min(periods).shift(1)
         df = df.with_columns([
-            ((pl.col("close") - lo) / (hi - lo)).cast(pl.Float32).alias(f"breakout_{lb_h}h")
+            ((pl.col("close") - lo) / (hi - lo)).cast(pl.Float32).alias(f"breakout_{lb_units}u")
         ])
 
-        if lb_h == 0:
+        if lb_units == 0:
             # Create a "Neutral" column. 
             # Note: This will NOT trigger trades with your current (>=1.0 / <=0.0) logic.
             df = df.with_columns([
-                pl.lit(None).cast(pl.Float32).alias("breakout_0h")
+                pl.lit(None).cast(pl.Float32).alias("breakout_0u")
             ])
             continue
 
+    # --- 4. Bollinger Band Width (BBW) ---
+    bbw_periods = run_cfg.get("bbw_periods", [])
+    bbw_std = run_cfg.get("bbw_std", [2.0]) # Default to 2.0 if not provided
 
-    # 2. Warmup Math (The Single Source of Truth)
-    raw_ma = run_cfg.get("ma_periods", [])
-    if isinstance(raw_ma, (int, float)): raw_ma = [raw_ma]
-    max_ma_val = max(raw_ma) if raw_ma else 0
+    for p in bbw_periods:
+        for s in bbw_std:
+            # Scale window by modifier (e.g., 24 * 3 = 72 candles)
+            n = max(1, p * unit_mult)
+            col_name = f"bbw_p{p}_s{s}"
+            
+            # Calculate Rolling Mean and Std Dev
+            # Note: We use ddof=0 for consistency with most trading platforms
+            rolling_mean = pl.col("close").rolling_mean(n)
+            rolling_std = pl.col("close").rolling_std(n, ddof=0)
+            
+            df = df.with_columns([
+                ((2 * s * rolling_std) / rolling_mean).cast(pl.Float32).alias(col_name)
+            ])
+
+
+    # --- 5. NEW WARMUP LOGIC (Dynamic & Robust) ---
+    # We find the single largest window used across all features to ensure safety.
+    max_k = max(run_cfg.get("stoch_k", [0]))
+    max_ma = max(ma_periods_used) if ma_periods_used else 0
+    max_lb = max(lookbacks) if lookbacks else 0
+    max_bbw = max(bbw_periods) if bbw_periods else 0
     
-    # Hours required for indicators to be valid
-    ma_warmup_h = math.ceil((max_ma_val * bar_mult * base_min) / 60)
+    # The largest "Unit" window
+    absolute_max_units = max(max_k, max_ma, max_lb, max_bbw)
     
-    raw_lb = run_cfg.get("entry_lookback_h", [])
-    if isinstance(raw_lb, int): raw_lb = [raw_lb]
-    max_entry_h = max(raw_lb) if raw_lb else 0
+    # Total hours = (Units * Modifier * BaseMin) / 60
+    # We add 2 hours as a "Buffer" for shifting and EWM stabilization
+    required_hours = math.ceil((absolute_max_units * unit_mult * base_min) / 60) + 2
 
-    lb_max = int(max(run_cfg.get("entry_lookback_h", [24])))
-    ma_max_h = math.ceil((max(run_cfg.get("ma_periods", [200])) * base_min) / 60)
-    required_hours = ma_max_h + lb_max + 1 # +1 for safety
-
-    # 3. Era Generation (The Polars Way)
-    # Extract string dates from cfg and create the range
+    # --- 6. Era Generation ---
     start_str = run_cfg["grid_start_date"]
     end_str = run_cfg["grid_end_date"]
     interval = f"{run_cfg.get('sl_tp_interval_months', 6)}mo"
@@ -209,24 +244,18 @@ def precompute_all_possible_features(df: pl.DataFrame, run_cfg: dict) -> pl.Data
     start_dt = pl.select(pl.lit(start_str).str.to_datetime(time_zone="UTC")).item()
     end_dt = pl.select(pl.lit(end_str).str.to_datetime(time_zone="UTC")).item()
 
-    # Now create the range using the native datetime objects
     era_series = pl.datetime_range(
-        start=start_dt,
-        end=end_dt,
-        interval=interval,
-        eager=True
+        start=start_dt, end=end_dt, interval=interval, eager=True
     ).dt.truncate("1mo")
 
     run_cfg["lookback_map"] = {
-        dt.strftime("%Y-%m"): int(required_hours) 
-        for dt in era_series
+        dt.strftime("%Y-%m"): int(required_hours) for dt in era_series
     }
-    return df, run_cfg  # Return both!
+
+    return df, run_cfg
 
 # -------- signal generator (lean) ----------
 def generate_filtered_signals(df_slice: pl.DataFrame, cfg: dict, df_main: Optional[pl.DataFrame] = None) -> pl.DataFrame:
-
-    # Generate signals candle by candle first
 
     # 1. Early exit with the strict 4-column schema
     if df_slice is None or not isinstance(df_slice, pl.DataFrame) or df_slice.height == 0:
@@ -239,14 +268,14 @@ def generate_filtered_signals(df_slice: pl.DataFrame, cfg: dict, df_main: Option
     cond_sell = pl.lit(True)
 
     # --- 1. Entry Lookback Logic ---
-    lb_h = int(cfg.get("entry_lookback_h", 0))
-    if lb_h > 0:
-        brk_col = f"breakout_{lb_h}h"
-        if brk_col in df_slice.columns:
-            # .fill_null(False) ensures that warmup periods don't trigger trades
-            # AND don't break the logical chain.
-            cond_buy = cond_buy & (pl.col(brk_col) >= 1.0).fill_null(False)
-            cond_sell = cond_sell & (pl.col(brk_col) <= 0.0).fill_null(False)
+    lb_units = int(cfg.get("entry_lookback_units", 0))
+
+    brk_col = f"breakout_{lb_units}u"
+    if brk_col in df_slice.columns:
+        # .fill_null(False) ensures that warmup periods don't trigger trades
+        # AND don't break the logical chain.
+        cond_buy = cond_buy & (pl.col(brk_col) >= 1.0).fill_null(False)
+        cond_sell = cond_sell & (pl.col(brk_col) <= 0.0).fill_null(False)
 
     # --- 2. Stochastic Logic (CLEANED) ---
     if cfg.get("use_stochastic", False):
@@ -267,14 +296,22 @@ def generate_filtered_signals(df_slice: pl.DataFrame, cfg: dict, df_main: Option
         ma_reversion = cfg.get("ma_reversion", False)
         for i in range(len(ma_periods)):
             if (ma_int >> i) & 1:
+
+                kama_col_name = f"kama_{chr(97 + i)}"
+
                 ma_col_name = f"ma_{chr(97 + i)}"
-                if ma_col_name in df_slice.columns:
+                if kama_col_name in df_slice.columns:
                     if not ma_reversion:
-                        cond_buy = cond_buy & (pl.col("close") > pl.col(ma_col_name)).fill_null(False)
-                        cond_sell = cond_sell & (pl.col("close") < pl.col(ma_col_name)).fill_null(False)
+                        # Trend Following: Price above KAMA for Buy
+                        cond_buy = cond_buy & (pl.col("close") > pl.col(kama_col_name)).fill_null(False)
+                        cond_sell = cond_sell & (pl.col("close") < pl.col(kama_col_name)).fill_null(False)
                     else:
-                        cond_buy = cond_buy & (pl.col("close") < pl.col(ma_col_name)).fill_null(False)
-                        cond_sell = cond_sell & (pl.col("close") > pl.col(ma_col_name)).fill_null(False)
+                        # Mean Reversion: Price below KAMA for Buy
+                        cond_buy = cond_buy & (pl.col("close") < pl.col(kama_col_name)).fill_null(False)
+                        cond_sell = cond_sell & (pl.col("close") > pl.col(kama_col_name)).fill_null(False)
+
+    bbw_p = cfg.get("bbw_periods", 0)
+    bbw_s = cfg.get("bbw_std", 0.0)
 
     # --- 4. Evaluate and Return Strict 4 Columns ---
     # We switch to lazy evaluation here for maximum Polars performance
@@ -316,10 +353,6 @@ def generate_filtered_signals(df_slice: pl.DataFrame, cfg: dict, df_main: Option
     # Vertical Concat to allow two signals at the same index/time
     df_out = pl.concat([df_buys, df_sells]).sort("idx", "side")
 
-        # TEMPORARY DEBUG
-    if df_out.height == 0:
-        # Check if indicators even have data
-        valid_brk = df_slice[f"breakout_{lb_h}h"].is_not_null().sum() if lb_h > 0 else "N/A"
     # Make sure to pass CACHE_SIGNAL_SCHEMA if enforce_schema expects a dict, 
     # or ensure get_schema("signals") in your schema.py is updated to these 4 columns.
     return df_out

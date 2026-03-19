@@ -218,6 +218,7 @@ def grid_search_pipeline():
     s_path = init_session_task()
     p_data = prepare_task(s_path)
     pending_batches = list_pending_task(s_path)
+    p_data >> pending_batches
 
     # 1. Capture the total number of tasks for the workers
     # We use a helper task or just pass the length of the list

@@ -21,7 +21,10 @@ from typing import List, Optional, Dict, Any, Set
 import polars as pl
 import pyarrow.parquet as pq
 
+import glob
+
 from etl.cache import _get_cache_root as _io_get_cache_root  # to build target paths consistently
+from etl.schema import MASTER_SCHEMA, EQUITY_SCHEMA, enforce_schema, get_schema
 
 _LOG = logging.getLogger(__name__)
 
@@ -167,7 +170,6 @@ def merge_parquet_files_streaming(inputs: List[str], out_path: Path, kind: str) 
         _LOG.error("Strict merge failed for %s: %s", kind, e)
         raise
 
-
 # ---------------------------------------------------------------------
 # Public: combine_cache  (merge worker parts -> final per-era file)
 # ---------------------------------------------------------------------
@@ -215,20 +217,11 @@ def combine_results_to_master(session_dir: str) -> Dict[str, Any]:
       2) Aggregate equity partition streaming and left-join aggregates into master.
       3) Write final master (canonical types).
     """
-    from etl.schema import MASTER_SCHEMA, enforce_schema
 
     session_dir = Path(session_dir)
     results_dir = session_dir / "results"
     master_metrics_path = session_dir / "master_metrics.parquet"
     equity_part_dir = session_dir / "equity_partitioned"
-
-    has_equity_data = (
-        equity_part_dir.exists() and 
-        any(equity_part_dir.rglob("*.parquet"))
-    )
-
-    if not has_equity_data:
-        _LOG.info("Equity dataset skipped or empty. Finalizing master metrics as-is.")
 
     # 1) discover batch master parts and merge streaming (or create empty canonical)
     batch_files = sorted(results_dir.glob("batch_*_master_metrics.parquet")) if results_dir.exists() else []
@@ -241,8 +234,6 @@ def combine_results_to_master(session_dir: str) -> Dict[str, Any]:
                 nonempty.append(p)
         except Exception as e:
             _LOG.error("Skipping corrupted master batch file %s: %s", p.name, e)
-
-    master_cols = list(MASTER_SCHEMA.keys())
 
     if nonempty:
         _LOG.info("Merging %d batch masters...", len(nonempty))
@@ -259,31 +250,78 @@ def combine_results_to_master(session_dir: str) -> Dict[str, Any]:
 
         _LOG.info("⚠️ No batch data found. Created empty master_metrics.")
 
-    if not has_equity_data:
-        _LOG.info("Equity dataset skipped. Finalizing.")
-        return {"status": "complete_no_equity", "path": str(master_metrics_path)}
-
-    # 2) Aggregate equity partition (if exists) and join to master
-    valid_equity_paths = []
+    has_equity_data = False
     if equity_part_dir.exists():
+        # Stop searching the moment we find a single file
+        for _ in equity_part_dir.rglob("*.parquet"):
+            has_equity_data = True
+            break
 
-        all_equity = sorted(equity_part_dir.rglob("*.parquet"))
-        for p in all_equity:
-            try:
-                # Check for corruption
-                pq.ParquetFile(str(p)).metadata
-                valid_equity_paths.append(p)
-            except Exception as e:
-                _LOG.error("Skipping corrupted equity file %s: %s", p.name, e)
+    if has_equity_data:
+        _LOG.info("Aggregating equity files to hydrate master metrics...")
+        
+        # A. COMPACT: Move worker fragments from _tmp/ to era_int=X/
+        tmp_dir = equity_part_dir / "_tmp"
+        if tmp_dir.exists():
+            from etl.equity_io import combine_equity_parts
 
-    has_equity_data = len(valid_equity_paths) > 0
+            all_tmp = list(tmp_dir.glob("equity_*.parquet"))
+            unique_keys = set()
 
-    if not has_equity_data:
-        _LOG.info("No valid equity data found (skipped or corrupted). Finalizing.")
-        return {"status": "complete_no_equity", "path": str(master_metrics_path), "rows": df_master.height}
+            for f in all_tmp:
+                name = f.name
+                if name.startswith("equity_era_int="):
+                    unique_keys.add(name.split("equity_era_int=", 1)[1].split("_cfg=", 1)[0])
 
-    return {
-        "status": "complete_with_equity",
-        "master_metrics_path": str(master_metrics_path),
-        "rows": df_master.height
-    }
+            for partition_key in unique_keys:
+                _LOG.debug("Compacting equity partition %s", partition_key)
+                combine_equity_parts(session_dir, partition_key, partition_by="era_int")
+
+        join_keys = [k for k in MASTER_SCHEMA.keys() if k in EQUITY_SCHEMA.keys()]
+        agg_targets = ["total_pos", "win_pos", "balance", "max_drawdown"] 
+
+        
+        # Construct the search pattern
+        pattern = str(equity_part_dir / "era_int=*" / "*.parquet")
+
+        # Check if ANY files actually match that specific pattern
+        if not glob.glob(pattern):
+            _LOG.warning("⚠️ No partitioned equity files found in era_int folders. Skipping aggregation.")
+            # Create a dummy scan from an empty dataframe with the right schema
+            equity_scan = pl.DataFrame([], schema=EQUITY_SCHEMA).lazy()
+        else:
+            equity_scan = pl.scan_parquet(pattern)
+
+        
+        df_equity_aggs = (
+            equity_scan
+            .group_by(join_keys)
+            .agg([
+                pl.len().alias("total_pos"),
+                pl.col("pnl_pct").filter(pl.col("pnl_pct") > 0).count().alias("win_pos"),
+                pl.col("equity").last().alias("balance"),
+                ((pl.col("equity").cum_max() - pl.col("equity")) / pl.col("equity").cum_max()).max().alias("max_drawdown")
+            ])
+            .collect()
+        )
+
+        # C. JOIN: Merge the results into our master metrics
+        # This turns a "Plan" into a "Result"
+        if not df_equity_aggs.is_empty():
+            _LOG.info("Equity data found. Updating master metrics...")
+            
+            # 1. Drop only if we are about to join
+            df_master = df_master.drop([c for c in agg_targets if c in df_master.columns])
+            
+            # 2. Join the new calculated values
+            df_master = df_master.join(df_equity_aggs, on=join_keys, how="left")
+            
+            # 3. Enforce schema to handle any Nulls created by missing equity logs
+            df_master = enforce_schema(df_master, "master", strict=True)
+        else:
+            _LOG.warning("No equity data to join. Preserving original batch metrics.")
+
+    df_master.write_parquet(master_metrics_path)
+
+    status = "complete_with_equity" if has_equity_data else "complete_no_equity"
+    return {"status": status, "path": str(master_metrics_path), "rows": df_master.height}

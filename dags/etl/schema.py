@@ -29,10 +29,12 @@ MASTER_SCHEMA: Dict[str, pl.DataType] = {
     # 2. Strategy Hyperparameters
     "ma_int": pl.Int32,
     "ma_reversion": pl.Boolean,
-    "entry_lookback_h": pl.Int32,
+    "entry_lookback_units": pl.Int32,
     "exit_window_h": pl.Int32,
     "use_stochastic": pl.Boolean,
     "stoch_key": pl.String,   # "12-3-3 (20/80)" (Easy for Humans)
+    "bbw_periods": pl.Int32,
+    "bbw_std": pl.Float32,
     "SL": pl.Float32,
     "TP": pl.Float32,
 
@@ -50,6 +52,8 @@ EQUITY_SCHEMA: Dict[str, pl.DataType] = {
     "SL": pl.Float32,
     "TP": pl.Float32,
     "time_ns": pl.Int64,
+    "entry_idx": pl.Int64,       # Individual Trade Detail
+    "exit_idx": pl.Int64,        # Individual Trade Detail
     "pnl_pct": pl.Float32,
     "equity": pl.Float32,
     "ma_p_gap_a_entry": pl.Float32,
@@ -105,6 +109,116 @@ SCHEMA_REGISTRY: Dict[str, Dict[str, pl.DataType]] = {
 }
 
 CLEAN_SCHEMA = DF_MAIN_SCHEMA
+
+# Optional per-schema metadata (single place to adjust behavior)
+SCHEMA_METADATA: Dict[str, Dict[str, Any]] = {
+    # you can change key_columns in future if you want a different detection rule
+    "equity": {
+        "key_columns": ["time_ns", "pnl_pct", "equity"],
+        # the fraction of non-null values (per-column) required to consider the fragment as trade-like
+        "min_non_null_fraction": 0.01,
+    },
+    "master": {
+        # master-specific columns used to detect master-like files accidentally written into equity
+        "key_columns": ["balance", "total_pos", "max_drawdown"],
+    },
+    # other schemas may add metadata later...
+}
+
+
+def get_schema_key_columns(schema_type: str) -> List[str]:
+    """
+    Return the canonical 'key' columns for quick fragment detection.
+    If not explicitly configured in SCHEMA_METADATA, fall back to a heuristic:
+      - prefer columns with names like time_ns/pnl_pct/equity or first 3 numeric columns.
+    """
+    meta = SCHEMA_METADATA.get(schema_type, {})
+    keys = meta.get("key_columns")
+    if keys:
+        return list(keys)
+
+    # heuristic fallback
+    schema = get_schema(schema_type)
+    candidates = []
+    for prefer in ("time_ns", "pnl_pct", "equity", "entry_idx", "exit_idx"):
+        if prefer in schema:
+            candidates.append(prefer)
+    if candidates:
+        return candidates[:3]
+
+    # last-resort: first three columns from the canonical schema
+    return list(schema.keys())[:3]
+
+
+def _non_null_fraction(series: pl.Series) -> float:
+    if series is None:
+        return 0.0
+    nulls = int(series.null_count())
+    total = series.len()
+    return 0.0 if total == 0 else float(total - nulls) / float(total)
+
+
+def classify_fragment(df: Optional[pl.DataFrame], schema_type: str, min_non_null_fraction: Optional[float] = None) -> Dict[str, Any]:
+    """
+    Analyze a polars DataFrame fragment and return attributes useful for deciding
+    whether the fragment should be staged as `schema_type`.
+
+    Returns a dict:
+      {
+        "is_like": bool,                       # passes heuristic check for schema_type
+        "key_columns": [...],                  # key columns used for test
+        "non_null_fractions": {col: frac},    # per-key-col non-null fraction
+        "missing_key_columns": [...],          # missing key columns
+        "other_schema_columns": [...],         # columns that match other canonical schemas (e.g. master)
+      }
+    """
+    if df is None or df.height == 0:
+        return {
+            "is_like": False,
+            "key_columns": [],
+            "non_null_fractions": {},
+            "missing_key_columns": [],
+            "other_schema_columns": [],
+        }
+
+    keys = get_schema_key_columns(schema_type)
+    if min_non_null_fraction is None:
+        min_non_null_fraction = float(SCHEMA_METADATA.get(schema_type, {}).get("min_non_null_fraction", 0.01))
+
+    non_null_fracs = {}
+    missing = []
+    for k in keys:
+        if k not in df.columns:
+            non_null_fracs[k] = 0.0
+            missing.append(k)
+        else:
+            non_null_fracs[k] = _non_null_fraction(df[k])
+
+    # determine if fragment is "like" this schema:
+    # heuristic: at least one key column exists and has non-null fraction >= threshold,
+    # and not all key columns are missing.
+    any_key_exists = any(k in df.columns for k in keys)
+    has_enough_non_null = any(frac >= min_non_null_fraction for frac in non_null_fracs.values())
+    is_like = any_key_exists and has_enough_non_null
+
+    # detect columns that belong to other canonical schemas (useful to detect master rows)
+    other_cols = []
+    master_cols = set(get_schema("master").keys())
+    for c in df.columns:
+        if c in master_cols:
+            other_cols.append(c)
+
+    return {
+        "is_like": bool(is_like),
+        "key_columns": keys,
+        "non_null_fractions": non_null_fracs,
+        "missing_key_columns": missing,
+        "other_schema_columns": other_cols,
+    }
+
+
+def is_fragment_like_schema(df: Optional[pl.DataFrame], schema_type: str, min_non_null_fraction: Optional[float] = None) -> bool:
+    return bool(classify_fragment(df, schema_type, min_non_null_fraction)["is_like"])
 
 # -------------------------
 # Helpers

@@ -1,0 +1,795 @@
+{
+  "generated_at_utc": "2026-03-19T15:01:24.438650Z",
+  "user_metadata": {
+    "--- Metadata ---": null,
+    "Total Rows in file": 1403943,
+    "Columns": [
+      "regime_id",
+      "era_int",
+      "side",
+      "ma_int",
+      "ma_reversion",
+      "entry_lookback_units",
+      "exit_window_h",
+      "use_stochastic",
+      "stoch_key",
+      "SL",
+      "TP",
+      "total_pos",
+      "win_pos",
+      "balance",
+      "max_drawdown"
+    ]
+  },
+  "actual_rows": 385018,
+  "actual_columns": [
+    "regime_id",
+    "era_int",
+    "side",
+    "ma_int",
+    "ma_reversion",
+    "entry_lookback_units",
+    "exit_window_h",
+    "use_stochastic",
+    "stoch_key",
+    "bbw_periods",
+    "bbw_std",
+    "SL",
+    "TP",
+    "total_pos",
+    "win_pos",
+    "balance",
+    "max_drawdown"
+  ],
+  "preview_sample": [
+    {
+      "regime_id": 1155,
+      "era_int": 20240901,
+      "side": 1,
+      "ma_int": 3,
+      "ma_reversion": false,
+      "entry_lookback_units": 0,
+      "exit_window_h": 24,
+      "use_stochastic": true,
+      "stoch_key": "k10_l30_u70",
+      "bbw_periods": 96,
+      "bbw_std": 2.5,
+      "SL": 0.699999988079071,
+      "TP": 3.700000047683716,
+      "total_pos": NaN,
+      "win_pos": NaN,
+      "balance": NaN,
+      "max_drawdown": NaN
+    },
+    {
+      "regime_id": 1408,
+      "era_int": 20240901,
+      "side": -1,
+      "ma_int": 3,
+      "ma_reversion": false,
+      "entry_lookback_units": 0,
+      "exit_window_h": 48,
+      "use_stochastic": true,
+      "stoch_key": "k14_l50_u50",
+      "bbw_periods": 96,
+      "bbw_std": 2.5,
+      "SL": 0.20000000298023224,
+      "TP": 4.0,
+      "total_pos": NaN,
+      "win_pos": NaN,
+      "balance": NaN,
+      "max_drawdown": NaN
+    },
+    {
+      "regime_id": 1076,
+      "era_int": 20250301,
+      "side": -1,
+      "ma_int": 2,
+      "ma_reversion": false,
+      "entry_lookback_units": 6,
+      "exit_window_h": 12,
+      "use_stochastic": true,
+      "stoch_key": "k14_l50_u50",
+      "bbw_periods": 96,
+      "bbw_std": 2.5,
+      "SL": 0.10000000149011612,
+      "TP": 0.699999988079071,
+      "total_pos": NaN,
+      "win_pos": NaN,
+      "balance": NaN,
+      "max_drawdown": NaN
+    },
+    {
+      "regime_id": 448,
+      "era_int": 20250901,
+      "side": 1,
+      "ma_int": 1,
+      "ma_reversion": false,
+      "entry_lookback_units": 3,
+      "exit_window_h": 48,
+      "use_stochastic": true,
+      "stoch_key": "k10_l30_u70",
+      "bbw_periods": 96,
+      "bbw_std": 2.5,
+      "SL": 0.30000001192092896,
+      "TP": 3.700000047683716,
+      "total_pos": NaN,
+      "win_pos": NaN,
+      "balance": NaN,
+      "max_drawdown": NaN
+    },
+    {
+      "regime_id": 1433,
+      "era_int": 20250901,
+      "side": 1,
+      "ma_int": 3,
+      "ma_reversion": false,
+      "entry_lookback_units": 5,
+      "exit_window_h": 72,
+      "use_stochastic": true,
+      "stoch_key": "k14_l50_u50",
+      "bbw_periods": 96,
+      "bbw_std": 2.5,
+      "SL": 0.5,
+      "TP": 2.200000047683716,
+      "total_pos": NaN,
+      "win_pos": NaN,
+      "balance": NaN,
+      "max_drawdown": NaN
+    },
+    {
+      "regime_id": 758,
+      "era_int": 20250301,
+      "side": -1,
+      "ma_int": 2,
+      "ma_reversion": false,
+      "entry_lookback_units": 0,
+      "exit_window_h": 12,
+      "use_stochastic": true,
+      "stoch_key": "k10_l40_u60",
+      "bbw_periods": 96,
+      "bbw_std": 2.5,
+      "SL": 0.30000001192092896,
+      "TP": 1.899999976158142,
+      "total_pos": NaN,
+      "win_pos": NaN,
+      "balance": NaN,
+      "max_drawdown": NaN
+    },
+    {
+      "regime_id": 74,
+      "era_int": 20240301,
+      "side": -1,
+      "ma_int": 0,
+      "ma_reversion": false,
+      "entry_lookback_units": 0,
+      "exit_window_h": 12,
+      "use_stochastic": true,
+      "stoch_key": "k10_l30_u70",
+      "bbw_periods": 96,
+      "bbw_std": 2.5,
+      "SL": 0.800000011920929,
+      "TP": 3.700000047683716,
+      "total_pos": NaN,
+      "win_pos": NaN,
+      "balance": NaN,
+      "max_drawdown": NaN
+    },
+    {
+      "regime_id": 724,
+      "era_int": 20240301,
+      "side": -1,
+      "ma_int": 2,
+      "ma_reversion": false,
+      "entry_lookback_units": 0,
+      "exit_window_h": 48,
+      "use_stochastic": false,
+      "stoch_key": "OFF",
+      "bbw_periods": 96,
+      "bbw_std": 2.5,
+      "SL": 0.30000001192092896,
+      "TP": 2.5,
+      "total_pos": NaN,
+      "win_pos": NaN,
+      "balance": NaN,
+      "max_drawdown": NaN
+    },
+    {
+      "regime_id": 1271,
+      "era_int": 20240301,
+      "side": -1,
+      "ma_int": 3,
+      "ma_reversion": false,
+      "entry_lookback_units": 1,
+      "exit_window_h": 72,
+      "use_stochastic": true,
+      "stoch_key": "k12_l30_u70",
+      "bbw_periods": 96,
+      "bbw_std": 2.5,
+      "SL": 0.30000001192092896,
+      "TP": 1.899999976158142,
+      "total_pos": NaN,
+      "win_pos": NaN,
+      "balance": NaN,
+      "max_drawdown": NaN
+    },
+    {
+      "regime_id": 88,
+      "era_int": 20230901,
+      "side": 1,
+      "ma_int": 0,
+      "ma_reversion": false,
+      "entry_lookback_units": 3,
+      "exit_window_h": 48,
+      "use_stochastic": true,
+      "stoch_key": "k10_l30_u70",
+      "bbw_periods": 96,
+      "bbw_std": 2.5,
+      "SL": 0.4000000059604645,
+      "TP": 2.200000047683716,
+      "total_pos": NaN,
+      "win_pos": NaN,
+      "balance": NaN,
+      "max_drawdown": NaN
+    }
+  ],
+  "global_coverage": {
+    "total_rows": 385018,
+    "empty_rows_total_pos_eq_0": 0,
+    "empty_pct": 0.0,
+    "coverage_pct": 100.0
+  },
+  "breakdown_by_config_top_50": {
+    "columns": [
+      "entry_lookback_units",
+      "ma_int",
+      "use_stochastic",
+      "total_configs",
+      "empty_count",
+      "percent_empty"
+    ],
+    "rows": [
+      {
+        "entry_lookback_units": 5,
+        "ma_int": 2,
+        "use_stochastic": false,
+        "total_configs": 160,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 6,
+        "ma_int": 2,
+        "use_stochastic": true,
+        "total_configs": 17421,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 3,
+        "ma_int": 2,
+        "use_stochastic": true,
+        "total_configs": 11358,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 3,
+        "ma_int": 0,
+        "use_stochastic": true,
+        "total_configs": 3541,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 4,
+        "ma_int": 1,
+        "use_stochastic": true,
+        "total_configs": 11520,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 5,
+        "ma_int": 1,
+        "use_stochastic": false,
+        "total_configs": 82,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 3,
+        "ma_int": 3,
+        "use_stochastic": false,
+        "total_configs": 77,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 6,
+        "ma_int": 0,
+        "use_stochastic": true,
+        "total_configs": 13802,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 5,
+        "ma_int": 0,
+        "use_stochastic": true,
+        "total_configs": 11292,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 0,
+        "ma_int": 3,
+        "use_stochastic": true,
+        "total_configs": 35640,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 1,
+        "ma_int": 2,
+        "use_stochastic": false,
+        "total_configs": 14,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 6,
+        "ma_int": 1,
+        "use_stochastic": true,
+        "total_configs": 14704,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 0,
+        "ma_int": 1,
+        "use_stochastic": true,
+        "total_configs": 35640,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 6,
+        "ma_int": 3,
+        "use_stochastic": true,
+        "total_configs": 17477,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 0,
+        "ma_int": 0,
+        "use_stochastic": true,
+        "total_configs": 35640,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 5,
+        "ma_int": 3,
+        "use_stochastic": true,
+        "total_configs": 15669,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 4,
+        "ma_int": 0,
+        "use_stochastic": true,
+        "total_configs": 6963,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 0,
+        "ma_int": 2,
+        "use_stochastic": true,
+        "total_configs": 35640,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 0,
+        "ma_int": 3,
+        "use_stochastic": false,
+        "total_configs": 3960,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 5,
+        "ma_int": 0,
+        "use_stochastic": false,
+        "total_configs": 80,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 1,
+        "ma_int": 2,
+        "use_stochastic": true,
+        "total_configs": 6988,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 6,
+        "ma_int": 1,
+        "use_stochastic": false,
+        "total_configs": 102,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 0,
+        "ma_int": 0,
+        "use_stochastic": false,
+        "total_configs": 3960,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 5,
+        "ma_int": 3,
+        "use_stochastic": false,
+        "total_configs": 163,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 4,
+        "ma_int": 0,
+        "use_stochastic": false,
+        "total_configs": 58,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 6,
+        "ma_int": 3,
+        "use_stochastic": false,
+        "total_configs": 201,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 0,
+        "ma_int": 2,
+        "use_stochastic": false,
+        "total_configs": 3960,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 0,
+        "ma_int": 1,
+        "use_stochastic": false,
+        "total_configs": 3960,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 4,
+        "ma_int": 2,
+        "use_stochastic": true,
+        "total_configs": 13458,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 1,
+        "ma_int": 3,
+        "use_stochastic": true,
+        "total_configs": 9614,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 3,
+        "ma_int": 1,
+        "use_stochastic": true,
+        "total_configs": 8915,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 1,
+        "ma_int": 0,
+        "use_stochastic": true,
+        "total_configs": 1288,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 1,
+        "ma_int": 1,
+        "use_stochastic": true,
+        "total_configs": 5953,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 4,
+        "ma_int": 3,
+        "use_stochastic": true,
+        "total_configs": 14032,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 6,
+        "ma_int": 2,
+        "use_stochastic": false,
+        "total_configs": 201,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 5,
+        "ma_int": 2,
+        "use_stochastic": true,
+        "total_configs": 15397,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 3,
+        "ma_int": 2,
+        "use_stochastic": false,
+        "total_configs": 76,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 3,
+        "ma_int": 0,
+        "use_stochastic": false,
+        "total_configs": 29,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 4,
+        "ma_int": 1,
+        "use_stochastic": false,
+        "total_configs": 80,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 3,
+        "ma_int": 3,
+        "use_stochastic": true,
+        "total_configs": 12368,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 6,
+        "ma_int": 0,
+        "use_stochastic": false,
+        "total_configs": 100,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 5,
+        "ma_int": 1,
+        "use_stochastic": true,
+        "total_configs": 13080,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 4,
+        "ma_int": 2,
+        "use_stochastic": false,
+        "total_configs": 123,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 3,
+        "ma_int": 1,
+        "use_stochastic": false,
+        "total_configs": 50,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 1,
+        "ma_int": 3,
+        "use_stochastic": false,
+        "total_configs": 22,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 1,
+        "ma_int": 0,
+        "use_stochastic": false,
+        "total_configs": 10,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 1,
+        "ma_int": 1,
+        "use_stochastic": false,
+        "total_configs": 20,
+        "empty_count": 0,
+        "percent_empty": 0
+      },
+      {
+        "entry_lookback_units": 4,
+        "ma_int": 3,
+        "use_stochastic": false,
+        "total_configs": 130,
+        "empty_count": 0,
+        "percent_empty": 0
+      }
+    ]
+  },
+  "top_performers_top_20": {
+    "columns": [
+      "balance",
+      "total_pos",
+      "max_drawdown",
+      "ma_reversion",
+      "entry_lookback_units",
+      "ma_int",
+      "SL",
+      "TP",
+      "use_stochastic"
+    ],
+    "rows": []
+  },
+  "winning_dna_top_1pct": {
+    "columns": [
+      "entry_lookback_units",
+      "occurrence_in_top_pct"
+    ],
+    "rows": [
+      {
+        "entry_lookback_units": 6,
+        "occurrence_in_top_pct": 1554
+      },
+      {
+        "entry_lookback_units": 5,
+        "occurrence_in_top_pct": 1310
+      },
+      {
+        "entry_lookback_units": 4,
+        "occurrence_in_top_pct": 986
+      }
+    ]
+  },
+  "stable_winners_count_and_head": {
+    "count": 0,
+    "head": {
+      "columns": [
+        "balance",
+        "max_drawdown",
+        "ma_reversion",
+        "total_pos",
+        "win_pos",
+        "entry_lookback_units",
+        "exit_window_h",
+        "ma_int",
+        "SL",
+        "TP",
+        "use_stochastic"
+      ],
+      "rows": []
+    }
+  },
+  "exit_impact_on_stable": {
+    "columns": [
+      "exit_window_h",
+      "avg_balance",
+      "avg_trades",
+      "config_count"
+    ],
+    "rows": []
+  },
+  "elite_configs": {
+    "columns": [
+      "balance",
+      "total_pos",
+      "max_drawdown",
+      "RR_Ratio",
+      "ma_int",
+      "entry_lookback_units",
+      "exit_window_h",
+      "SL",
+      "TP",
+      "use_stochastic"
+    ],
+    "rows": []
+  },
+  "target_sl_tp_analysis": {
+    "total_occurrences": 9226,
+    "unique_strategies": 263,
+    "avg_appearances_per_strategy": 35.08,
+    "performance_summary": {
+      "columns": [
+        "group",
+        "avg_balance",
+        "median_balance",
+        "avg_trades",
+        "avg_drawdown",
+        "config_count"
+      ],
+      "rows": [
+        {
+          "group": "Target (0.1/1.0)",
+          "avg_balance": NaN,
+          "median_balance": NaN,
+          "avg_trades": NaN,
+          "avg_drawdown": NaN,
+          "config_count": 9226
+        },
+        {
+          "group": "Other Settings",
+          "avg_balance": NaN,
+          "median_balance": NaN,
+          "avg_trades": NaN,
+          "avg_drawdown": NaN,
+          "config_count": 375792
+        }
+      ]
+    }
+  },
+  "stochastic_impact": {
+    "overall": {
+      "columns": [
+        "use_stochastic",
+        "avg_balance",
+        "avg_dd",
+        "avg_trades",
+        "config_count"
+      ],
+      "rows": [
+        {
+          "use_stochastic": false,
+          "avg_balance": NaN,
+          "avg_dd": NaN,
+          "avg_trades": NaN,
+          "config_count": 17618
+        },
+        {
+          "use_stochastic": true,
+          "avg_balance": NaN,
+          "avg_dd": NaN,
+          "avg_trades": NaN,
+          "config_count": 367400
+        }
+      ]
+    },
+    "elite": {
+      "columns": [
+        "use_stochastic",
+        "count",
+        "elite_avg_balance"
+      ],
+      "rows": []
+    }
+  },
+  "lookback_ranking": {
+    "columns": [
+      "entry_lookback_units",
+      "era_count",
+      "unique_eras",
+      "avg_balance",
+      "median_balance",
+      "avg_drawdown",
+      "total_configs"
+    ],
+    "rows": []
+  }
+}

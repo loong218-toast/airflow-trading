@@ -197,31 +197,32 @@ def load_cached(kind: str, months: int, era_label: str, regime_id: str) -> Optio
         return None
 
 def stage_for_flush(kind: str, months: int, era_label: str, regime_id: str, df_new: pl.DataFrame) -> None:
-    """
-    WORKER-ONLY WRITE: Each worker writes a unique file. No reading, no merging.
-    """
     if df_new is None or df_new.height == 0:
         return
 
-    # 1. Identify unique worker via Airflow environment variables
     worker_id = str(os.getenv("AIRFLOW_MAP_INDEX", "0"))
-    
-    # 2. Define unique path: config_{id}_batch_{worker}.parquet
     tmp_dir = _get_tmp_dir()
     worker_part = tmp_dir / f"config_{regime_id}_batch_{worker_id}.parquet"
 
-    # 3. Ensure schema is canonical before saving
-    from etl.schema import enforce_schema
     df_to_write = enforce_schema(df_new, kind, strict=True)
 
+    fd, tmp_name = tempfile.mkstemp(prefix=worker_part.name + ".", dir=str(tmp_dir))
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+
     try:
-        # 4. Atomic Write (Overwrite any existing file for THIS specific worker/config only)
-        df_to_write.write_parquet(str(worker_part), compression="snappy")
+        df_to_write.write_parquet(str(tmp_path), compression="snappy")
+        os.replace(str(tmp_path), str(worker_part))
         _LOG.debug("Worker %s staged %d rows for cfg %s", worker_id, df_to_write.height, regime_id)
     except Exception as e:
         _LOG.error("Worker %s failed to stage cache for cfg %s: %s", worker_id, regime_id, e)
-        # We raise here because if staging fails, the final merge will produce incomplete results
         raise
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
 
 
 def flush_all_buffers() -> None:

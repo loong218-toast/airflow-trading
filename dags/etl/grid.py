@@ -13,6 +13,7 @@ from collections import defaultdict
 import numpy as np
 import polars as pl
 import pandas as pd
+import secrets
 
 import numba as _numba
 _numba_threads = int(os.getenv("NUMBA_NUM_THREADS", os.getenv("NUMBA_NUM_THREADS_OVERRIDE", "1")))
@@ -59,7 +60,7 @@ from etl.master_io_utils import (
     _flush_master_rows_buffer,
 )
 
-from etl.schema import enforce_schema, get_schema, cast_to_schema
+from etl.schema import enforce_schema, get_schema, cast_to_schema, classify_fragment
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -68,14 +69,13 @@ logger.setLevel(logging.INFO)
 DEFAULT_RUN_CONFIG = {
     "pair": "XXBTZUSD",
     "BASE_MINUTES": 5,
-    "ma_timeframe": "1h",
     "ma_periods": [50, 600],
     "sl_tp_in_pct": True,
     "min_rr": 3.0,
     "sl_range": {"min": 0.1, "max": 2.0, "step": 0.2},
     "tp_range": {"min": 2.0, "max": 8.0, "step": 0.2},
     "exit_windows": [1, 4, 12, 24, 48, 72, 168],
-    "entry_lookback_h": [0, 1, 4, 8, 12, 16, 20, 24, 48, 72, 168],
+    "entry_lookback_units": [0, 1, 4, 8, 12, 16, 20, 24, 48, 72, 168],
     "ma_reversion": [False, True],
     "use_stochastic": False,
     "BTC_SETTINGS": {"spread": 0.0002},
@@ -176,7 +176,7 @@ def generate_configs(session_dir: Path, run_cfg: dict) -> List[Path]:
     cfg_dir = session_dir / "configs"
     cfg_dir.mkdir(parents=True, exist_ok=True)
     exit_windows = run_cfg.get("exit_windows", [24])
-    lookbacks = run_cfg.get("entry_lookback_h", [24])
+    lookbacks = run_cfg.get("entry_lookback_units", [24])
     
     sl_vals, tp_vals = _expand_sl_tp(run_cfg)
     combos = _prune_by_min_rr(sl_vals, tp_vals, float(run_cfg.get("min_rr", 3.0)))
@@ -192,6 +192,9 @@ def generate_configs(session_dir: Path, run_cfg: dict) -> List[Path]:
     stoch_ks = run_cfg.get("stoch_k", [12])
     stoch_thresholds = run_cfg.get("stoch_thresholds", [[20, 80]])
     use_stoch_list = run_cfg.get("use_stochastic", [False, True])
+
+    bbw_periods = run_cfg.get("bbw_periods", [96])
+    bbw_std = run_cfg.get("bbw_std", [2.5])
 
     all_regime_configs = []
     idx = 0
@@ -219,23 +222,31 @@ def generate_configs(session_dir: Path, run_cfg: dict) -> List[Path]:
                             })
 
                 for branch in stoch_branches:
-                    for lb_h in lookbacks:
-                        for exit_h in exit_windows:
-                            regime = {
-                                "regime_id": f"{idx:05d}",
-                                "ma_int": ma_int,
-                                "ma_reversion": ma_rev,
-                                "use_stochastic": use_stoch,
-                                "stoch_key": branch["stoch_key"],
-                                "stoch_col": branch["col"],
-                                "stoch_lower": branch["low"],
-                                "stoch_upper": branch["high"],
-                                "entry_lookback_h": int(lb_h),
-                                "exit_window_h": int(exit_h),
-                                "ma_periods": ma_periods_sorted
-                            }
-                            all_regime_configs.append(regime)
-                            idx += 1
+
+                    for p in bbw_periods:
+                        # If period is 0 (OFF), we only need to run once (std doesn't matter)
+                        current_stds = bbw_std if p > 0 else [0.0]
+                        
+                        for s in current_stds:
+                            for lb_h in lookbacks:
+                                for exit_h in exit_windows:
+                                    regime = {
+                                        "regime_id": f"{idx:05d}",
+                                        "ma_int": ma_int,
+                                        "ma_reversion": ma_rev,
+                                        "use_stochastic": use_stoch,
+                                        "stoch_key": branch["stoch_key"],
+                                        "stoch_col": branch["col"],
+                                        "stoch_lower": branch["low"],
+                                        "stoch_upper": branch["high"],
+                                        "bbw_periods": int(p),
+                                        "bbw_std": float(s),
+                                        "entry_lookback_units": int(lb_h),
+                                        "exit_window_h": int(exit_h),
+                                        "ma_periods": ma_periods_sorted
+                                    }
+                                    all_regime_configs.append(regime)
+                                    idx += 1
 
     total_regimes = len(all_regime_configs)
     batch_size = int(run_cfg.get("BATCH_SIZE", 150))
@@ -277,7 +288,7 @@ def list_pending_config_paths(session_dir: Path) -> List[str]:
             if not sample_logged and regimes:
                 sample_r = regimes[0]
                 logger.info("🛠️ SAMPLE REGIME FROM BATCH %s:", batch_path.name)
-                logger.info("   > Lookback: %s", sample_r.get("entry_lookback_h"))
+                logger.info("   > Lookback: %s", sample_r.get("entry_lookback_units"))
                 logger.info("   > MA Int: %s | MA Periods: %s", sample_r.get("ma_int"), sample_r.get("ma_periods"))
                 logger.info("   > Stoch: %s | MA Rev: %s", sample_r.get("use_stochastic"), sample_r.get("ma_reversion"))
                 sample_logged = True
@@ -297,81 +308,141 @@ def list_pending_config_paths(session_dir: Path) -> List[str]:
     return pending_batches
 
 class EquityStager:
-    def __init__(self, equity_part_base: Path, batch_id: int, flush_rows: int, partition_by: str,
-                 max_total_rows: int = 200_000, max_partitions: int = 128):
+    """
+    One temp parquet per (partition_key, batch_id, worker_id).
+    Appends row groups to the same file instead of creating many files.
+    """
+
+    def __init__(
+        self,
+        equity_part_base: Path,
+        batch_id: int,
+        flush_rows: int,
+        partition_by: str,
+        max_total_rows: int = 200_000,
+        max_partitions: int = 128,
+        tmp_dir: Optional[Path] = None,
+    ):
         self.base = Path(equity_part_base)
-        self.batch_id = batch_id
+        self.batch_id = int(batch_id)
         self.flush_rows = int(flush_rows)
-        self.partition_by = partition_by
-        self._staging = {}
-        self._staging_rows = {}
-        self._total_rows = 0
+        self.partition_by = str(partition_by)
+
         self.max_total_rows = int(max_total_rows)
         self.max_partitions = int(max_partitions)
 
+        self._tmp_dir = Path(tmp_dir) if tmp_dir is not None else (self.base / "_tmp")
+        self._tmp_dir.mkdir(parents=True, exist_ok=True)
+        self.base.mkdir(parents=True, exist_ok=True)
+
+        # Open writer per partition key and keep it open until flush_all()
+        self._writers: Dict[str, pq.ParquetWriter] = {}
+        self._paths: Dict[str, Path] = {}
+
+    def _worker_id(self) -> str:
+        return os.getenv("AIRFLOW_MAP_INDEX", "0")
+
+    def _part_path(self, part_key: str) -> Path:
+        worker_id = self._worker_id()
+        return self._tmp_dir / (
+            f"equity_{self.partition_by}={part_key}"
+            f"_batch={self.batch_id}"
+            f"_worker={worker_id}.parquet"
+        )
+
+    def _ensure_writer(self, part_key: str, first_table: Optional[pl.DataFrame] = None) -> pq.ParquetWriter:
+        writer = self._writers.get(part_key)
+        if writer is not None:
+            return writer
+
+        out_path = self._part_path(part_key)
+        self._paths[part_key] = out_path
+
+        # Fresh run or stale partial file: overwrite cleanly
+        if out_path.exists():
+            try:
+                out_path.unlink()
+            except Exception:
+                pass
+
+        if first_table is None or first_table.height == 0:
+            raise RuntimeError(f"Cannot open ParquetWriter for empty equity batch: part_key={part_key}")
+
+        arrow_table = first_table.to_arrow()
+        writer = pq.ParquetWriter(
+            str(out_path),
+            arrow_table.schema,
+            compression="snappy",
+        )
+        self._writers[part_key] = writer
+        return writer
+
+    def _append_df(self, part_key: str, df_chunk: pl.DataFrame):
+        if df_chunk is None or df_chunk.height == 0:
+            return
+
+        # Enforce canonical equity schema once before writing
+        df_chunk = enforce_schema(df_chunk, "equity", strict=True)
+        if df_chunk.height == 0:
+            return
+
+        writer = self._ensure_writer(part_key, df_chunk)
+        writer.write_table(df_chunk.to_arrow())
+
     def stage(self, part_key: str, df_small: pl.DataFrame):
-        try:
-            df_small = enforce_schema(df_small, "equity")
-        except Exception:
-            logger.debug("EquityStager: enforce_schema failed for partition %s; staging without enforcement", part_key)
-
-        lst = self._staging.get(part_key)
-        if lst is None:
-            lst = []
-            self._staging[part_key] = lst
-            self._staging_rows[part_key] = 0
-        lst.append(df_small)
-        self._staging_rows[part_key] += int(df_small.height)
-        self._total_rows += int(df_small.height)
-
-        if self._staging_rows[part_key] >= self.flush_rows:
-            self.flush(part_key)
+        """
+        Append equity rows immediately, chunked by flush_rows to keep memory low.
+        """
+        if df_small is None or df_small.height == 0:
             return
 
-        if self._total_rows >= self.max_total_rows or len(self._staging) > self.max_partitions:
-            self.flush(part_key)
-
-    def flush(self, part_key: str):
-        lst = self._staging.get(part_key)
-        if not lst:
-            self._staging_rows[part_key] = 0
-            return
-        to_write = pl.concat(lst, how='vertical') if len(lst) > 1 else lst[0]
         try:
-            to_write = enforce_schema(to_write, "equity")
+            df_canonical = enforce_schema(df_small, "equity", strict=True)
         except Exception:
-            logger.debug("EquityStager.flush: enforce_schema failed; continuing with original DF")
-        part_dir = self.base / f"{self.partition_by}={part_key}"
-        part_dir.mkdir(parents=True, exist_ok=True)
-        out_file = part_dir / f"batch_{self.batch_id:04d}_{part_key}_{int(time.time()*1000)}.parquet"
-        _atomic_write_parquet(to_write, out_file)
-        removed_rows = self._staging_rows.get(part_key, 0)
-        self._total_rows = max(0, self._total_rows - removed_rows)
-        self._staging[part_key] = []
-        self._staging_rows[part_key] = 0
+            logger.exception("EquityStager.stage: enforce_schema failed for part %s; skipping fragment", part_key)
+            return
+
+        if df_canonical.height == 0:
+            return
+
+        # Write in smaller chunks if the input batch is large
+        n = int(df_canonical.height)
+        step = max(1, int(self.flush_rows))
+
+        for start in range(0, n, step):
+            chunk = df_canonical.slice(start, step)
+            try:
+                self._append_df(part_key, chunk)
+            except Exception:
+                logger.exception("EquityStager.stage: write failed for part %s", part_key)
+                raise
+
+        # free temporary objects quickly
         try:
+            del df_canonical
             gc.collect()
         except Exception:
             pass
 
+    def flush(self, part_key: str):
+        """
+        No buffer to flush because writes are immediate.
+        Kept as a no-op interface method.
+        """
+        return
+
     def flush_all(self):
-        for k in list(self._staging.keys()):
+        """
+        Close all open Parquet writers.
+        """
+        for part_key, writer in list(self._writers.items()):
             try:
-                self.flush(k)
-            except Exception as e:
-                logger.exception("EquityStager.flush_all: failed for %s: %s", k, e)
+                writer.close()
+            except Exception:
+                logger.exception("EquityStager.flush_all: failed to close writer for %s", part_key)
 
-class NoopStager:
-    """Truly silent stager that mimics the EquityStager interface."""
-    def __init__(self, *args, **kwargs):
-        self.partition_by = ""
-        self.base = Path("/dev/null") # Safety fallback
-        self._staging = {}
-        self._total_rows = 0
-
-    def stage(self, *args, **kwargs): pass
-    def flush(self, *args, **kwargs): pass
-    def flush_all(self, *args, **kwargs): pass
+        self._writers = {}
+        self._paths = {}
 
 # SL/TP helpers (unchanged)
 def _expand_sl_tp(run_cfg: Dict) -> Tuple[List[float], List[float]]:
@@ -637,7 +708,7 @@ def _get_or_generate_signals(
         return pl.DataFrame([], schema=get_schema("signals"))
 
     try:
-        #df_signals = generate_filtered_signals(df_input_slice, {**run_cfg, **regime_cfg, "regime_id": regime_id}, df_main=df_main)
+        df_signals = generate_filtered_signals(df_input_slice, {**run_cfg, **regime_cfg, "regime_id": regime_id}, df_main=df_main)
     except Exception as e:
         # generation failure is critical — raise so caller can decide
         raise RuntimeError(f"generate_filtered_signals failed for regime={regime_id} era={era_label}: {e}") from e
@@ -671,7 +742,6 @@ def _get_or_generate_signals(
     # Return annotated DF for downstream (non-strict so features persist in-memory)
     return enforce_schema(df_signals, "signals", strict=False) if not df_signals.is_empty() else pl.DataFrame([], schema=get_schema("signals"))
 
-# New helper: build and stage equity time-series rows when requested
 def build_and_stage_equity(
     closed_rets: np.ndarray,
     closed_entry_idxs: np.ndarray,
@@ -692,11 +762,6 @@ def build_and_stage_equity(
     ma_p_gap_a_exit: Optional[np.ndarray] = None,
     ma_p_gap_b_exit: Optional[np.ndarray] = None,
 ) -> Tuple[Optional[float], int, float]:
-    """
-    Build equity time-series (pnl_pct, equity) and stage using stager iff run_cfg['Equity_dataset'] is truthy.
-    Returns (final_balance or None, win_pos)
-    This helper centralizes equity creation and staging; when Equity_dataset is False it avoids heavy computations.
-    """
 
     # Compute pnl_pct vectorized and compound equity
     pnl_pct_arr, exit_times_ns = compute_pnl_pct_vectorized(
@@ -714,7 +779,7 @@ def build_and_stage_equity(
         sl_tp_in_pct=bool(run_cfg.get("sl_tp_in_pct", True)),
         funding_period_hours=int(run_cfg.get("funding_period_hours", 8)),
         funding_rate_unit=str(run_cfg.get("funding_rate_unit", "per_period")),
-        spread_is_percent=bool(run_cfg.get("spread_is_percent", True))
+        spread_is_percent=bool(run_cfg.get("spread_is_percent", True)),
     )
 
     equity_arr, max_dd = fast_compound_equity(pnl_pct_arr, 100.0)
@@ -722,19 +787,20 @@ def build_and_stage_equity(
     equity_arr = np.nan_to_num(equity_arr, nan=0.0, posinf=1e37, neginf=-1e37)
     pnl_pct_arr = np.nan_to_num(pnl_pct_arr, nan=0.0, posinf=1e37, neginf=-1e37)
 
-    # Create the lean DataFrame and stage
-    if equity_arr.size:
+    # default results
+    win_pos = int(np.count_nonzero(closed_rets > 0.0)) if closed_rets.size else 0
+    final_balance = float(equity_arr[-1]) if equity_arr.size else 100.0
 
+    # Create the lean DataFrame and stage (only if there are equity points)
+    if equity_arr.size:
         # Prepare gap arrays (convert to float32 and ensure proper length)
         def _prepare_gap(arr):
             if arr is None or arr.size == 0:
                 return np.full(equity_arr.shape[0], np.nan, dtype=np.float32)
-            # ensure float32 and same length
             a = np.asarray(arr, dtype=np.float32)
             if a.shape[0] != equity_arr.shape[0]:
-                # Defensive: truncate or pad with nan
                 if a.shape[0] > equity_arr.shape[0]:
-                    a = a[:equity_arr.shape[0]]
+                    a = a[: equity_arr.shape[0]]
                 else:
                     pad = np.full(equity_arr.shape[0] - a.shape[0], np.nan, dtype=np.float32)
                     a = np.concatenate([a, pad])
@@ -742,8 +808,8 @@ def build_and_stage_equity(
 
         gap_a_entry = _prepare_gap(ma_p_gap_a_entry)
         gap_b_entry = _prepare_gap(ma_p_gap_b_entry)
-        gap_a_exit  = _prepare_gap(ma_p_gap_a_exit)
-        gap_b_exit  = _prepare_gap(ma_p_gap_b_exit)
+        gap_a_exit = _prepare_gap(ma_p_gap_a_exit)
+        gap_b_exit = _prepare_gap(ma_p_gap_b_exit)
 
         equity_data = {
             "regime_id": int(regime_id),
@@ -752,24 +818,39 @@ def build_and_stage_equity(
             "SL": float(sl_val),
             "TP": float(tp_val),
             "time_ns": exit_times_ns.astype(np.int64),
-            "pnl_pct": pnl_pct_arr.astype(np.float32), 
-            "equity": equity_arr.astype(np.float32),  
+            "entry_idx": closed_entry_idxs.astype(np.int64),
+            "exit_idx": closed_exit_idxs.astype(np.int64),
+            "pnl_pct": pnl_pct_arr.astype(np.float32),
+            "equity": equity_arr.astype(np.float32),
             "ma_p_gap_a_entry": gap_a_entry,
             "ma_p_gap_b_entry": gap_b_entry,
-            "ma_p_gap_a_exit":  gap_a_exit,
-            "ma_p_gap_b_exit":  gap_b_exit
+            "ma_p_gap_a_exit": gap_a_exit,
+            "ma_p_gap_b_exit": gap_b_exit,
         }
-        
-        equity_df = cast_to_schema(equity_data, "equity")
 
-        equity_enabled = bool(run_cfg.get("Equity_dataset", True))
-        if equity_enabled:
+        # Build polars DF and cast to canonical equity schema (this simply arranges columns).
+        # The enforcement to canonical types will happen in stager.stage() (which calls enforce_schema).
+        try:
+            equity_df = cast_to_schema(equity_data, "equity")
+        except Exception as e:
+            logger.exception("build_and_stage_equity: failed to build equity DataFrame: %s", e)
+            equity_df = pl.DataFrame([], schema=get_schema("equity"))
+
+        # Validation using schema.classify_fragment (single source of truth)
+        meta = classify_fragment(equity_df, "equity")
+        if not meta.get("is_like", False):
+            logger.error(
+                "build_and_stage_equity: refusing to stage fragment; not equity-like. meta=%s sample=%s",
+                meta,
+                equity_df.head(1).to_dicts() if equity_df.height else None,
+            )
+        else:
+            # choose partition key according to stager.partition_by
             partition_val = str(regime_id) if getattr(stager, "partition_by", "") == "regime_id" else str(era_int)
-            stager.stage(partition_val, equity_df)
-
-
-    win_pos = int(np.count_nonzero(closed_rets > 0.0)) if closed_rets.size else 0
-    final_balance = float(equity_arr[-1]) if equity_arr.size else 100.0
+            try:
+                stager.stage(partition_val, equity_df)
+            except Exception:
+                logger.exception("build_and_stage_equity: stager.stage failed for partition %s", partition_val)
 
     return final_balance, win_pos, float(max_dd)
 
@@ -811,9 +892,6 @@ def _run_backtest_grid(
             bucket_df = None
 
     logger.info(f"DEBUG: era={era_label} regime={regime_id} total_signals={df_signals.height}")
-    if not df_signals.is_empty():
-        logger.info(f"DEBUG: unique_sides={df_signals['side'].unique().to_list()}")
-        logger.info(f"DEBUG: signal_sample={df_signals.head(2).to_dicts()}")
 
     for sl_val, tp_val in combos:
         for side_df_pl, side_flag in ((buys, 1), (sells, -1)):
@@ -831,8 +909,10 @@ def _run_backtest_grid(
                     "ma_reversion": bool(regime_cfg.get("ma_reversion", False)),
                     "use_stochastic": bool(regime_cfg.get("use_stochastic", False)),
                     "stoch_key": str(regime_cfg.get("stoch_key", "OFF")),
-                    "entry_lookback_h": int(regime_cfg.get("entry_lookback_h", 0)),
+                    "entry_lookback_units": int(regime_cfg.get("entry_lookback_units", 0)),
                     "exit_window_h": int(regime_cfg.get("exit_window_h", 0)),
+                    "bbw_periods": int(regime_cfg.get("bbw_periods", 0)),
+                    "bbw_std": float(regime_cfg.get("bbw_std", 0.0)),
                     "SL": float(sl_val),
                     "TP": float(tp_val),
                     "total_pos": 0,
@@ -991,7 +1071,9 @@ def _run_backtest_grid(
                 "regime_id": int(regime_id),
                 "ma_int": int(regime_cfg.get("ma_int", 0)),
                 "ma_reversion": bool(regime_cfg.get("ma_reversion", False)),
-                "entry_lookback_h": int(regime_cfg.get("entry_lookback_h", 0)),
+                "entry_lookback_units": int(regime_cfg.get("entry_lookback_units", 0)),
+                "bbw_periods": int(regime_cfg.get("bbw_periods", 0)),
+                "bbw_std": float(regime_cfg.get("bbw_std", 0.0)),
                 "use_stochastic": bool(regime_cfg.get("use_stochastic", False)),
                 "stoch_key": str(regime_cfg.get("stoch_key", "OFF")),
                 "max_drawdown": float(max_dd)
@@ -1079,17 +1161,10 @@ def process_era_combos(
         if end_ns > max_ns:
             end_ns = max_ns
 
-        # 1. Convert to ns and clamp
-        start_ns = np.datetime64(input_start).astype("datetime64[ns]").astype(np.int64)
-        end_ns = np.datetime64(end).astype("datetime64[ns]").astype(np.int64)
-
-        min_data_ns = int(main_time_ns_arr[0])
-        max_data_ns = int(main_time_ns_arr[-1])
-
         # LOGICAL CHECK: Is this era even inside our data?
-        if end_ns < min_data_ns or start_ns > max_data_ns:
+        if end_ns < min_ns or start_ns > max_ns:
             logger.warning(f"SKIP Era {era_label}: Entirely outside data range. "
-                        f"Data: {pd.to_datetime(min_data_ns)} to {pd.to_datetime(max_data_ns)}")
+                        f"Data: {pd.to_datetime(min_ns)} to {pd.to_datetime(max_ns)}")
             continue
 
         start_idx = int(np.searchsorted(main_time_ns_arr, start_ns, side="left"))
@@ -1185,19 +1260,16 @@ def compute_config_and_save(batch_path: str, session_dir: str, compute_backtest:
     flush_rows = int(run_cfg.get("PARQUET_FLUSH_ROWS", 100_000))
     partition_by = str(run_cfg.get("EQUITY_PARTITION_BY", "era_int"))
 
-    # create either real stager or noop depending on Equity_dataset flag
-    equity_enabled = bool(run_cfg.get("Equity_dataset", True))
-
-    if not equity_enabled:
-        stager = NoopStager()
-    else:
-        # Only the real stager gets the path and creates the directory
-        stager = EquityStager(
-            equity_part_base=session_dir / "equity_partitioned", 
-            batch_id=batch_id, 
-            flush_rows=flush_rows, 
-            partition_by=partition_by
-        )
+    # Use session-local tmp dir so coordinator can find parts (session_dir/equity_partitioned/_tmp)
+    equity_base = session_dir / "equity_partitioned"
+    equity_tmp = equity_base / "_tmp"
+    stager = EquityStager(
+        equity_part_base=equity_base,
+        batch_id=batch_id,
+        flush_rows=flush_rows,
+        partition_by=partition_by,
+        tmp_dir=equity_tmp,
+    )
 
     processed_count = 0
     skipped_count = 0
@@ -1223,9 +1295,11 @@ def compute_config_and_save(batch_path: str, session_dir: str, compute_backtest:
                 logger.debug("regime_id not int-convertible: %s", regime_cfg.get("regime_id"))
             regime_cfg["ma_int"] = int(regime_cfg.get("ma_int", 0) or 0)
             regime_cfg["ma_reversion"] = bool(regime_cfg.get("ma_reversion", False))
-            regime_cfg["entry_lookback_h"] = int(regime_cfg.get("entry_lookback_h", 0) or 0)
+            regime_cfg["entry_lookback_units"] = int(regime_cfg.get("entry_lookback_units", 0) or 0)
             regime_cfg["exit_window_h"] = int(regime_cfg.get("exit_window_h", 0) or 0)
             regime_cfg["use_stochastic"] = bool(regime_cfg.get("use_stochastic", False))
+            #regime_cfg["bbw_periods"] = int(regime_cfg.get("bbw_periods", 0) or 0)
+            #regime_cfg["bbw_std"] = float(regime_cfg.get("bbw_std", 0.0) or 0.0)
 
             regime_id = regime_cfg.get("regime_id")
             summary_path = results_dir / f"cfg_{regime_id}_summary.json"
@@ -1258,6 +1332,7 @@ def compute_config_and_save(batch_path: str, session_dir: str, compute_backtest:
         raise
     finally:
         try:
+            # spill staged equity parts to tmp files (workers do not merge final files)
             stager.flush_all()
             _flush_master_rows_buffer(results_dir, batch_id)
         except Exception as e:
@@ -1268,6 +1343,7 @@ def compute_config_and_save(batch_path: str, session_dir: str, compute_backtest:
         except Exception:
             logger.debug("flush_all_buffers() failed")
 
+        # Merge master metrics parts into batch master (unchanged)
         parts_dir = results_dir / "master_parts" / f"batch_{batch_id:04d}"
         parts = sorted(parts_dir.glob("*.parquet")) if parts_dir.exists() else []
         if parts:

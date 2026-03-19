@@ -171,6 +171,9 @@ def prepare_base_data(session_dir: str, db_uri: str, run_cfg: Dict[str, Any], fo
     grid_start = pd.to_datetime(run_cfg["grid_start_date"], utc=True)
     grid_end = pd.to_datetime(run_cfg["grid_end_date"], utc=True)
 
+    padding_days = run_cfg.get("padded_days", 15) 
+    padded_start = grid_start - pd.Timedelta(days=padding_days)
+
     # quick check: reuse existing global file if present and not forced and it has rows
     if global_base_file.exists() and not force:
         try:
