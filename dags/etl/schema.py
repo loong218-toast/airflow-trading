@@ -33,8 +33,10 @@ MASTER_SCHEMA: Dict[str, pl.DataType] = {
     "exit_window_h": pl.Int32,
     "use_stochastic": pl.Boolean,
     "stoch_key": pl.String,   # "12-3-3 (20/80)" (Easy for Humans)
+    "use_bbw": pl.Boolean,
     "bbw_periods": pl.Int32,
     "bbw_std": pl.Float32,
+    "bbw_thresholds": pl.Int32,
     "SL": pl.Float32,
     "TP": pl.Float32,
 

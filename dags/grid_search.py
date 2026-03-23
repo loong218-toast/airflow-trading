@@ -208,10 +208,17 @@ def grid_search_pipeline():
 
     @task()
     def combine_results_task(session_dir: str, dependencies):
-        from etl.grid import combine_results_to_master
-        # We include 'dependencies' in the arguments to force Airflow to wait for workers
+        from etl.merge_utils import combine_results_to_master
         logger.info(f"🧹 Combining results for {session_dir}...")
         return combine_results_to_master(session_dir)
+
+    @task()
+    def combine_equity_task(session_dir: str, dependencies):
+        from etl.merge_utils import combine_all_equity_parts
+        logger.info(f"🧹 Combining equity parts for {session_dir}...")
+        outputs = combine_all_equity_parts(session_dir)
+        logger.info("✅ Equity merge complete: %d era files", len(outputs))
+        return [str(p) for p in outputs]
 
     # --- EXECUTION FLOW ---
     # 1. Setup
@@ -236,7 +243,7 @@ def grid_search_pipeline():
     # Explicitly ensure prep is done before mapping
     p_data >> compute_results
 
-    # compute_results >> join
-    combine_results_task(s_path, dependencies=compute_results)
+    combine_master = combine_results_task(s_path, dependencies=compute_results)
+    combine_equity = combine_equity_task(s_path, dependencies=combine_master)
 
 grid_search_dag = grid_search_pipeline()

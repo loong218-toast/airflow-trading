@@ -1,36 +1,24 @@
-# etl/merge_utils.py
-"""
-Merge utilities: streaming-only merges for cache parts and master aggregation.
-
-- combine_cache(kind, months, era_label, regime_id)
-    merge worker tmp parts (config_{regime_id}_batch_{worker}.parquet) -> final per-era target
-    (signals -> config_{id}.parquet ; backtest -> config_{id}_combos.parquet)
-    Uses Polars streaming only. On any streaming failure it logs diagnostics and raises.
-
-- combine_results_to_master(session_dir)
-    Streaming-only merges for assembling master_metrics.parquet and streaming aggregation of equity partitions.
-"""
 from __future__ import annotations
 
 import os
+import json
 import logging
-import time
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Set
+from collections import defaultdict
+import re
 
 import polars as pl
 import pyarrow.parquet as pq
 
-import glob
-
-from etl.cache import _get_cache_root as _io_get_cache_root  # to build target paths consistently
-from etl.schema import MASTER_SCHEMA, EQUITY_SCHEMA, enforce_schema, get_schema
+from etl.cache import _get_cache_root as _io_get_cache_root
+from etl.schema import MASTER_SCHEMA, enforce_schema, get_schema
 
 _LOG = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------
-# small filesystem helpers (unchanged)
+# small filesystem helpers
 # ---------------------------------------------------------------------
 def _tmp_dir() -> Path:
     tmp = os.getenv("CACHE_TMP_DIR", None)
@@ -52,13 +40,19 @@ def _target_path(kind: str, months: int, era_label: str, regime_id: str) -> Path
     base = _era_dir_base(months, kind, era_label)
     if kind == "signals":
         return base / f"config_{regime_id}.parquet"
-    else:
-        return base / f"config_{regime_id}_combos.parquet"
+    return base / f"config_{regime_id}_combos.parquet"
 
 
-def _worker_parts_for_config(regime_id: str) -> List[Path]:
-    td = _tmp_dir()
-    return sorted(td.glob(f"config_{regime_id}_batch_*.parquet"))
+def _worker_parts_for_config(kind: str, months: int, era_label: str, regime_id: str) -> List[Path]:
+    tmp = _tmp_dir()
+    pattern = f"{kind}_config_{regime_id}_era_{era_label}_batch_*.parquet"
+    return sorted(tmp.glob(pattern))
+
+
+def _equity_tmp_dir(session_dir: Path) -> Path:
+    tmp_dir = session_dir / "equity_partitioned" / "_tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    return tmp_dir
 
 
 # ---------------------------------------------------------------------
@@ -75,15 +69,12 @@ def _is_float_dtype(dt: pl.DataType) -> bool:
 def get_canonical_casts(kind: str, input_cols: Set[str]) -> List[pl.Expr]:
     """
     Build cast expressions for a streaming pipeline based on the canonical schema for `kind`.
-    Ensures Int/Float safety: fills nulls for ints and clips floats when targeting Float32.
     """
-    from etl.schema import get_schema
-
     schema = get_schema(kind)
     exprs: List[pl.Expr] = []
+
     for col_name, dtype in schema.items():
         if col_name in input_cols:
-            # present in input: cast with safety for ints/floats
             if _is_int_dtype(dtype):
                 exprs.append(pl.col(col_name).fill_nan(None).fill_null(0).cast(dtype).alias(col_name))
             elif _is_float_dtype(dtype):
@@ -94,18 +85,12 @@ def get_canonical_casts(kind: str, input_cols: Set[str]) -> List[pl.Expr]:
             else:
                 exprs.append(pl.col(col_name).cast(dtype).alias(col_name))
         else:
-            # missing: inject typed null
             exprs.append(pl.lit(None).cast(dtype).alias(col_name))
+
     return exprs
 
 
 def _master_cast_exprs_for(schema_cols: Set[str]) -> List[pl.Expr]:
-    """
-    Similar to get_canonical_casts but targeted at MASTER_SCHEMA mapping.
-    Handles Int32 and Float32 (and all canonical master types) safely.
-    """
-    from etl.schema import MASTER_SCHEMA
-
     exprs: List[pl.Expr] = []
     for name, pol_dt in MASTER_SCHEMA.items():
         if name in schema_cols:
@@ -127,7 +112,6 @@ def _master_cast_exprs_for(schema_cols: Set[str]) -> List[pl.Expr]:
 # parquet schema introspection helper
 # ---------------------------------------------------------------------
 def _gather_parquet_schema_names(paths: List[Path]) -> Set[str]:
-    """Return union of column names across given parquet file paths using pyarrow metadata."""
     cols: Set[str] = set()
     for p in paths:
         try:
@@ -148,13 +132,8 @@ def merge_parquet_files_streaming(inputs: List[str], out_path: Path, kind: str) 
     if not inputs:
         raise ValueError(f"No inputs for {kind} merge")
 
-    # 1. Peek at schemas to see what columns we actually have
     all_input_cols = _gather_parquet_schema_names([Path(p) for p in inputs])
-
-    # 2. Build the casting plan based on the official schema
     cast_exprs = get_canonical_casts(kind, all_input_cols)
-    # final order from schema
-    from etl.schema import get_schema
     final_cols = list(get_schema(kind).keys())
 
     tmp_out = out_path.with_suffix(".tmp.parquet")
@@ -170,32 +149,35 @@ def merge_parquet_files_streaming(inputs: List[str], out_path: Path, kind: str) 
         _LOG.error("Strict merge failed for %s: %s", kind, e)
         raise
 
+
 # ---------------------------------------------------------------------
-# Public: combine_cache  (merge worker parts -> final per-era file)
+# Public: combine_cache
 # ---------------------------------------------------------------------
 def combine_cache(kind: str, months: int, era_label: str, regime_id: str) -> Optional[Path]:
     """
-    Merge all worker temp parts for regime_id into the per-era final file.
-
-    - Only streaming merges are used. On failure this raises (so caller sees it).
-    - Removes worker parts on success (best-effort).
-    - Returns the final target Path or None if no worker parts found.
+    Merge all worker temp parts for one (kind, months, era_label, regime_id)
+    into the final per-era cache file.
     """
     if kind not in ("signals", "backtest"):
         raise ValueError("kind must be 'signals' or 'backtest'")
 
-    parts = _worker_parts_for_config(regime_id)
+    parts = _worker_parts_for_config(kind, months, era_label, regime_id)
     if not parts:
-        _LOG.debug("combine_cache: no worker parts found for %s (kind=%s)", regime_id, kind)
+        _LOG.debug(
+            "combine_cache: no worker parts found for kind=%s regime=%s era=%s",
+            kind, regime_id, era_label
+        )
         return None
 
     target = _target_path(kind, months, era_label, regime_id)
     inputs = [str(p) for p in parts]
 
-    _LOG.info("combine_cache: merging %d worker parts for config=%s -> %s", len(inputs), regime_id, target)
+    _LOG.info(
+        "combine_cache: merging %d worker parts for kind=%s cfg=%s era=%s -> %s",
+        len(inputs), kind, regime_id, era_label, target
+    )
     merge_parquet_files_streaming(inputs, target, kind)
 
-    # cleanup worker parts on success (best-effort)
     for p in parts:
         try:
             p.unlink(missing_ok=True)
@@ -205,30 +187,139 @@ def combine_cache(kind: str, months: int, era_label: str, regime_id: str) -> Opt
     return target
 
 
+import re
+from collections import defaultdict
+
+_EQUITY_SHARD_RE = re.compile(
+    r"^equity_era_int=(?P<era>\d+)_batch=(?P<batch>\d+)_(?:worker|task)=(?P<unit>\d+)\.parquet$"
+)
+
+def _equity_tmp_dir(session_dir: Path) -> Path:
+    tmp_dir = session_dir / "equity_partitioned" / "_tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    return tmp_dir
+
+
+def _equity_parts_for_partition(
+    session_dir: Path,
+    partition_key: str,
+    batch_id: Optional[int] = None,
+) -> List[Path]:
+    tmp_dir = _equity_tmp_dir(session_dir)
+
+    if batch_id is None:
+        candidates = sorted(tmp_dir.glob(f"equity_era_int={partition_key}_batch=*.parquet"))
+    else:
+        candidates = sorted(tmp_dir.glob(f"equity_era_int={partition_key}_batch={int(batch_id)}_*.parquet"))
+
+    parts: List[Path] = []
+    for p in candidates:
+        m = _EQUITY_SHARD_RE.match(p.name)
+        if not m:
+            _LOG.debug("Skipping non-matching equity shard: %s", p.name)
+            continue
+        parts.append(p)
+
+    return parts
+
+
+def combine_equity_parts(
+    session_dir: Path,
+    partition_key: str,
+    batch_id: Optional[int] = None,
+) -> Optional[Path]:
+    """
+    Merge worker/task equity shards for one era into a single final equity parquet.
+    """
+    parts = _equity_parts_for_partition(session_dir, partition_key, batch_id=batch_id)
+    if not parts:
+        _LOG.debug(
+            "combine_equity_parts: no equity shards found for era=%s batch=%s",
+            partition_key, batch_id
+        )
+        return None
+
+    final_dir = session_dir / "equity_partitioned" / f"era_int={partition_key}"
+    final_dir.mkdir(parents=True, exist_ok=True)
+    final_path = final_dir / f"equity_era_int={partition_key}.parquet"
+
+    _LOG.info(
+        "combine_equity_parts: merging %d shards for era=%s batch=%s -> %s",
+        len(parts), partition_key, batch_id, final_path
+    )
+
+    merge_parquet_files_streaming([str(p) for p in parts], final_path, kind="equity")
+
+    merged_schema = pl.read_parquet_schema(str(final_path))
+    missing = set(get_schema("equity").keys()) - set(merged_schema.keys())
+    if missing:
+        raise RuntimeError(f"Post-merge: missing columns in final equity {missing}")
+
+    manifest = {"parts": [str(p) for p in parts], "final": str(final_path)}
+    final_path.with_suffix(".manifest.json").write_text(json.dumps(manifest, indent=2))
+
+    for p in parts:
+        try:
+            p.unlink(missing_ok=True)
+        except Exception:
+            _LOG.debug("combine_equity_parts: failed to remove shard %s (ignored)", p)
+
+    return final_path
+
+
+def combine_all_equity_parts(
+    session_dir: str | Path,
+    batch_id: Optional[int] = None,
+) -> List[Path]:
+    """
+    Merge every era found in session_dir/equity_partitioned/_tmp.
+    Safe for low RAM because each era is merged separately with streaming.
+    """
+    session_dir = Path(session_dir)
+    tmp_dir = _equity_tmp_dir(session_dir)
+
+    if batch_id is None:
+        candidates = sorted(tmp_dir.glob("equity_era_int=*_batch=*.parquet"))
+    else:
+        candidates = sorted(tmp_dir.glob(f"equity_era_int=*_batch={int(batch_id)}_*.parquet"))
+
+    eras: Dict[str, List[Path]] = defaultdict(list)
+
+    for p in candidates:
+        m = _EQUITY_SHARD_RE.match(p.name)
+        if not m:
+            continue
+        era = m.group("era")
+        if batch_id is not None and int(m.group("batch")) != int(batch_id):
+            continue
+        eras[era].append(p)
+
+    outputs: List[Path] = []
+    for era in sorted(eras.keys()):
+        out = combine_equity_parts(session_dir=session_dir, partition_key=era, batch_id=batch_id)
+        if out is not None:
+            outputs.append(out)
+
+    _LOG.info("combine_all_equity_parts: merged %d era files", len(outputs))
+    return outputs
+
 # ---------------------------------------------------------------------
-# Streaming-only combine_results_to_master (shorter / less redundant)
+# Master merge
 # ---------------------------------------------------------------------
 def combine_results_to_master(session_dir: str) -> Dict[str, Any]:
     """
     Streaming-only combine for final master_metrics.parquet.
-
-    Steps:
-      1) Merge per-batch master parts (streaming) into master_metrics.parquet.
-      2) Aggregate equity partition streaming and left-join aggregates into master.
-      3) Write final master (canonical types).
+    This function only handles master metrics.
+    Equity merging is handled separately by combine_equity_parts().
     """
-
     session_dir = Path(session_dir)
     results_dir = session_dir / "results"
     master_metrics_path = session_dir / "master_metrics.parquet"
-    equity_part_dir = session_dir / "equity_partitioned"
 
-    # 1) discover batch master parts and merge streaming (or create empty canonical)
     batch_files = sorted(results_dir.glob("batch_*_master_metrics.parquet")) if results_dir.exists() else []
     nonempty = []
     for p in batch_files:
         try:
-            # This check detects corruption/truncation
             meta = pq.ParquetFile(str(p)).metadata
             if meta.num_rows > 0:
                 nonempty.append(p)
@@ -237,91 +328,24 @@ def combine_results_to_master(session_dir: str) -> Dict[str, Any]:
 
     if nonempty:
         _LOG.info("Merging %d batch masters...", len(nonempty))
-        # Use a lazy scan and cast using the schema helper logic
+        tmp_master = master_metrics_path.with_suffix(".tmp.parquet")
+        try:
+            pl.scan_parquet([str(p) for p in nonempty]).sink_parquet(str(tmp_master), compression="snappy")
+            os.replace(str(tmp_master), str(master_metrics_path))
+        except Exception:
+            if tmp_master.exists():
+                tmp_master.unlink(missing_ok=True)
+            raise
 
-        df_master = pl.scan_parquet([str(p) for p in nonempty]).collect()
-        df_master = enforce_schema(df_master, "master", strict=True)
-        df_master.write_parquet(master_metrics_path)
-
-        _LOG.info("✅ Successfully merged %d batches into master_metrics (Rows: %d)", len(nonempty), df_master.height)
+        _LOG.info("✅ Successfully merged %d batches into master_metrics", len(nonempty))
     else:
         df_master = pl.DataFrame([], schema=MASTER_SCHEMA)
         df_master.write_parquet(master_metrics_path)
-
         _LOG.info("⚠️ No batch data found. Created empty master_metrics.")
+        return {"status": "complete_no_batch_data", "path": str(master_metrics_path), "rows": 0}
 
-    has_equity_data = False
-    if equity_part_dir.exists():
-        # Stop searching the moment we find a single file
-        for _ in equity_part_dir.rglob("*.parquet"):
-            has_equity_data = True
-            break
-
-    if has_equity_data:
-        _LOG.info("Aggregating equity files to hydrate master metrics...")
-        
-        # A. COMPACT: Move worker fragments from _tmp/ to era_int=X/
-        tmp_dir = equity_part_dir / "_tmp"
-        if tmp_dir.exists():
-            from etl.equity_io import combine_equity_parts
-
-            all_tmp = list(tmp_dir.glob("equity_*.parquet"))
-            unique_keys = set()
-
-            for f in all_tmp:
-                name = f.name
-                if name.startswith("equity_era_int="):
-                    unique_keys.add(name.split("equity_era_int=", 1)[1].split("_cfg=", 1)[0])
-
-            for partition_key in unique_keys:
-                _LOG.debug("Compacting equity partition %s", partition_key)
-                combine_equity_parts(session_dir, partition_key, partition_by="era_int")
-
-        join_keys = [k for k in MASTER_SCHEMA.keys() if k in EQUITY_SCHEMA.keys()]
-        agg_targets = ["total_pos", "win_pos", "balance", "max_drawdown"] 
-
-        
-        # Construct the search pattern
-        pattern = str(equity_part_dir / "era_int=*" / "*.parquet")
-
-        # Check if ANY files actually match that specific pattern
-        if not glob.glob(pattern):
-            _LOG.warning("⚠️ No partitioned equity files found in era_int folders. Skipping aggregation.")
-            # Create a dummy scan from an empty dataframe with the right schema
-            equity_scan = pl.DataFrame([], schema=EQUITY_SCHEMA).lazy()
-        else:
-            equity_scan = pl.scan_parquet(pattern)
-
-        
-        df_equity_aggs = (
-            equity_scan
-            .group_by(join_keys)
-            .agg([
-                pl.len().alias("total_pos"),
-                pl.col("pnl_pct").filter(pl.col("pnl_pct") > 0).count().alias("win_pos"),
-                pl.col("equity").last().alias("balance"),
-                ((pl.col("equity").cum_max() - pl.col("equity")) / pl.col("equity").cum_max()).max().alias("max_drawdown")
-            ])
-            .collect()
-        )
-
-        # C. JOIN: Merge the results into our master metrics
-        # This turns a "Plan" into a "Result"
-        if not df_equity_aggs.is_empty():
-            _LOG.info("Equity data found. Updating master metrics...")
-            
-            # 1. Drop only if we are about to join
-            df_master = df_master.drop([c for c in agg_targets if c in df_master.columns])
-            
-            # 2. Join the new calculated values
-            df_master = df_master.join(df_equity_aggs, on=join_keys, how="left")
-            
-            # 3. Enforce schema to handle any Nulls created by missing equity logs
-            df_master = enforce_schema(df_master, "master", strict=True)
-        else:
-            _LOG.warning("No equity data to join. Preserving original batch metrics.")
-
+    df_master = pl.read_parquet(master_metrics_path)
+    df_master = enforce_schema(df_master, "master", strict=True)
     df_master.write_parquet(master_metrics_path)
 
-    status = "complete_with_equity" if has_equity_data else "complete_no_equity"
-    return {"status": status, "path": str(master_metrics_path), "rows": df_master.height}
+    return {"status": "complete_master_only", "path": str(master_metrics_path), "rows": df_master.height}

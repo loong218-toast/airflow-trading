@@ -170,13 +170,14 @@ def precompute_all_possible_features(df: pl.DataFrame, run_cfg: dict) -> pl.Data
                     s_min = pl.col("close").rolling_min(k_window, min_periods=1)
                     s_max = pl.col("close").rolling_max(k_window, min_periods=1)
                     
-                    # We use a temporary scope to avoid column name collisions
                     df = df.with_columns([
                         (100.0 * (pl.col("close") - s_min) / (s_max - s_min)).fill_nan(50.0).alias("_k")
                     ]).with_columns([
-                        pl.col("_k").rolling_mean(d_window, min_periods=1).alias("_d")
+                        # Change rolling_mean to ewm_mean
+                        pl.col("_k").ewm_mean(span=d_window, adjust=False).alias("_d")
                     ]).with_columns([
-                        pl.col("_d").rolling_mean(s_window, min_periods=1).alias(col_name)
+                        # Change rolling_mean to ewm_mean
+                        pl.col("_d").ewm_mean(span=s_window, adjust=False).alias(col_name)
                     ]).drop(["_k", "_d"])
 
     # --- 3. Breakouts (precompute for every requested entry_lookback_h) ---
@@ -195,30 +196,41 @@ def precompute_all_possible_features(df: pl.DataFrame, run_cfg: dict) -> pl.Data
         ])
 
         if lb_units == 0:
-            # Create a "Neutral" column. 
-            # Note: This will NOT trigger trades with your current (>=1.0 / <=0.0) logic.
             df = df.with_columns([
-                pl.lit(None).cast(pl.Float32).alias("breakout_0u")
+                pl.lit(1.0).cast(pl.Float32).alias("breakout_0u") # 1.0 means 'always triggered'
             ])
-            continue
 
-    # --- 4. Bollinger Band Width (BBW) ---
+# --- 4. Normalized Bollinger Band Width (BBW) ---
     bbw_periods = run_cfg.get("bbw_periods", [])
-    bbw_std = run_cfg.get("bbw_std", [2.0]) # Default to 2.0 if not provided
+    bbw_std = run_cfg.get("bbw_std", [2.5])
+    # We use a long lookback to find the "Era Min/Max" for volatility
+    rel_lookback = 500 
 
     for p in bbw_periods:
+        if p <= 0: continue 
+            
         for s in bbw_std:
-            # Scale window by modifier (e.g., 24 * 3 = 72 candles)
             n = max(1, p * unit_mult)
             col_name = f"bbw_p{p}_s{s}"
             
-            # Calculate Rolling Mean and Std Dev
-            # Note: We use ddof=0 for consistency with most trading platforms
+            # 1. Calculate Raw BBW
             rolling_mean = pl.col("close").rolling_mean(n)
             rolling_std = pl.col("close").rolling_std(n, ddof=0)
+            raw_bbw = (2 * s * rolling_std) / rolling_mean
             
+            # 2. Calculate Rolling Min/Max of the Width itself
+            # This identifies the "Squeeze" (Min) and "Expansion" (Max)
+            b_min = raw_bbw.rolling_min(window_size=rel_lookback)
+            b_max = raw_bbw.rolling_max(window_size=rel_lookback)
+            
+            # 3. Create the 0-100 Relative Scale
+            # 50 = Exactly the middle of recent volatility
             df = df.with_columns([
-                ((2 * s * rolling_std) / rolling_mean).cast(pl.Float32).alias(col_name)
+                (100 * (raw_bbw - b_min) / (b_max - b_min))
+                .fill_nan(50)
+                .clip(0, 100) # Ensure no outliers
+                .cast(pl.Float32)
+                .alias(col_name)
             ])
 
 
@@ -270,12 +282,13 @@ def generate_filtered_signals(df_slice: pl.DataFrame, cfg: dict, df_main: Option
     # --- 1. Entry Lookback Logic ---
     lb_units = int(cfg.get("entry_lookback_units", 0))
 
-    brk_col = f"breakout_{lb_units}u"
-    if brk_col in df_slice.columns:
-        # .fill_null(False) ensures that warmup periods don't trigger trades
-        # AND don't break the logical chain.
-        cond_buy = cond_buy & (pl.col(brk_col) >= 1.0).fill_null(False)
-        cond_sell = cond_sell & (pl.col(brk_col) <= 0.0).fill_null(False)
+    # Only apply the filter if units > 0. 
+    # If units == 0, we skip this and cond_buy stays True (passing through).
+    if lb_units > 0:
+        brk_col = f"breakout_{lb_units}u"
+        if brk_col in df_slice.columns:
+            cond_buy = cond_buy & (pl.col(brk_col) >= 0.8).fill_null(False)
+            cond_sell = cond_sell & (pl.col(brk_col) <= 0.2).fill_null(False)
 
     # --- 2. Stochastic Logic (CLEANED) ---
     if cfg.get("use_stochastic", False):
@@ -310,24 +323,22 @@ def generate_filtered_signals(df_slice: pl.DataFrame, cfg: dict, df_main: Option
                         cond_buy = cond_buy & (pl.col("close") < pl.col(kama_col_name)).fill_null(False)
                         cond_sell = cond_sell & (pl.col("close") > pl.col(kama_col_name)).fill_null(False)
 
-    bbw_p = cfg.get("bbw_periods", 0)
-    bbw_s = cfg.get("bbw_std", 0.0)
+    # --- 4. BBW Threshold Gate ---
+    if cfg.get("use_bbw", False):
+        p = cfg.get("bbw_periods")
+        s = cfg.get("bbw_std")
+        threshold = cfg.get("bbw_thresholds", 50) # Now 50 means "Median Volatility"
+        
+        bbw_col = f"bbw_p{p}_s{s}"
+        
+        if bbw_col in df_slice.columns:
+            # Entry only if volatility is in the lower half of recent history
+            vol_gate = (pl.col(bbw_col) <= threshold).fill_null(False)
+            
+            cond_buy = cond_buy & vol_gate
+            cond_sell = cond_sell & vol_gate
 
-    # --- 4. Evaluate and Return Strict 4 Columns ---
-    # We switch to lazy evaluation here for maximum Polars performance
-    df_out = (
-        df_slice.with_columns([
-            pl.when(cond_buy).then(pl.lit(1))
-              .when(cond_sell).then(pl.lit(-1))
-              .otherwise(pl.lit(0))
-              .alias("side"),
-            pl.lit(cfg.get("regime_id", 0)).cast(pl.Int32).alias("regime_id")
-        ])
-        .filter(pl.col("side") != 0)
-        .select(["idx", "time_ns", "side", "regime_id"]) # Ensure strict output
-    )
-
-    # --- 4. Evaluate both directions independently ---
+    # --- 5. Evaluate both directions independently ---
     # Create Buy Signals
     df_buys = (
         df_slice.filter(cond_buy)

@@ -396,6 +396,21 @@ services:
       airflow-init:
         condition: service_completed_successfully
 
+  signal-api:
+    build: ./signal-api
+    container_name: signal-api
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: airflow
+      CORS_ORIGINS: https://loong218-toast.github.io/airflow-trading/
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+    restart: always
+
 volumes:
   postgres-db-volume:
 

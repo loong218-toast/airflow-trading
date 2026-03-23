@@ -79,41 +79,20 @@ with DAG(
         PRIMARY KEY (pair, market_type, time)
     );
 
-    CREATE INDEX IF NOT EXISTS ix_dfmain_pair_time_ns ON df_main (pair, time_ns);
-    CREATE INDEX IF NOT EXISTS ix_dfmain_era ON df_main (era_int);
+        CREATE INDEX IF NOT EXISTS ix_dfmain_pair_time_ns ON df_main (pair, time_ns);
+        CREATE INDEX IF NOT EXISTS ix_dfmain_era ON df_main (era_int);
 
-        -- 6. Moving Averages Table
-        CREATE TABLE IF NOT EXISTS indicator_ma (
+        CREATE TABLE IF NOT EXISTS signal_state_latest (
         pair TEXT NOT NULL,
-        market_type TEXT NOT NULL, 
-        time TIMESTAMP WITH TIME ZONE NOT NULL,
+        market_type TEXT NOT NULL,
+        side INT NOT NULL,
+        regime_id INT NOT NULL,
+        signal_time TIMESTAMPTZ NOT NULL,
         time_ns BIGINT NOT NULL,
-        ma_a DOUBLE PRECISION, -- Generic Slot 1
-        ma_b DOUBLE PRECISION, -- Generic Slot 2
-        ma_c DOUBLE PRECISION, -- Generic Slot 3
-        ma_d DOUBLE PRECISION, -- Generic Slot 4
-        price_ma_gap_h REAL,
-        ma_gap_a REAL,
-        ma_gap_b REAL,
-        ma_gap_c REAL,
-        PRIMARY KEY (pair, market_type, time)
-    );
-
-        CREATE INDEX IF NOT EXISTS ix_ma_pair_time_ns ON indicator_ma (pair, time_ns);
-
-        -- 7. Stochastic Oscillator Table
-        CREATE TABLE IF NOT EXISTS indicator_stochastic (
-            pair TEXT NOT NULL,
-            market_type TEXT NOT NULL,
-            time TIMESTAMP WITH TIME ZONE NOT NULL,
-            time_ns BIGINT NOT NULL,
-            pct_k REAL,            -- Fast line
-            pct_d REAL,            -- Slow line (SMA of K)
-            pct_d_slow REAL,       -- Further smoothed line
-            PRIMARY KEY (pair, market_type, time)
+        message TEXT,
+        updated_at TIMESTAMPTZ DEFAULT now(),
+        PRIMARY KEY (pair, market_type)
         );
-
-        CREATE INDEX IF NOT EXISTS ix_stoch_pair_time_ns ON indicator_stochastic (pair, time_ns);
 
         -- 8. metadata table
         CREATE TABLE IF NOT EXISTS transform_metadata (

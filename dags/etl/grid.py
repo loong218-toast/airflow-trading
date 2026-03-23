@@ -13,7 +13,9 @@ from collections import defaultdict
 import numpy as np
 import polars as pl
 import pandas as pd
+import pyarrow.parquet as pq
 import secrets
+from itertools import product
 
 import numba as _numba
 _numba_threads = int(os.getenv("NUMBA_NUM_THREADS", os.getenv("NUMBA_NUM_THREADS_OVERRIDE", "1")))
@@ -41,6 +43,7 @@ from etl.db import get_engine
 from etl.backtest import (
     backtest_signals_sl_tp_rets,
     fast_compound_equity,
+    fast_compound_equity_gate,
     compute_pnl_pct_vectorized,
     warmup_numba_kernels,
 )
@@ -85,7 +88,6 @@ DEFAULT_RUN_CONFIG = {
     "conservative_sl_first": True,
     "treat_no_hit_as_loss": True,
     "BATCH_SIZE": 80,
-    "COMBINE_BATCH_SIZE": 400,
     "grid_start_date": "2024-09-01T00:00:00Z",
     "grid_end_date": "2025-09-15T23:59:59Z",
     "max_dd_threshold": 0.20,
@@ -172,85 +174,140 @@ def _split_period_windows_from_pl(df: pl.DataFrame, months: int,
         cur = end
     return windows
 
-def generate_configs(session_dir: Path, run_cfg: dict) -> List[Path]:
+def _list(x, default):
+    if x is None:
+        return list(default)
+    if isinstance(x, list):
+        return x
+    if isinstance(x, tuple):
+        return list(x)
+    return [x]
+
+def _stoch_opts(cfg, use_stoch_list):
+    out = []
+
+    ks = _list(cfg.get("stoch_k"), [12]) if "stoch_k" in cfg else _list(cfg.get("k"), [12])
+    ds = _list(cfg.get("stoch_d"), [3]) if "stoch_d" in cfg else _list(cfg.get("d"), [3])
+    ss = _list(cfg.get("stoch_s"), [3]) if "stoch_s" in cfg else _list(cfg.get("s"), [3])
+    ths = _list(cfg.get("stoch_thresholds"), [[20, 80]]) if "stoch_thresholds" in cfg else _list(cfg.get("thresholds"), [[20, 80]])
+
+    for use_stoch in use_stoch_list:
+        if not use_stoch:
+            out.append({
+                "use_stochastic": False,
+                "stoch_key": "OFF",
+                "col": None,
+                "low": None,
+                "high": None,
+            })
+            continue
+
+        for k, d, s, t in product(ks, ds, ss, ths):
+            if not isinstance(t, (list, tuple)) or len(t) != 2:
+                raise ValueError(f"Invalid stoch_threshold entry: {t!r}")
+
+            low = float(t[0])
+            high = float(t[1])
+
+            out.append({
+                "use_stochastic": True,
+                "stoch_key": f"k{k}_d{d}_s{s}_l{low:g}_u{high:g}",
+                "col": f"stoch_k{k}_d{d}_s{s}",
+                "low": low,
+                "high": high,
+            })
+
+    return out
+
+def _bbw_opts(cfg, use_bbw_list):
+    out = []
+
+    periods = [int(x) for x in _list(cfg.get("bbw_periods"), [96]) if int(x) > 0]
+    stds = [float(x) for x in _list(cfg.get("bbw_std"), [2.5])]
+    ths = [float(x) for x in _list(cfg.get("bbw_thresholds"), [50])]
+
+    for use_bbw in use_bbw_list:
+        if not use_bbw:
+            out.append({
+                "use_bbw": False,
+                "bbw_periods": 0,
+                "bbw_std": 0.0,
+                "bbw_thresholds": 0.0,
+            })
+            continue
+
+        for p, s, t in product(periods, stds, ths):
+            out.append({
+                "use_bbw": True,
+                "bbw_periods": p,
+                "bbw_std": s,
+                "bbw_thresholds": t,
+            })
+
+    return out
+
+def _write_batch(path: Path, batch_id: int, rows: list[dict]) -> None:
+    with open(path, "w", encoding="utf8") as f:
+        json.dump({"batch_id": batch_id, "regimes": rows}, f, indent=2)
+
+def generate_configs(session_dir: Path, run_cfg: dict) -> list[Path]:
     cfg_dir = session_dir / "configs"
     cfg_dir.mkdir(parents=True, exist_ok=True)
-    exit_windows = run_cfg.get("exit_windows", [24])
-    lookbacks = run_cfg.get("entry_lookback_units", [24])
-    
+
+    exit_windows = _list(run_cfg.get("exit_windows"), [24])
+    lookbacks = _list(run_cfg.get("entry_lookback_units"), [24])
+
     sl_vals, tp_vals = _expand_sl_tp(run_cfg)
     combos = _prune_by_min_rr(sl_vals, tp_vals, float(run_cfg.get("min_rr", 3.0)))
 
     ma_periods = run_cfg.get("ma_periods", []) or []
     if not isinstance(ma_periods, list):
         ma_periods = list(ma_periods)
-    # Sort to ensure ma_a = smallest, ma_b = next smallest
+
     ma_periods_sorted = sorted({int(x) for x in ma_periods})
     n_bits = len(ma_periods_sorted)
-    max_ma_int = (1 << n_bits) if n_bits > 0 else 1 # range(0, 1) if no MAs
+    max_ma_int = (1 << n_bits) if n_bits > 0 else 1
 
-    stoch_ks = run_cfg.get("stoch_k", [12])
-    stoch_thresholds = run_cfg.get("stoch_thresholds", [[20, 80]])
-    use_stoch_list = run_cfg.get("use_stochastic", [False, True])
+    ma_reversion_list = _list(run_cfg.get("ma_reversion"), [False])
+    use_stoch_list = _list(run_cfg.get("use_stochastic"), [False, True])
+    use_bbw_list = _list(run_cfg.get("use_bbw"), [False, True])
 
-    bbw_periods = run_cfg.get("bbw_periods", [96])
-    bbw_std = run_cfg.get("bbw_std", [2.5])
+    stoch_opts = _stoch_opts(run_cfg, use_stoch_list)
+    bbw_opts = _bbw_opts(run_cfg, use_bbw_list)
 
     all_regime_configs = []
     idx = 0
-    ma_reversion_list = run_cfg.get("ma_reversion", [False, True])
-    use_stoch_list = run_cfg.get("use_stochastic", [False, True])
+
     for ma_rev in ma_reversion_list:
         for ma_int in range(0, max_ma_int):
-            for use_stoch in use_stoch_list:
-
-                stoch_branches = []
-                if not use_stoch:
-                    stoch_branches.append({
-                        "stoch_key": "OFF",
-                        "col": None, "low": None, "high": None
-                    })
-                else:
-                    for k in stoch_ks:
-                        for t in stoch_thresholds:
-                            key = f"k{k}_l{t[0]}_u{t[1]}"
-                            stoch_branches.append({
-                                "stoch_key": key,
-                                "col": f"stoch_k{k}_d3_s3", 
-                                "low": float(t[0]),
-                                "high": float(t[1])
-                            })
-
-                for branch in stoch_branches:
-
-                    for p in bbw_periods:
-                        # If period is 0 (OFF), we only need to run once (std doesn't matter)
-                        current_stds = bbw_std if p > 0 else [0.0]
-                        
-                        for s in current_stds:
-                            for lb_h in lookbacks:
-                                for exit_h in exit_windows:
-                                    regime = {
-                                        "regime_id": f"{idx:05d}",
-                                        "ma_int": ma_int,
-                                        "ma_reversion": ma_rev,
-                                        "use_stochastic": use_stoch,
-                                        "stoch_key": branch["stoch_key"],
-                                        "stoch_col": branch["col"],
-                                        "stoch_lower": branch["low"],
-                                        "stoch_upper": branch["high"],
-                                        "bbw_periods": int(p),
-                                        "bbw_std": float(s),
-                                        "entry_lookback_units": int(lb_h),
-                                        "exit_window_h": int(exit_h),
-                                        "ma_periods": ma_periods_sorted
-                                    }
-                                    all_regime_configs.append(regime)
-                                    idx += 1
+            for st in stoch_opts:
+                for bw in bbw_opts:
+                    for lb_h in lookbacks:
+                        for exit_h in exit_windows:
+                            regime = {
+                                "regime_id": f"{idx:05d}",
+                                "ma_int": int(ma_int),
+                                "ma_reversion": bool(ma_rev),
+                                "use_stochastic": bool(st["use_stochastic"]),
+                                "stoch_key": st["stoch_key"],
+                                "stoch_col": st["col"],
+                                "stoch_lower": st["low"],
+                                "stoch_upper": st["high"],
+                                "use_bbw": bool(bw["use_bbw"]),
+                                "bbw_periods": int(bw["bbw_periods"]),
+                                "bbw_std": float(bw["bbw_std"]),
+                                "bbw_thresholds": float(bw["bbw_thresholds"]),
+                                "entry_lookback_units": int(lb_h),
+                                "exit_window_h": int(exit_h),
+                                "ma_periods": ma_periods_sorted,
+                            }
+                            all_regime_configs.append(regime)
+                            idx += 1
 
     total_regimes = len(all_regime_configs)
     batch_size = int(run_cfg.get("BATCH_SIZE", 150))
     saved_batch_paths = []
+
     logger.info("=" * 60)
     logger.info("🚀 GRID CONFIG GENERATION (BATCH MODE)")
     logger.info("📈 Total Unique Regimes: %d", total_regimes)
@@ -258,16 +315,20 @@ def generate_configs(session_dir: Path, run_cfg: dict) -> List[Path]:
     logger.info("🧪 SL/TP combos per regime: %d", len(combos))
     logger.info("📊 Total Backtests to be run: %d", total_regimes * len(combos))
     logger.info("=" * 60)
+
     for i in range(0, total_regimes, batch_size):
         batch_slice = all_regime_configs[i : i + batch_size]
         batch_num = i // batch_size
         batch_payload = {"batch_id": batch_num, "regimes": batch_slice}
         batch_filename = cfg_dir / f"batch_{batch_num:04d}.json"
+
         with open(batch_filename, "w", encoding="utf8") as f:
             json.dump(batch_payload, f, indent=2)
+
         saved_batch_paths.append(batch_filename)
         if len(saved_batch_paths) % 20 == 0 or i + batch_size >= total_regimes:
             logger.info("📝 Written %d batch files...", len(saved_batch_paths))
+
     return saved_batch_paths
 
 def list_pending_config_paths(session_dir: Path) -> List[str]:
@@ -276,22 +337,12 @@ def list_pending_config_paths(session_dir: Path) -> List[str]:
     batch_files = sorted(cfg_dir.glob("batch_*.json"))
     pending_batches = []
 
-    sample_logged = False
-
     for batch_path in batch_files:
         try:
             with open(batch_path, "r", encoding="utf8") as f:
                 batch_data = json.load(f)
 
             regimes = batch_data.get("regimes", [])
-
-            if not sample_logged and regimes:
-                sample_r = regimes[0]
-                logger.info("🛠️ SAMPLE REGIME FROM BATCH %s:", batch_path.name)
-                logger.info("   > Lookback: %s", sample_r.get("entry_lookback_units"))
-                logger.info("   > MA Int: %s | MA Periods: %s", sample_r.get("ma_int"), sample_r.get("ma_periods"))
-                logger.info("   > Stoch: %s | MA Rev: %s", sample_r.get("use_stochastic"), sample_r.get("ma_reversion"))
-                sample_logged = True
 
             is_batch_complete = True
             for r in regimes:
@@ -347,7 +398,7 @@ class EquityStager:
         return self._tmp_dir / (
             f"equity_{self.partition_by}={part_key}"
             f"_batch={self.batch_id}"
-            f"_worker={worker_id}.parquet"
+            f"_task={worker_id}.parquet"
         )
 
     def _ensure_writer(self, part_key: str, first_table: Optional[pl.DataFrame] = None) -> pq.ParquetWriter:
@@ -742,7 +793,7 @@ def _get_or_generate_signals(
     # Return annotated DF for downstream (non-strict so features persist in-memory)
     return enforce_schema(df_signals, "signals", strict=False) if not df_signals.is_empty() else pl.DataFrame([], schema=get_schema("signals"))
 
-def build_and_stage_equity(
+def compute_equity_preview(
     closed_rets: np.ndarray,
     closed_entry_idxs: np.ndarray,
     closed_exit_idxs: np.ndarray,
@@ -753,17 +804,7 @@ def build_and_stage_equity(
     sl_val: float,
     tp_val: float,
     run_cfg: dict,
-    regime_id: int,
-    era_int: int,
-    side_flag: int,
-    stager,
-    ma_p_gap_a_entry: Optional[np.ndarray] = None,
-    ma_p_gap_b_entry: Optional[np.ndarray] = None,
-    ma_p_gap_a_exit: Optional[np.ndarray] = None,
-    ma_p_gap_b_exit: Optional[np.ndarray] = None,
-) -> Tuple[Optional[float], int, float]:
-
-    # Compute pnl_pct vectorized and compound equity
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]:
     pnl_pct_arr, exit_times_ns = compute_pnl_pct_vectorized(
         closed_masked_rets=closed_rets,
         closed_entry_idxs=closed_entry_idxs,
@@ -782,77 +823,145 @@ def build_and_stage_equity(
         spread_is_percent=bool(run_cfg.get("spread_is_percent", True)),
     )
 
-    equity_arr, max_dd = fast_compound_equity(pnl_pct_arr, 100.0)
+    if pnl_pct_arr is None or pnl_pct_arr.size == 0:
+        return (
+            np.empty(0, dtype=np.float64),
+            np.empty(0, dtype=np.int64),
+            np.empty(0, dtype=np.float64),
+            0.0,
+            False,
+        )
 
-    equity_arr = np.nan_to_num(equity_arr, nan=0.0, posinf=1e37, neginf=-1e37)
     pnl_pct_arr = np.nan_to_num(pnl_pct_arr, nan=0.0, posinf=1e37, neginf=-1e37)
+    max_dd_threshold = float(run_cfg.get("max_dd_threshold", 0.5))
+    equity_arr, max_dd, breached = fast_compound_equity_gate(pnl_pct_arr, 100.0, max_dd_threshold)
+    equity_arr = np.nan_to_num(equity_arr, nan=0.0, posinf=1e37, neginf=-1e37)
 
-    # default results
-    win_pos = int(np.count_nonzero(closed_rets > 0.0)) if closed_rets.size else 0
+    return pnl_pct_arr, exit_times_ns, equity_arr, float(max_dd), bool(breached)
+
+def stage_equity_from_preview(
+    pnl_pct_arr: np.ndarray,
+    exit_times_ns: np.ndarray,
+    equity_arr: np.ndarray,
+    closed_entry_idxs: np.ndarray,
+    closed_exit_idxs: np.ndarray,
+    sl_val: float,
+    tp_val: float,
+    regime_id: int,
+    era_int: int,
+    side_flag: int,
+    stager,
+    max_dd: float,
+    ma_p_gap_a_entry: Optional[np.ndarray] = None,
+    ma_p_gap_b_entry: Optional[np.ndarray] = None,
+    ma_p_gap_a_exit: Optional[np.ndarray] = None,
+    ma_p_gap_b_exit: Optional[np.ndarray] = None,
+) -> Tuple[float, int, float]:
+    """
+    Stage equity rows only after the DD gate already passed.
+    Returns final_balance, win_pos, max_dd.
+    """
+    if equity_arr is None or equity_arr.size == 0:
+        return 100.0, 0, float(max_dd)
+
+    pnl_pct_arr = np.nan_to_num(pnl_pct_arr, nan=0.0, posinf=1e37, neginf=-1e37)
+    equity_arr = np.nan_to_num(equity_arr, nan=0.0, posinf=1e37, neginf=-1e37)
+
+    win_pos = int(np.count_nonzero(pnl_pct_arr > 0.0))
     final_balance = float(equity_arr[-1]) if equity_arr.size else 100.0
 
-    # Create the lean DataFrame and stage (only if there are equity points)
-    if equity_arr.size:
-        # Prepare gap arrays (convert to float32 and ensure proper length)
-        def _prepare_gap(arr):
-            if arr is None or arr.size == 0:
-                return np.full(equity_arr.shape[0], np.nan, dtype=np.float32)
-            a = np.asarray(arr, dtype=np.float32)
-            if a.shape[0] != equity_arr.shape[0]:
-                if a.shape[0] > equity_arr.shape[0]:
-                    a = a[: equity_arr.shape[0]]
-                else:
-                    pad = np.full(equity_arr.shape[0] - a.shape[0], np.nan, dtype=np.float32)
-                    a = np.concatenate([a, pad])
-            return a
+    def _prepare_gap(arr, target_len):
+        if arr is None or arr.size == 0:
+            return np.full(target_len, np.nan, dtype=np.float32)
+        a = np.asarray(arr, dtype=np.float32)
+        if a.shape[0] != target_len:
+            if a.shape[0] > target_len:
+                a = a[:target_len]
+            else:
+                pad = np.full(target_len - a.shape[0], np.nan, dtype=np.float32)
+                a = np.concatenate([a, pad])
+        return a
 
-        gap_a_entry = _prepare_gap(ma_p_gap_a_entry)
-        gap_b_entry = _prepare_gap(ma_p_gap_b_entry)
-        gap_a_exit = _prepare_gap(ma_p_gap_a_exit)
-        gap_b_exit = _prepare_gap(ma_p_gap_b_exit)
+    gap_len = equity_arr.shape[0]
+    gap_a_entry = _prepare_gap(ma_p_gap_a_entry, gap_len)
+    gap_b_entry = _prepare_gap(ma_p_gap_b_entry, gap_len)
+    gap_a_exit = _prepare_gap(ma_p_gap_a_exit, gap_len)
+    gap_b_exit = _prepare_gap(ma_p_gap_b_exit, gap_len)
 
-        equity_data = {
-            "regime_id": int(regime_id),
-            "era_int": int(era_int),
-            "side": int(side_flag),
-            "SL": float(sl_val),
-            "TP": float(tp_val),
-            "time_ns": exit_times_ns.astype(np.int64),
-            "entry_idx": closed_entry_idxs.astype(np.int64),
-            "exit_idx": closed_exit_idxs.astype(np.int64),
-            "pnl_pct": pnl_pct_arr.astype(np.float32),
-            "equity": equity_arr.astype(np.float32),
-            "ma_p_gap_a_entry": gap_a_entry,
-            "ma_p_gap_b_entry": gap_b_entry,
-            "ma_p_gap_a_exit": gap_a_exit,
-            "ma_p_gap_b_exit": gap_b_exit,
-        }
+    equity_data = {
+        "regime_id": int(regime_id),
+        "era_int": int(era_int),
+        "side": int(side_flag),
+        "SL": float(sl_val),
+        "TP": float(tp_val),
+        "time_ns": exit_times_ns.astype(np.int64),
+        "entry_idx": closed_entry_idxs.astype(np.int64),
+        "exit_idx": closed_exit_idxs.astype(np.int64),
+        "pnl_pct": pnl_pct_arr.astype(np.float32),
+        "equity": equity_arr.astype(np.float32),
+        "ma_p_gap_a_entry": gap_a_entry,
+        "ma_p_gap_b_entry": gap_b_entry,
+        "ma_p_gap_a_exit": gap_a_exit,
+        "ma_p_gap_b_exit": gap_b_exit,
+    }
 
-        # Build polars DF and cast to canonical equity schema (this simply arranges columns).
-        # The enforcement to canonical types will happen in stager.stage() (which calls enforce_schema).
-        try:
-            equity_df = cast_to_schema(equity_data, "equity")
-        except Exception as e:
-            logger.exception("build_and_stage_equity: failed to build equity DataFrame: %s", e)
-            equity_df = pl.DataFrame([], schema=get_schema("equity"))
+    try:
+        equity_df = cast_to_schema(equity_data, "equity")
+    except Exception as e:
+        logger.exception("stage_equity_from_preview: failed to build equity DataFrame: %s", e)
+        return final_balance, win_pos, float(max_dd)
 
-        # Validation using schema.classify_fragment (single source of truth)
-        meta = classify_fragment(equity_df, "equity")
-        if not meta.get("is_like", False):
-            logger.error(
-                "build_and_stage_equity: refusing to stage fragment; not equity-like. meta=%s sample=%s",
-                meta,
-                equity_df.head(1).to_dicts() if equity_df.height else None,
-            )
-        else:
-            # choose partition key according to stager.partition_by
-            partition_val = str(regime_id) if getattr(stager, "partition_by", "") == "regime_id" else str(era_int)
-            try:
-                stager.stage(partition_val, equity_df)
-            except Exception:
-                logger.exception("build_and_stage_equity: stager.stage failed for partition %s", partition_val)
+    meta = classify_fragment(equity_df, "equity")
+    if not meta.get("is_like", False):
+        logger.error(
+            "stage_equity_from_preview: refusing to stage fragment; not equity-like. meta=%s sample=%s",
+            meta,
+            equity_df.head(1).to_dicts() if equity_df.height else None,
+        )
+        return final_balance, win_pos, float(max_dd)
+
+    partition_val = str(regime_id) if getattr(stager, "partition_by", "") == "regime_id" else str(era_int)
+    try:
+        stager.stage(partition_val, equity_df)
+    except Exception:
+        logger.exception("stage_equity_from_preview: stager.stage failed for partition %s", partition_val)
 
     return final_balance, win_pos, float(max_dd)
+
+def _make_master_row(
+    regime_id: int,
+    era_int: int,
+    side_flag: int,
+    sl_val: float,
+    tp_val: float,
+    total_pos: int,
+    win_pos: int,
+    balance: float,
+    max_dd: float,
+    regime_cfg: dict,
+) -> dict:
+    return {
+        "balance": float(balance),
+        "SL": float(sl_val),
+        "TP": float(tp_val),
+        "win_pos": int(win_pos),
+        "total_pos": int(total_pos),
+        "side": int(side_flag),
+        "exit_window_h": int(regime_cfg.get("exit_window_h", 0)),
+        "era_int": int(era_int),
+        "regime_id": int(regime_id),
+        "ma_int": int(regime_cfg.get("ma_int", 0)),
+        "ma_reversion": bool(regime_cfg.get("ma_reversion", False)),
+        "entry_lookback_units": int(regime_cfg.get("entry_lookback_units", 0)),
+        "use_bbw": bool(regime_cfg.get("use_bbw", False)),
+        "bbw_periods": int(regime_cfg.get("bbw_periods", 0)),
+        "bbw_std": float(regime_cfg.get("bbw_std", 0.0)),
+        "bbw_thresholds": int(regime_cfg.get("bbw_thresholds", 0)),
+        "use_stochastic": bool(regime_cfg.get("use_stochastic", False)),
+        "stoch_key": str(regime_cfg.get("stoch_key", "OFF")),
+        "max_drawdown": float(max_dd),
+    }
+
 
 def _run_backtest_grid(
     regime_id: int,
@@ -867,9 +976,10 @@ def _run_backtest_grid(
     batch_id: int,
     stager,
     max_dd_threshold: float,
+    current_idx: int,
+    total_in_batch: int,
     combos: List[Tuple[float, float]],
 ):
-
     months = int(run_cfg["sl_tp_interval_months"])
 
     df_main = data_ctx["df_main"]
@@ -878,50 +988,64 @@ def _run_backtest_grid(
     main_spread_arr = data_ctx["main_spread_arr"]
     main_funding_arr = data_ctx["main_funding_arr"]
 
-    buys = df_signals.filter(pl.col("side") == 1) if (df_signals is not None and not df_signals.is_empty()) else pl.DataFrame([], schema=get_schema("signals"))
-    sells = df_signals.filter(pl.col("side") == -1) if (df_signals is not None and not df_signals.is_empty()) else pl.DataFrame([], schema=get_schema("signals"))
+    if df_signals is not None and not df_signals.is_empty():
+        buys = df_signals.filter(pl.col("side") == 1)
+        sells = df_signals.filter(pl.col("side") == -1)
+    else:
+        buys = pl.DataFrame([], schema=get_schema("signals"))
+        sells = pl.DataFrame([], schema=get_schema("signals"))
 
-    bucket_df = None
+    bucket_map = {}
     if not bool(run_cfg.get("force_rebuild_cache", False)):
         try:
             bucket_df = load_backtest_cached(months, era_label, str(regime_id))
-            if bucket_df is not None:
-                bucket_df = enforce_schema(bucket_df, "backtest")
+            if bucket_df is not None and not bucket_df.is_empty():
+                for row in bucket_df.iter_rows(named=True):
+                    key = (
+                        int(row["sig_n"]),
+                        int(row["sig_min_ns"]),
+                        int(row["sig_max_ns"]),
+                        round(float(row["SL"]), 6),
+                        round(float(row["TP"]), 6),
+                        int(row["side"]),
+                        int(row["exit_window_h"]),
+                    )
+                    bucket_map[key] = row
         except Exception as e:
             logger.debug("load_backtest_cached failed for cfg=%s era=%s: %s", regime_id, era_label, e)
-            bucket_df = None
+            bucket_map = {}
 
-    logger.info(f"DEBUG: era={era_label} regime={regime_id} total_signals={df_signals.height}")
+    logger.info("DEBUG: era=%s regime=%s total_signals=%d", era_label, regime_id, int(df_signals.height))
+
+    dd_pass = 0
+    dd_fail = 0
+    cache_hit = 0
+    cache_miss = 0
+    staged_equity = 0
+    master_rows_written = 0
+    empty_rows_written = 0
 
     for sl_val, tp_val in combos:
         for side_df_pl, side_flag in ((buys, 1), (sells, -1)):
-            total_pos = 0
-            if side_df_pl is not None and not side_df_pl.is_empty():
-                total_pos = int(side_df_pl.height)
+            total_pos = int(side_df_pl.height) if side_df_pl is not None and not side_df_pl.is_empty() else 0
 
             if total_pos == 0:
-                # No positions for this side/era/hyperparams: emit a canonical empty master row
-                master_row_raw = {
-                    "regime_id": int(regime_id),
-                    "era_int": int(era_int),
-                    "side": int(side_flag),
-                    "ma_int": int(regime_cfg.get("ma_int", 0)),
-                    "ma_reversion": bool(regime_cfg.get("ma_reversion", False)),
-                    "use_stochastic": bool(regime_cfg.get("use_stochastic", False)),
-                    "stoch_key": str(regime_cfg.get("stoch_key", "OFF")),
-                    "entry_lookback_units": int(regime_cfg.get("entry_lookback_units", 0)),
-                    "exit_window_h": int(regime_cfg.get("exit_window_h", 0)),
-                    "bbw_periods": int(regime_cfg.get("bbw_periods", 0)),
-                    "bbw_std": float(regime_cfg.get("bbw_std", 0.0)),
-                    "SL": float(sl_val),
-                    "TP": float(tp_val),
-                    "total_pos": 0,
-                    "win_pos": 0,
-                    "balance": 100.0, # Or None, but usually 100.0 is better for baseline
-                    "max_drawdown": 0.0,
-                }
-                canonical = enforce_schema(pl.DataFrame([master_row_raw]), "master").to_dicts()[0]
+                master_row_raw = _make_master_row(
+                    regime_id=regime_id,
+                    era_int=era_int,
+                    side_flag=side_flag,
+                    sl_val=sl_val,
+                    tp_val=tp_val,
+                    total_pos=0,
+                    win_pos=0,
+                    balance=100.0,
+                    max_dd=0.0,
+                    regime_cfg=regime_cfg,
+                )
+                canonical = pl.DataFrame([master_row_raw]).pipe(enforce_schema, "master").to_dicts()[0]
                 buffer_master_row(results_dir, batch_id, canonical)
+                empty_rows_written += 1
+                master_rows_written += 1
                 continue
 
             sig_idxs = side_df_pl["idx"].to_numpy(allow_copy=True).astype(np.int64)
@@ -930,26 +1054,28 @@ def _run_backtest_grid(
             sig_min_ns = int(sig_times_ns.min()) if sig_n > 0 else -1
             sig_max_ns = int(sig_times_ns.max()) if sig_n > 0 else -1
 
-            entry_idx = None; exit_idx = None; rets = None
-            if bucket_df is not None and not bucket_df.is_empty():
-                try:
-                    hit = bucket_df.filter(
-                        (pl.col("sig_n") == sig_n) &
-                        (pl.col("sig_min_ns") == sig_min_ns) &
-                        (pl.col("sig_max_ns") == sig_max_ns) &
-                        (pl.col("SL") == float(sl_val)) &
-                        (pl.col("TP") == float(tp_val)) &
-                        (pl.col("side") == int(side_flag)) &
-                        (pl.col("exit_window_h") == int(regime_cfg.get("exit_window_h", 0)))
-                    )
-                    if hit.height > 0:
-                        entry_idx = np.asarray(hit["entry_idx"][0], dtype=np.int64)
-                        exit_idx = np.asarray(hit["exit_idx"][0], dtype=np.int64)
-                        rets = np.asarray(hit["ret"][0], dtype=np.float64)
-                except Exception:
-                    entry_idx = None
-                    exit_idx = None
-                    rets = None
+            entry_idx = None
+            exit_idx = None
+            rets = None
+
+            if bucket_map:
+                key = (
+                    sig_n,
+                    sig_min_ns,
+                    sig_max_ns,
+                    round(float(sl_val), 6),
+                    round(float(tp_val), 6),
+                    int(side_flag),
+                    int(regime_cfg.get("exit_window_h", 0)),
+                )
+                hit = bucket_map.get(key)
+                if hit is not None:
+                    cache_hit += 1
+                    entry_idx = np.asarray(hit["entry_idx"], dtype=np.int64)
+                    exit_idx = np.asarray(hit["exit_idx"], dtype=np.int64)
+                    rets = np.asarray(hit["ret"], dtype=np.float64)
+                else:
+                    cache_miss += 1
 
             if (sig_idxs < 0).any() or (sig_idxs >= len(main_close_arr)).any():
                 logger.error("OOB Index: cfg=%s era=%s sig_idxs out of range", regime_id, era_label)
@@ -969,119 +1095,149 @@ def _run_backtest_grid(
                         spread=float(run_cfg.get("BTC_SETTINGS", {}).get("spread", 0.0)),
                         conservative_sl_first=bool(run_cfg.get("conservative_sl_first", True)),
                         treat_no_hit_as_loss=bool(run_cfg.get("treat_no_hit_as_loss", True)),
-                        side_flag=side_flag
+                        side_flag=side_flag,
                     )
                     entry_idx = np.asarray(res.get("entry_idx", []), dtype=np.int64)
                     exit_idx = np.asarray(res.get("exit_idx", []), dtype=np.int64)
                     rets = np.asarray(res.get("rets", res.get("ret", [])), dtype=np.float64)
 
-                    res_df = pl.DataFrame({
-                        "sig_n": [sig_n],
-                        "sig_min_ns": [sig_min_ns],
-                        "sig_max_ns": [sig_max_ns],
-                        "SL": [float(sl_val)],
-                        "TP": [float(tp_val)],
-                        "side": [int(side_flag)],
-                        "regime_id": [int(regime_id)],
-                        "exit_window_h": [int(regime_cfg.get("exit_window_h", 0))],
-                        # Explicitly tell Polars these are lists
-                        "entry_idx": pl.Series([entry_idx], dtype=pl.List(pl.Int64)),
-                        "exit_idx": pl.Series([exit_idx], dtype=pl.List(pl.Int64)),
-                        "ret": pl.Series([rets], dtype=pl.List(pl.Float32)) 
-                    }).pipe(enforce_schema, "backtest", strict=True)
+                    res_df = pl.DataFrame(
+                        {
+                            "sig_n": [sig_n],
+                            "sig_min_ns": [sig_min_ns],
+                            "sig_max_ns": [sig_max_ns],
+                            "SL": [float(sl_val)],
+                            "TP": [float(tp_val)],
+                            "side": [int(side_flag)],
+                            "regime_id": [int(regime_id)],
+                            "exit_window_h": [int(regime_cfg.get("exit_window_h", 0))],
+                            "entry_idx": pl.Series([entry_idx], dtype=pl.List(pl.Int64)),
+                            "exit_idx": pl.Series([exit_idx], dtype=pl.List(pl.Int64)),
+                            "ret": pl.Series([rets], dtype=pl.List(pl.Float32)),
+                        }
+                    ).pipe(enforce_schema, "backtest", strict=True)
 
                     stage_for_flush("backtest", months, era_label, str(regime_id), res_df)
                 except Exception as e:
                     logger.error("Backtest kernel error cfg=%s era=%s: %s", regime_id, era_label, e)
                     continue
 
-            def _safe_take_col_as_float32(df: pl.DataFrame, colname: str, idxs: np.ndarray) -> np.ndarray:
-                if idxs is None or idxs.size == 0:
-                    return np.empty(0, dtype=np.float32)
-                if colname not in df.columns:
-                    return np.full(idxs.shape[0], np.nan, dtype=np.float32)
-                # use zero-copy numpy view where possible then advanced-index
-                try:
-                    col_arr = df[colname].to_numpy()
-                    # clip out-of-bound indices to produce nan for invalid positions
-                    out = np.full(idxs.shape[0], np.nan, dtype=np.float32)
-                    valid_mask = (idxs >= 0) & (idxs < col_arr.shape[0])
-                    if valid_mask.any():
-                        out[valid_mask] = col_arr[idxs[valid_mask]].astype(np.float32)
-                    return out
-                except Exception:
-                    # fallback slower path via Polars take -> to_numpy
-                    try:
-                        s = df[colname].take(idxs.tolist())
-                        return s.to_numpy().astype(np.float32)
-                    except Exception:
-                        return np.full(idxs.shape[0], np.nan, dtype=np.float32)
-
             mask_closed = np.asarray([]) if exit_idx is None else (exit_idx >= 0)
-            if mask_closed.size and mask_closed.any():
-                closed_rets = rets[mask_closed]
-                closed_entry_idxs = entry_idx[mask_closed].astype(np.int64)
-                closed_exit_idxs = exit_idx[mask_closed].astype(np.int64)
 
-                gap_entry_a, gap_entry_b, gap_exit_a, gap_exit_b = get_ma_price_gaps_for_indices(df_main, closed_entry_idxs, closed_exit_idxs)
-
-                # Build and stage equity only if enabled in run config; helper returns final balance and win_pos
-                final_balance, win_pos, max_dd = build_and_stage_equity(
-                    closed_rets=closed_rets,
-                    closed_entry_idxs=closed_entry_idxs,
-                    closed_exit_idxs=closed_exit_idxs,
-                    main_close_arr=main_close_arr,
-                    main_time_ns_arr=main_time_ns_arr,
-                    main_spread_arr=main_spread_arr,
-                    main_funding_arr=main_funding_arr,
-                    sl_val=float(sl_val),
-                    tp_val=float(tp_val),
-                    run_cfg=run_cfg,
+            if not (mask_closed.size and mask_closed.any()):
+                master_row_raw = _make_master_row(
                     regime_id=regime_id,
                     era_int=era_int,
                     side_flag=side_flag,
-                    stager=stager,
-                    ma_p_gap_a_entry=gap_entry_a,
-                    ma_p_gap_b_entry=gap_entry_b,
-                    ma_p_gap_a_exit=gap_exit_a,
-                    ma_p_gap_b_exit=gap_exit_b,
+                    sl_val=sl_val,
+                    tp_val=tp_val,
+                    total_pos=total_pos,
+                    win_pos=0,
+                    balance=100.0,
+                    max_dd=0.0,
+                    regime_cfg=regime_cfg,
                 )
-
-            else:
-                closed_rets = np.array([], dtype=np.float64)
-                closed_entry_idxs = np.array([], dtype=np.int64)
-                closed_exit_idxs = np.array([], dtype=np.int64)
-                final_balance = 100.0
-                win_pos = 0
-                max_dd = 0.0
-
-            if isinstance(max_dd, float) and max_dd > max_dd_threshold:
-                logger.debug("Skipping cfg=%s SL=%s TP=%s era=%s due to max_dd %.3f", regime_id, sl_val, tp_val, era_label, max_dd)
+                canonical = pl.DataFrame([master_row_raw]).pipe(enforce_schema, "master").to_dicts()[0]
+                buffer_master_row(results_dir, batch_id, canonical)
+                master_rows_written += 1
                 continue
 
-            master_row_raw = {
-                "balance": float(final_balance),
-                "SL": float(sl_val),
-                "TP": float(tp_val),
-                "win_pos": int(win_pos),
-                "total_pos": int(total_pos),
-                "side": int(side_flag),
-                "exit_window_h": int(regime_cfg.get("exit_window_h", 0)),
-                "era_int": int(era_int),
-                "regime_id": int(regime_id),
-                "ma_int": int(regime_cfg.get("ma_int", 0)),
-                "ma_reversion": bool(regime_cfg.get("ma_reversion", False)),
-                "entry_lookback_units": int(regime_cfg.get("entry_lookback_units", 0)),
-                "bbw_periods": int(regime_cfg.get("bbw_periods", 0)),
-                "bbw_std": float(regime_cfg.get("bbw_std", 0.0)),
-                "use_stochastic": bool(regime_cfg.get("use_stochastic", False)),
-                "stoch_key": str(regime_cfg.get("stoch_key", "OFF")),
-                "max_drawdown": float(max_dd)
-            }
+            closed_rets = rets[mask_closed]
+            closed_entry_idxs = entry_idx[mask_closed].astype(np.int64)
+            closed_exit_idxs = exit_idx[mask_closed].astype(np.int64)
 
+            pnl_pct_arr, exit_times_ns, equity_arr, current_max_dd, breached = compute_equity_preview(
+                closed_rets=closed_rets,
+                closed_entry_idxs=closed_entry_idxs,
+                closed_exit_idxs=closed_exit_idxs,
+                main_close_arr=main_close_arr,
+                main_time_ns_arr=main_time_ns_arr,
+                main_spread_arr=main_spread_arr,
+                main_funding_arr=main_funding_arr,
+                sl_val=float(sl_val),
+                tp_val=float(tp_val),
+                run_cfg=run_cfg,
+            )
+
+            if breached:
+                dd_fail += 1
+                logger.debug(
+                    "DD FAIL era=%s regime=%s side=%s SL=%.4f TP=%.4f max_dd=%.4f threshold=%.4f -> skip equity only",
+                    era_label, regime_id, int(side_flag), float(sl_val), float(tp_val), float(current_max_dd), float(max_dd_threshold),
+                )
+
+                final_balance = float(equity_arr[-1]) if equity_arr.size else 100.0
+                win_pos = int(np.count_nonzero(closed_rets > 0.0)) if closed_rets.size else 0
+
+                master_row_raw = _make_master_row(
+                    regime_id=regime_id,
+                    era_int=era_int,
+                    side_flag=side_flag,
+                    sl_val=sl_val,
+                    tp_val=tp_val,
+                    total_pos=total_pos,
+                    win_pos=win_pos,
+                    balance=final_balance,
+                    max_dd=current_max_dd,
+                    regime_cfg=regime_cfg,
+                )
+                canonical = pl.DataFrame([master_row_raw]).pipe(enforce_schema, "master").to_dicts()[0]
+                buffer_master_row(results_dir, batch_id, canonical)
+                master_rows_written += 1
+                continue
+
+            dd_pass += 1
+
+            gap_entry_a, gap_entry_b, gap_exit_a, gap_exit_b = get_ma_price_gaps_for_indices(
+                df_main, closed_entry_idxs, closed_exit_idxs
+            )
+
+            final_balance, win_pos, max_dd = stage_equity_from_preview(
+                pnl_pct_arr=pnl_pct_arr,
+                exit_times_ns=exit_times_ns,
+                equity_arr=equity_arr,
+                closed_entry_idxs=closed_entry_idxs,
+                closed_exit_idxs=closed_exit_idxs,
+                sl_val=float(sl_val),
+                tp_val=float(tp_val),
+                regime_id=regime_id,
+                era_int=era_int,
+                side_flag=side_flag,
+                stager=stager,
+                max_dd=current_max_dd,
+                ma_p_gap_a_entry=gap_entry_a,
+                ma_p_gap_b_entry=gap_entry_b,
+                ma_p_gap_a_exit=gap_exit_a,
+                ma_p_gap_b_exit=gap_exit_b,
+            )
+            staged_equity += 1
+
+            master_row_raw = _make_master_row(
+                regime_id=regime_id,
+                era_int=era_int,
+                side_flag=side_flag,
+                sl_val=sl_val,
+                tp_val=tp_val,
+                total_pos=total_pos,
+                win_pos=win_pos,
+                balance=final_balance,
+                max_dd=max_dd,
+                regime_cfg=regime_cfg,
+            )
             canonical = pl.DataFrame([master_row_raw]).pipe(enforce_schema, "master").to_dicts()[0]
             buffer_master_row(results_dir, batch_id, canonical)
+            master_rows_written += 1
 
+    return {
+        "dd_pass": dd_pass,
+        "dd_fail": dd_fail,
+        "cache_hit": cache_hit,
+        "cache_miss": cache_miss,
+        "staged_equity": staged_equity,
+        "master_rows_written": master_rows_written,
+        "empty_rows_written": empty_rows_written,
+    }
+    
 def process_era_combos(
     regime_id: int,
     regime_cfg: dict,
@@ -1091,6 +1247,8 @@ def process_era_combos(
     batch_id: int,
     stager,
     max_dd_threshold: float,
+    current_idx: int,
+    total_in_batch: int
 ) -> Tuple[int, int]:
     """
     Strict per-era processing loop.
@@ -1128,6 +1286,9 @@ def process_era_combos(
 
     windows = _split_period_windows_from_pl(df_main, months, min_dt=grid_start, max_dt=grid_end)
     logger.debug("process_era_combos: regime=%s windows=%d", regime_id, len(windows))
+
+    empty_era_streak = 0
+    max_empty_era_streak = int(run_cfg.get("MAX_EMPTY_ERA_STREAK", 2))
 
     # iterate strictly over precomputed windows (eras)
     for (start, end) in windows:
@@ -1190,7 +1351,7 @@ def process_era_combos(
         )
 
         # run backtests (this function reads arrays and flags from data_ctx / run_cfg)
-        _run_backtest_grid(
+        summary = _run_backtest_grid(
             regime_id=regime_id,
             regime_cfg=regime_cfg,
             run_cfg=run_cfg,
@@ -1203,8 +1364,34 @@ def process_era_combos(
             batch_id=batch_id,
             stager=stager,
             max_dd_threshold=max_dd_threshold,
+            current_idx=current_idx,
+            total_in_batch=total_in_batch,
             combos=combos,
         )
+
+        current_regime_display = current_idx + 1
+
+        logger.info(
+            f"📊 [Batch {batch_id}] Regime {current_regime_display}/{total_in_batch} (ID:{regime_id}) | "
+            f"Era: {era_label} | PASS: {summary['dd_pass']} | FAIL: {summary['dd_fail']} | "
+            f"Streak: {empty_era_streak}/{max_empty_era_streak}"
+        )
+
+        if summary["master_rows_written"] == 0:
+            logger.warning(
+                f"⚠️ Skipping Era {era_label} for regime={regime_id}: "
+                f"All {summary['dd_fail']} combos failed DD threshold {max_dd_threshold}."
+            )
+            empty_era_streak += 1  # NOW your streak logic actually works!
+            
+            if empty_era_streak >= max_empty_era_streak:
+                error_msg = f"❌ CRITICAL FAILURE: Regime {regime_id} killed. Hit max empty streak of {max_empty_era_streak}."
+                logger.error(error_msg)
+                
+                # This stops EVERYTHING and tells Airflow the task failed
+                raise RuntimeError(error_msg)
+            
+            continue # Go to the next era in the loop
 
         processed_inc += 1
 
@@ -1298,8 +1485,10 @@ def compute_config_and_save(batch_path: str, session_dir: str, compute_backtest:
             regime_cfg["entry_lookback_units"] = int(regime_cfg.get("entry_lookback_units", 0) or 0)
             regime_cfg["exit_window_h"] = int(regime_cfg.get("exit_window_h", 0) or 0)
             regime_cfg["use_stochastic"] = bool(regime_cfg.get("use_stochastic", False))
-            #regime_cfg["bbw_periods"] = int(regime_cfg.get("bbw_periods", 0) or 0)
-            #regime_cfg["bbw_std"] = float(regime_cfg.get("bbw_std", 0.0) or 0.0)
+            regime_cfg["bbw_periods"] = int(regime_cfg.get("bbw_periods", 0) or 0)
+            regime_cfg["bbw_std"] = float(regime_cfg.get("bbw_std", 0.0) or 0.0)
+            regime_cfg["use_bbw"] = bool(regime_cfg.get("use_bbw", False))
+            regime_cfg["bbw_thresholds"] = int(regime_cfg.get("bbw_thresholds", 0) or 0)
 
             regime_id = regime_cfg.get("regime_id")
             summary_path = results_dir / f"cfg_{regime_id}_summary.json"
@@ -1319,6 +1508,8 @@ def compute_config_and_save(batch_path: str, session_dir: str, compute_backtest:
                 batch_id=batch_id,
                 stager=stager,
                 max_dd_threshold=max_dd_threshold,
+                current_idx=idx,
+                total_in_batch=total_in_batch
             )
             processed_count += p_inc
             skipped_count += s_inc

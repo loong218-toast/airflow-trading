@@ -64,6 +64,45 @@ def fast_compound_equity(pnl_arr, start_equity=100.0):
             max_dd = dd
             
     return equity, max_dd
+@njit(cache=True)
+def fast_compound_equity_gate(pnl_arr, start_equity=100.0, max_dd_threshold=-1.0):
+    n = pnl_arr.shape[0]
+    equity = np.empty(n, dtype=np.float64)
+    cur = start_equity
+    running_max = cur
+    max_dd = 0.0
+
+    for i in range(n):
+        pnl = pnl_arr[i]
+
+        if not (pnl > -2.0 and pnl < 2.0):
+            pnl = -1.0
+
+        cur = cur * (1.0 + pnl)
+
+        if cur > 1e37:
+            cur = 1e37
+
+        if cur < 0.0001 or not np.isfinite(cur):
+            cur = 0.0001
+
+        equity[i] = cur
+
+        if cur > running_max:
+            running_max = cur
+
+        if running_max > 0.0001:
+            dd = (running_max - cur) / running_max
+        else:
+            dd = 0.0
+
+        if dd > max_dd:
+            max_dd = dd
+
+        if max_dd_threshold > 0.0 and max_dd >= max_dd_threshold:
+            return equity[: i + 1], max_dd, True
+
+    return equity, max_dd, False
 
 # -------------------------
 # pnl kernel (numba) - parallel for batch PnL conversion

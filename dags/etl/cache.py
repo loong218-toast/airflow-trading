@@ -92,14 +92,15 @@ def _target_path(kind: str, months: int, era_label: str, regime_id: str) -> Path
         return base / f"config_{regime_id}_combos.parquet"
 
 
-def _worker_part_path(regime_id: str, worker_id: str) -> Path:
+def _worker_part_path(kind: str, months: int, era_label: str, regime_id: str, worker_id: str) -> Path:
     tmp = _get_tmp_dir()
-    return tmp / f"config_{regime_id}_batch_{worker_id}.parquet"
+    return tmp / f"{kind}_config_{regime_id}_era_{era_label}_batch_{worker_id}.parquet"
 
 
-def _list_worker_parts_for_config(regime_id: str) -> List[Path]:
+def _list_worker_parts_for_config(kind: str, months: int, era_label: str, regime_id: str) -> List[Path]:
     tmp = _get_tmp_dir()
-    return sorted(tmp.glob(f"config_{regime_id}_batch_*.parquet"))
+    pattern = f"{kind}_config_{regime_id}_era_{era_label}_batch_*.parquet"
+    return sorted(tmp.glob(pattern))
 
 
 def _ensure_dir(p: Path) -> None:
@@ -202,7 +203,7 @@ def stage_for_flush(kind: str, months: int, era_label: str, regime_id: str, df_n
 
     worker_id = str(os.getenv("AIRFLOW_MAP_INDEX", "0"))
     tmp_dir = _get_tmp_dir()
-    worker_part = tmp_dir / f"config_{regime_id}_batch_{worker_id}.parquet"
+    worker_part = _worker_part_path(kind, months, era_label, regime_id, worker_id)
 
     df_to_write = enforce_schema(df_new, kind, strict=True)
 
@@ -213,9 +214,15 @@ def stage_for_flush(kind: str, months: int, era_label: str, regime_id: str, df_n
     try:
         df_to_write.write_parquet(str(tmp_path), compression="snappy")
         os.replace(str(tmp_path), str(worker_part))
-        _LOG.debug("Worker %s staged %d rows for cfg %s", worker_id, df_to_write.height, regime_id)
+        _LOG.debug(
+            "Worker %s staged %d rows for kind=%s cfg=%s era=%s -> %s",
+            worker_id, df_to_write.height, kind, regime_id, era_label, worker_part.name
+        )
     except Exception as e:
-        _LOG.error("Worker %s failed to stage cache for cfg %s: %s", worker_id, regime_id, e)
+        _LOG.error(
+            "Worker %s failed to stage cache for kind=%s cfg=%s era=%s: %s",
+            worker_id, kind, regime_id, era_label, e
+        )
         raise
     finally:
         if tmp_path.exists():
@@ -234,6 +241,7 @@ def flush_all_buffers() -> None:
 def inspect_cache_root() -> Dict[str, Dict[str, int]]:
     out: Dict[str, Dict[str, int]] = {}
     base = _get_cache_root()
+
     for cat in sorted(base.glob("*mo")):
         cat_name = cat.name
         out[cat_name] = {}
@@ -244,12 +252,16 @@ def inspect_cache_root() -> Dict[str, Dict[str, int]]:
                 continue
             count = sum(1 for _ in base_k.rglob("*.parquet"))
             out[cat_name][kind] = count
+
     try:
         tmp = _get_tmp_dir()
-        tmp_count = len(list(tmp.glob("config_*_batch_*.parquet")))
-        out["tmp_parts"] = {"count": tmp_count}
+        out["tmp_parts"] = {
+            "signals": len(list(tmp.glob("signals_config_*_era_*_batch_*.parquet"))),
+            "backtest": len(list(tmp.glob("backtest_config_*_era_*_batch_*.parquet"))),
+        }
     except Exception:
         pass
+
     return out
 
     # --- Compatibility Aliases ---

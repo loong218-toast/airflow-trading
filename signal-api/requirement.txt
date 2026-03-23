@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+psycopg2-binary
+numpy>=1.22,<2.5
+polars>=1.21.0
