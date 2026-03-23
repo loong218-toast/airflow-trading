@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, text
 import os
@@ -32,14 +32,52 @@ engine = create_engine(db_uri(), pool_pre_ping=True)
 def health():
     return {"ok": True}
 
-@app.get("/api/latest-signal")
-def latest_signal():
-    query = text("""
-        SELECT *
-        FROM signal_state_latest
-        ORDER BY updated_at DESC
-        LIMIT 1
+@app.get("/api/volatility-index")
+def volatility_index(
+    pair: str = Query(default="XXBTZUSD"),
+    market_type: str = Query(default="spot"),
+    months: int = Query(default=6),
+):
+    sql = text("""
+        WITH bounds AS (
+            SELECT
+                MIN(time) AS start_time,
+                MAX(time) AS end_time
+            FROM df_main
+            WHERE pair = :pair
+              AND market_type = :market_type
+              AND time >= NOW() - (:months || ' months')::interval
+        ),
+        stats AS (
+            SELECT
+                MIN(close) AS min_close,
+                MAX(close) AS max_close,
+                COUNT(*) AS candle_count
+            FROM df_main
+            WHERE pair = :pair
+              AND market_type = :market_type
+              AND time >= NOW() - (:months || ' months')::interval
+        )
+        SELECT
+            stats.min_close,
+            stats.max_close,
+            stats.candle_count,
+            CASE
+                WHEN stats.min_close IS NULL OR stats.min_close = 0 THEN NULL
+                ELSE (stats.max_close - stats.min_close) / stats.min_close
+            END AS volatility_index
+        FROM stats
     """)
+
     with engine.connect() as conn:
-        row = conn.execute(query).mappings().first()
-    return {"data": dict(row) if row else None}
+        row = conn.execute(
+            sql,
+            {"pair": pair, "market_type": market_type, "months": months},
+        ).mappings().first()
+
+    return {
+        "pair": pair,
+        "market_type": market_type,
+        "months": months,
+        "data": dict(row) if row else None,
+    }

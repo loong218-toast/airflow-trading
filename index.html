@@ -68,7 +68,8 @@
 <section class="flex flex-col items-center justify-center py-2 space-y-2">
 <span class="font-label text-[10px] uppercase tracking-[0.15em] text-text-muted">Price Data Range</span>
 <div class="bg-surface-container px-4 py-2 rounded-full border border-white/5 shadow-inner">
-<p class="font-headline font-bold text-sm text-text-main">Oct 10, 2023 - Jan 10, 2024</p>
+<p id="price-range-text" class="font-headline font-bold text-sm text-text-main">Loading...</p>
+<p id="price-range-meta" class="font-label text-[10px] text-text-muted mt-1 text-center"></p>
 </div>
 </section>
 <section class="bg-surface p-5 rounded-xl border border-white/5 shadow-xl space-y-6">
@@ -76,36 +77,42 @@
 <h2 class="font-headline font-extrabold text-xl tracking-tight text-white">Volatility Index</h2>
 <span class="font-label text-xs text-primary font-semibold">Live Metrics</span>
 </div>
-<div class="flex justify-between items-end h-40 px-2">
-<div class="flex flex-col items-center gap-3 w-1/6">
-<div class="w-full bg-background/50 rounded-t-lg relative flex items-end overflow-hidden h-24">
-<div class="w-full bg-gradient-to-t from-primary to-primary-accent h-[65%] rounded-t-sm shadow-[0_0_15px_rgba(0,128,128,0.3)]"></div>
+<div class="flex justify-between items-end h-40 px-2" id="vi-bars">
+  <div class="flex flex-col items-center gap-3 w-1/6">
+    <div class="w-full bg-background/50 rounded-t-lg relative flex items-end overflow-hidden h-24">
+      <div id="bar-24h" class="w-full bg-gradient-to-t from-primary to-primary-accent rounded-t-sm"></div>
+    </div>
+    <span class="font-label text-[10px] font-bold text-text-muted">24H</span>
+  </div>
+
+  <div class="flex flex-col items-center gap-3 w-1/6">
+    <div class="w-full bg-background/50 rounded-t-lg relative flex items-end overflow-hidden h-28">
+      <div id="bar-72h" class="w-full bg-gradient-to-t from-primary to-primary-accent rounded-t-sm"></div>
+    </div>
+    <span class="font-label text-[10px] font-bold text-text-muted">72H</span>
+  </div>
+
+  <div class="flex flex-col items-center gap-3 w-1/6">
+    <div class="w-full bg-background/50 rounded-t-lg relative flex items-end overflow-hidden h-32">
+      <div id="bar-1w" class="w-full bg-gradient-to-t from-primary to-primary-accent rounded-t-sm"></div>
+    </div>
+    <span class="font-label text-[10px] font-bold text-text-muted">1W</span>
+  </div>
+
+  <div class="flex flex-col items-center gap-3 w-1/6">
+    <div class="w-full bg-background/50 rounded-t-lg relative flex items-end overflow-hidden h-24">
+      <div id="bar-1m" class="w-full bg-gradient-to-t from-primary to-primary-accent rounded-t-sm"></div>
+    </div>
+    <span class="font-label text-[10px] font-bold text-text-muted">1M</span>
+  </div>
+
+  <div class="flex flex-col items-center gap-3 w-1/6">
+    <div class="w-full bg-background/50 rounded-t-lg relative flex items-end overflow-hidden h-36">
+      <div id="bar-3m" class="w-full bg-gradient-to-t from-primary to-primary-accent rounded-t-sm"></div>
+    </div>
+    <span class="font-label text-[10px] font-bold text-text-muted">3M</span>
+  </div>
 </div>
-<span class="font-label text-[10px] font-bold text-text-muted">24H</span>
-</div>
-<div class="flex flex-col items-center gap-3 w-1/6">
-<div class="w-full bg-background/50 rounded-t-lg relative flex items-end overflow-hidden h-28">
-<div class="w-full bg-gradient-to-t from-primary to-primary-accent h-[42%] rounded-t-sm shadow-[0_0_15px_rgba(0,128,128,0.3)]"></div>
-</div>
-<span class="font-label text-[10px] font-bold text-text-muted">72H</span>
-</div>
-<div class="flex flex-col items-center gap-3 w-1/6">
-<div class="w-full bg-background/50 rounded-t-lg relative flex items-end overflow-hidden h-32">
-<div class="w-full bg-gradient-to-t from-primary to-primary-accent h-[88%] rounded-t-sm shadow-[0_0_15px_rgba(0,128,128,0.3)]"></div>
-</div>
-<span class="font-label text-[10px] font-bold text-text-muted">1W</span>
-</div>
-<div class="flex flex-col items-center gap-3 w-1/6">
-<div class="w-full bg-background/50 rounded-t-lg relative flex items-end overflow-hidden h-24">
-<div class="w-full bg-gradient-to-t from-primary to-primary-accent h-[55%] rounded-t-sm shadow-[0_0_15px_rgba(0,128,128,0.3)]"></div>
-</div>
-<span class="font-label text-[10px] font-bold text-text-muted">1M</span>
-</div>
-<div class="flex flex-col items-center gap-3 w-1/6">
-<div class="w-full bg-background/50 rounded-t-lg relative flex items-end overflow-hidden h-36">
-<div class="w-full bg-gradient-to-t from-primary to-primary-accent h-[72%] rounded-t-sm shadow-[0_0_15px_rgba(0,128,128,0.3)]"></div>
-</div>
-<span class="font-label text-[10px] font-bold text-text-muted">3M</span>
 </div>
 </div>
 </section>
@@ -113,9 +120,10 @@
 <div class="absolute -right-4 -top-4 w-24 h-24 bg-primary/10 rounded-full blur-2xl"></div>
 <div class="flex flex-col items-center space-y-4">
 <span class="font-label text-xs uppercase tracking-[0.2em] text-text-muted font-bold">Signal Side</span>
-<div class="text-5xl font-headline font-black tracking-tighter italic text-white/10">
-                N/A
-            </div>
+<div id="signal-side-text" class="text-5xl font-headline font-black tracking-tighter italic text-white/10">
+  N/A
+</div>
+<p id="signal-side-note" class="font-body text-xs text-text-muted italic">Awaiting technical confirmation...</p>
 <p class="font-body text-xs text-text-muted italic">Awaiting technical confirmation...</p>
 </div>
 </section>
@@ -187,5 +195,60 @@
 </nav>
 <div class="fixed -z-10 top-20 -left-20 w-64 h-64 bg-primary/5 rounded-full blur-[100px] pointer-events-none"></div>
 <div class="fixed -z-10 bottom-40 -right-20 w-80 h-80 bg-primary/5 rounded-full blur-[120px] pointer-events-none"></div>
+
+<script>
+async function loadDashboard() {
+  const pair = "XXBTZUSD";
+  const marketType = "spot";
+
+  const baseApi = "https://YOUR-API-DOMAIN";
+
+  const res = await fetch(
+    `${baseApi}/api/dashboard?pair=${encodeURIComponent(pair)}&market_type=${encodeURIComponent(marketType)}`
+  );
+  const data = await res.json();
+
+  const vi = data.volatility_index || {};
+  const signal = data.signal || {};
+
+  document.getElementById("price-range-text").textContent =
+    vi.range_text || "No data";
+
+  document.getElementById("price-range-meta").textContent =
+    vi.candle_count ? `${vi.candle_count} candles • ${vi.window_label || "3M"}` : "";
+
+  const setBar = (id, value) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const pct = Math.max(0, Math.min(100, Number(value) || 0));
+    el.style.height = `${pct}%`;
+  };
+
+  setBar("bar-24h", vi.buckets?.["24h"]?.pct);
+  setBar("bar-72h", vi.buckets?.["72h"]?.pct);
+  setBar("bar-1w", vi.buckets?.["1w"]?.pct);
+  setBar("bar-1m", vi.buckets?.["1m"]?.pct);
+  setBar("bar-3m", vi.buckets?.["3m"]?.pct);
+
+  const sideEl = document.getElementById("signal-side-text");
+  const noteEl = document.getElementById("signal-side-note");
+
+  if (signal.side === "buy") {
+    sideEl.textContent = "BUY";
+    sideEl.className = "text-5xl font-headline font-black tracking-tighter italic text-status-open";
+    noteEl.textContent = signal.message || "Buy signal detected";
+  } else if (signal.side === "sell") {
+    sideEl.textContent = "SELL";
+    sideEl.className = "text-5xl font-headline font-black tracking-tighter italic text-red-400";
+    noteEl.textContent = signal.message || "Sell signal detected";
+  } else {
+    sideEl.textContent = "N/A";
+    sideEl.className = "text-5xl font-headline font-black tracking-tighter italic text-white/10";
+    noteEl.textContent = "Awaiting technical confirmation...";
+  }
+}
+
+loadDashboard();
+</script>
 
 </body></html>
