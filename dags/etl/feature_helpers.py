@@ -6,9 +6,106 @@ import gc
 
 from etl.schema import get_schema, enforce_schema
 
-# in-process caches (lightweight) — safe to keep for the lifetime of the worker
 _STOCH_CACHE: Dict = {}
 _LOOKBACK_CACHE: Dict = {}
+
+
+def _unwrap_singleton(value: Any) -> Any:
+    if isinstance(value, (list, tuple)) and len(value) == 1:
+        return value[0]
+    return value
+
+
+def _as_list(value: Any) -> list:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    return [value]
+
+
+def _as_bool(value: Any, default: bool = False) -> bool:
+    value = _unwrap_singleton(value)
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in {"true", "1", "yes", "y", "on"}:
+            return True
+        if v in {"false", "0", "no", "n", "off"}:
+            return False
+    return default
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    value = _unwrap_singleton(value)
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, (float, np.floating)):
+        return int(value)
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return default
+        return int(float(s))
+    return default
+
+
+def _as_float(value: Any, default: float = 0.0) -> float:
+    value = _unwrap_singleton(value)
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return float(int(value))
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return float(value)
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return default
+        return float(s)
+    return default
+
+
+def _as_str(value: Any, default: str = "") -> str:
+    value = _unwrap_singleton(value)
+    if value is None:
+        return default
+    return str(value)
+
+
+def _as_int_list(value: Any) -> list[int]:
+    return [_as_int(x) for x in _as_list(value)]
+
+
+def _as_float_list(value: Any) -> list[float]:
+    return [_as_float(x) for x in _as_list(value)]
+
+
+def _as_bool_list(value: Any) -> list[bool]:
+    return [_as_bool(x) for x in _as_list(value)]
+
+
+def _as_threshold_pairs(value: Any) -> list[list[float]]:
+    value = _unwrap_singleton(value)
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)) and value and isinstance(value[0], (list, tuple)):
+        return [[_as_float(a), _as_float(b)] for a, b in value]
+    if isinstance(value, (list, tuple)):
+        vals = [_as_float(x) for x in value]
+        return [vals] if vals else []
+    return [[_as_float(value)]]
 
 # ---------- time/idx helpers ----------
 def normalize_signals_times(df_signals: pl.DataFrame, df_main: Optional[pl.DataFrame] = None) -> pl.DataFrame:
@@ -49,16 +146,6 @@ def get_ma_price_gaps_for_indices(
     regime_cfg: Optional[dict] = None,
     run_cfg: Optional[dict] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Return signed MA gap features for trade entry/exit rows.
-
-    gap_a = fast_ma - slow_ma
-    gap_b = (fast_ma - slow_ma) / slow_ma   if slow_ma != 0 else 0
-
-    Uses the active MA columns from ma_int + ma_periods when possible.
-    Falls back to the first two available kama_* columns.
-    Never returns NaN.
-    """
     regime_cfg = regime_cfg or {}
     run_cfg = run_cfg or {}
 
@@ -73,12 +160,10 @@ def get_ma_price_gaps_for_indices(
     if df_main is None or df_main.height == 0:
         return gap_a_entry, gap_b_entry, gap_a_exit, gap_b_exit
 
-    # Find active MA columns from regime_cfg / run_cfg.
-    ma_periods = regime_cfg.get("ma_periods", run_cfg.get("ma_periods", [])) or []
-    if isinstance(ma_periods, (int, float)):
-        ma_periods = [ma_periods]
+    ma_periods = regime_cfg.get("ma_periods", run_cfg.get("ma_periods", []))
+    ma_periods = _as_int_list(ma_periods)
 
-    ma_int = int(regime_cfg.get("ma_int", 0) or 0)
+    ma_int = _as_int(regime_cfg.get("ma_int", 0), 0)
 
     active_ma_cols = []
     for i in range(len(ma_periods)):
@@ -87,15 +172,12 @@ def get_ma_price_gaps_for_indices(
             if col in df_main.columns:
                 active_ma_cols.append(col)
 
-    # Fallback: use the first available kama_* columns
     if len(active_ma_cols) < 2:
-        kama_cols = [c for c in df_main.columns if c.startswith("kama_")]
-        kama_cols = sorted(kama_cols)
+        kama_cols = sorted([c for c in df_main.columns if c.startswith("kama_")])
         if len(kama_cols) >= 2:
             active_ma_cols = kama_cols[:2]
 
     if len(active_ma_cols) < 2:
-        # not enough MA columns to compute a spread
         return gap_a_entry, gap_b_entry, gap_a_exit, gap_b_exit
 
     fast_col = active_ma_cols[0]
@@ -148,29 +230,15 @@ def get_ma_price_gaps_for_indices(
     return gap_a_entry, gap_b_entry, gap_a_exit, gap_b_exit
 
 def add_volatility_index_features(df: pl.DataFrame, run_cfg: dict) -> pl.DataFrame:
-    """
-    Add causal rolling volatility-index style features on df_main.close.
-
-    Volatility Index:
-        (rolling_max - rolling_min) / rolling_min
-
-    Assumption:
-        1 month = 30 days
-
-    Uses the base candle size from BASE_MINUTES.
-    """
     if df is None or df.height == 0:
         return df
 
-    base_min = int(run_cfg.get("BASE_MINUTES", 5))
+    base_min = _as_int(run_cfg.get("BASE_MINUTES", 5), 5)
 
-    # Optional: if you want to use the signal timeframe instead of the base candle size,
-    # set this to True in run_cfg and multiply by signal_timeframe_modifier.
-    use_signal_tf = bool(run_cfg.get("volatility_use_signal_timeframe", False))
-    modifier = int(run_cfg.get("signal_timeframe_modifier", 3)) if use_signal_tf else 1
+    use_signal_tf = _as_bool(run_cfg.get("volatility_use_signal_timeframe", False), False)
+    modifier = _as_int(run_cfg.get("signal_timeframe_modifier", 3), 3) if use_signal_tf else 1
     effective_min = max(1, base_min * modifier)
 
-    # window sizes in bars
     windows = {
         "rng_24h": int(round((24 * 60) / effective_min)),
         "rng_72h": int(round((72 * 60) / effective_min)),
@@ -243,166 +311,123 @@ def get_volatility_index_for_indices(
 
 # Precompute Function
 def precompute_all_possible_features(df: pl.DataFrame, run_cfg: dict) -> pl.DataFrame:
-    """
-    Precompute feature columns (MA, stochastic, breakouts) and produce a per-era lookback_map (hours).
-    The function mutates run_cfg by setting run_cfg['lookback_map'] to a dict:
-       { "YYYY-MM": lookback_hours, ... }
-
-    Requirements in run_cfg:
-      - "BASE_MINUTES" (int)
-      - "sl_tp_interval_months" (int)
-      - "grid_start_date", "grid_end_date" (ISO datetimes)
-      - "ma_periods" and "entry_lookback_h" are used to compute needed lookback
-    """
-
     import math
 
     if df is None or df.height == 0:
-        # still ensure run_cfg gets an empty map (explicit)
         run_cfg["lookback_map"] = {}
         return df
 
     df = df.clone()
 
-    base_min = int(run_cfg.get("BASE_MINUTES", 5))
-    modifier = int(run_cfg.get("signal_timeframe_modifier", 3)) # Default to 3 (15m)
-    unit_mult = modifier
+    base_min = _as_int(run_cfg.get("BASE_MINUTES", 5), 5)
+    modifier = _as_int(run_cfg.get("signal_timeframe_modifier", 3), 3)
+    unit_mult = max(1, modifier)
 
-    # --- 1. MA Periods (Compute ALL as ma_a, ma_b, ma_c...) ---
-    raw_ma_periods = run_cfg.get("ma_periods", []) or []
-    if isinstance(raw_ma_periods, (int, float)):
-        raw_ma_periods = [raw_ma_periods]
+    # --- 1. MA Periods ---
+    raw_ma_periods = run_cfg.get("ma_periods", [])
+    ma_periods_used = sorted({x for x in _as_int_list(raw_ma_periods) if x > 0})
 
-    ma_periods_used = sorted({int(x) for x in raw_ma_periods})
-
-    # KAMA Constants (Fixed)
     fast_sc = 2 / (2 + 1)
     slow_sc = 2 / (30 + 1)
 
     for i, period in enumerate(ma_periods_used):
         ma_name = f"kama_{chr(97 + i)}"
-        # The 'n' period scaled by our modifier
         n = max(1, period * unit_mult)
-        
-        # Polars calculation for ER (Efficiency Ratio)
-        change = (pl.col("close") - pl.col("close").shift(n)).abs()
-        volatility = (pl.col("close") - pl.col("close").shift(1)).abs().rolling_sum(n)
-        er = (change / volatility).fill_nan(0.0)
-        
-        # Calculate Smoothing Constant
-        sc = (er * (fast_sc - slow_sc) + slow_sc).pow(2)
-        
-        # Note: True KAMA is recursive. In Polars precompute, we use an EWM 
-        # approximation or a scan. For high-speed trading scripts, 
-        # a weighted mean over the period is often used as a proxy.
+
         df = df.with_columns([
             pl.col("close").ewm_mean(span=n, adjust=False).alias(ma_name)
         ])
 
-    # --- 2. Stochastic (pct_d_slow) ---
+    # --- 2. Stochastic ---
     use_stoch_val = run_cfg.get("use_stochastic", False)
-    should_compute_stoch = use_stoch_val if isinstance(use_stoch_val, bool) else any(use_stoch_val)
-    
-    if should_compute_stoch:    
-        ks = run_cfg.get("stoch_k", [12])
-        ds = run_cfg.get("stoch_d", [3])
-        ss = run_cfg.get("stoch_s", [3])
-        
+    should_compute_stoch = _as_bool(use_stoch_val, False)
+
+    if should_compute_stoch:
+        ks = _as_int_list(run_cfg.get("stoch_k", [12])) or [12]
+        ds = _as_int_list(run_cfg.get("stoch_d", [3])) or [3]
+        ss = _as_int_list(run_cfg.get("stoch_s", [3])) or [3]
+
         for k in ks:
             for d in ds:
                 for s in ss:
-                    k_window = k * unit_mult
-                    d_window = d * unit_mult
-                    s_window = s * unit_mult
+                    k_window = max(1, k * unit_mult)
+                    d_window = max(1, d * unit_mult)
+                    s_window = max(1, s * unit_mult)
 
-                    # Consistent naming: stoch_k12_d3_s3
                     col_name = f"stoch_k{k}_d{d}_s{s}"
-                    
+
                     s_min = pl.col("close").rolling_min(k_window, min_periods=1)
                     s_max = pl.col("close").rolling_max(k_window, min_periods=1)
-                    
+
                     df = df.with_columns([
                         (100.0 * (pl.col("close") - s_min) / (s_max - s_min)).fill_nan(50.0).alias("_k")
                     ]).with_columns([
-                        # Change rolling_mean to ewm_mean
                         pl.col("_k").ewm_mean(span=d_window, adjust=False).alias("_d")
                     ]).with_columns([
-                        # Change rolling_mean to ewm_mean
                         pl.col("_d").ewm_mean(span=s_window, adjust=False).alias(col_name)
                     ]).drop(["_k", "_d"])
 
-    # --- 3. Breakouts (precompute for every requested entry_lookback_h) ---
-    lookbacks = run_cfg.get("entry_lookback_units", [])
-    if isinstance(lookbacks, int):
-        lookbacks = [lookbacks]
-
+    # --- 3. Breakouts ---
+    lookbacks = _as_int_list(run_cfg.get("entry_lookback_units", []))
     for lb_units in lookbacks:
         if lb_units < 0:
             continue
+
         periods = lb_units * unit_mult
         hi = pl.col("high").rolling_max(periods).shift(1)
         lo = pl.col("low").rolling_min(periods).shift(1)
+
         df = df.with_columns([
             ((pl.col("close") - lo) / (hi - lo)).cast(pl.Float32).alias(f"breakout_{lb_units}u")
         ])
 
         if lb_units == 0:
             df = df.with_columns([
-                pl.lit(1.0).cast(pl.Float32).alias("breakout_0u") # 1.0 means 'always triggered'
+                pl.lit(1.0).cast(pl.Float32).alias("breakout_0u")
             ])
 
-# --- 4. Normalized Bollinger Band Width (BBW) ---
-    bbw_periods = run_cfg.get("bbw_periods", [])
-    bbw_std = run_cfg.get("bbw_std", [2.5])
-    # We use a long lookback to find the "Era Min/Max" for volatility
-    rel_lookback = 500 
+    # --- 4. BBW ---
+    bbw_periods = sorted({x for x in _as_int_list(run_cfg.get("bbw_periods", [])) if x > 0})
+    bbw_std = _as_float_list(run_cfg.get("bbw_std", [2.5])) or [2.5]
+    rel_lookback = 500
 
     for p in bbw_periods:
-        if p <= 0: continue 
-            
         for s in bbw_std:
             n = max(1, p * unit_mult)
             col_name = f"bbw_p{p}_s{s}"
-            
-            # 1. Calculate Raw BBW
+
             rolling_mean = pl.col("close").rolling_mean(n)
             rolling_std = pl.col("close").rolling_std(n, ddof=0)
             raw_bbw = (2 * s * rolling_std) / rolling_mean
-            
-            # 2. Calculate Rolling Min/Max of the Width itself
-            # This identifies the "Squeeze" (Min) and "Expansion" (Max)
+
             b_min = raw_bbw.rolling_min(window_size=rel_lookback)
             b_max = raw_bbw.rolling_max(window_size=rel_lookback)
-            
-            # 3. Create the 0-100 Relative Scale
-            # 50 = Exactly the middle of recent volatility
+
             df = df.with_columns([
                 (100 * (raw_bbw - b_min) / (b_max - b_min))
                 .fill_nan(50)
-                .clip(0, 100) # Ensure no outliers
+                .clip(0, 100)
                 .cast(pl.Float32)
                 .alias(col_name)
             ])
 
-
-    # --- 5. NEW WARMUP LOGIC (Dynamic & Robust) ---
-    # We find the single largest window used across all features to ensure safety.
-    max_k = max(run_cfg.get("stoch_k", [0]))
+    # --- 5. Warmup / lookback ---
+    max_k = max(_as_int_list(run_cfg.get("stoch_k", [0])) or [0])
     max_ma = max(ma_periods_used) if ma_periods_used else 0
     max_lb = max(lookbacks) if lookbacks else 0
     max_bbw = max(bbw_periods) if bbw_periods else 0
-    
-    # The largest "Unit" window
+
     absolute_max_units = max(max_k, max_ma, max_lb, max_bbw)
-    
-    # Total hours = (Units * Modifier * BaseMin) / 60
-    # We add 2 hours as a "Buffer" for shifting and EWM stabilization
     required_hours = math.ceil((absolute_max_units * unit_mult * base_min) / 60) + 2
 
     # --- 6. Era Generation ---
-    start_str = run_cfg["grid_start_date"]
-    end_str = run_cfg["grid_end_date"]
-    interval = f"{run_cfg.get('sl_tp_interval_months', 6)}mo"
+    start_str = _as_str(run_cfg.get("grid_start_date", ""))
+    end_str = _as_str(run_cfg.get("grid_end_date", ""))
+    if not start_str or not end_str:
+        run_cfg["lookback_map"] = {}
+        return df, run_cfg
+        
+    interval = f"{_as_int(run_cfg.get('sl_tp_interval_months', 6), 6)}mo"
 
     start_dt = pl.select(pl.lit(start_str).str.to_datetime(time_zone="UTC")).item()
     end_dt = pl.select(pl.lit(end_str).str.to_datetime(time_zone="UTC")).item()
@@ -419,104 +444,85 @@ def precompute_all_possible_features(df: pl.DataFrame, run_cfg: dict) -> pl.Data
 
 # -------- signal generator (lean) ----------
 def generate_filtered_signals(df_slice: pl.DataFrame, cfg: dict, df_main: Optional[pl.DataFrame] = None) -> pl.DataFrame:
-
-    # 1. Early exit with the strict 4-column schema
     if df_slice is None or not isinstance(df_slice, pl.DataFrame) or df_slice.height == 0:
-        return pl.DataFrame([], schema=CACHE_SIGNAL_SCHEMA)
+        return pl.DataFrame([], schema=get_schema("signals"))
 
     df_slice = normalize_signals_times(df_slice, df_main=df_main)
 
-    # Initialize base conditions as True
     cond_buy = pl.lit(True)
     cond_sell = pl.lit(True)
 
     # --- 1. Entry Lookback Logic ---
-    lb_units = int(cfg.get("entry_lookback_units", 0))
+    lb_units = _as_int(cfg.get("entry_lookback_units", 0), 0)
 
-    # Only apply the filter if units > 0. 
-    # If units == 0, we skip this and cond_buy stays True (passing through).
     if lb_units > 0:
         brk_col = f"breakout_{lb_units}u"
         if brk_col in df_slice.columns:
             cond_buy = cond_buy & (pl.col(brk_col) >= 0.8).fill_null(False)
             cond_sell = cond_sell & (pl.col(brk_col) <= 0.2).fill_null(False)
 
-    # --- 2. Stochastic Logic (CLEANED) ---
-    if cfg.get("use_stochastic", False):
+    # --- 2. Stochastic Logic ---
+    if _as_bool(cfg.get("use_stochastic", False), False):
         stoch_col = cfg.get("stoch_col")
-        lower = cfg.get("stoch_lower")
-        upper = cfg.get("stoch_upper")
-        
-        # If the specific precomputed column exists, use it
+        lower = _as_float(cfg.get("stoch_lower", 30), 30)
+        upper = _as_float(cfg.get("stoch_upper", 70), 70)
+
         if stoch_col and stoch_col in df_slice.columns:
             cond_buy = cond_buy & (pl.col(stoch_col) < lower).fill_null(False)
             cond_sell = cond_sell & (pl.col(stoch_col) > upper).fill_null(False)
 
-    # --- 3. MA Logic (Trend Following Only) ---
-    ma_int = int(cfg.get("ma_int", 0))
-    ma_periods = cfg.get("ma_periods", [])
+    # --- 3. MA Logic ---
+    ma_int = _as_int(cfg.get("ma_int", 0), 0)
+    ma_periods = _as_int_list(cfg.get("ma_periods", []))
 
     if ma_int > 0:
-        ma_reversion = cfg.get("ma_reversion", False)
+        ma_reversion = _as_bool(cfg.get("ma_reversion", False), False)
+
         for i in range(len(ma_periods)):
             if (ma_int >> i) & 1:
-
                 kama_col_name = f"kama_{chr(97 + i)}"
-
-                ma_col_name = f"ma_{chr(97 + i)}"
                 if kama_col_name in df_slice.columns:
                     if not ma_reversion:
-                        # Trend Following: Price above KAMA for Buy
                         cond_buy = cond_buy & (pl.col("close") > pl.col(kama_col_name)).fill_null(False)
                         cond_sell = cond_sell & (pl.col("close") < pl.col(kama_col_name)).fill_null(False)
                     else:
-                        # Mean Reversion: Price below KAMA for Buy
                         cond_buy = cond_buy & (pl.col("close") < pl.col(kama_col_name)).fill_null(False)
                         cond_sell = cond_sell & (pl.col("close") > pl.col(kama_col_name)).fill_null(False)
 
     # --- 4. BBW Threshold Gate ---
-    if cfg.get("use_bbw", False):
-        p = cfg.get("bbw_periods")
-        s = cfg.get("bbw_std")
-        threshold = cfg.get("bbw_thresholds", 50) # Now 50 means "Median Volatility"
-        
+    if _as_bool(cfg.get("use_bbw", False), False):
+        p = _as_int(cfg.get("bbw_periods", 0), 0)
+        s = _as_float(cfg.get("bbw_std", 0), 0.0)
+        threshold = _as_float(cfg.get("bbw_thresholds", 50), 50.0)
+
         bbw_col = f"bbw_p{p}_s{s}"
-        
+
         if bbw_col in df_slice.columns:
-            # Entry only if volatility is in the lower half of recent history
             vol_gate = (pl.col(bbw_col) <= threshold).fill_null(False)
-            
             cond_buy = cond_buy & vol_gate
             cond_sell = cond_sell & vol_gate
 
-    # --- 5. Evaluate both directions independently ---
-    # Create Buy Signals
     df_buys = (
         df_slice.filter(cond_buy)
         .select([
-            pl.col("idx"), 
-            pl.col("time_ns"), 
+            pl.col("idx"),
+            pl.col("time_ns"),
             pl.lit(1, dtype=pl.Int8).alias("side"),
-            pl.lit(cfg.get("regime_id", 0), dtype=pl.Int32).alias("regime_id")
+            pl.lit(_as_int(cfg.get("regime_id", 0), 0), dtype=pl.Int32).alias("regime_id")
         ])
     )
 
-    # Create Sell Signals
     df_sells = (
         df_slice.filter(cond_sell)
         .select([
-            pl.col("idx"), 
-            pl.col("time_ns"), 
+            pl.col("idx"),
+            pl.col("time_ns"),
             pl.lit(-1, dtype=pl.Int8).alias("side"),
-            pl.lit(cfg.get("regime_id", 0), dtype=pl.Int32).alias("regime_id")
+            pl.lit(_as_int(cfg.get("regime_id", 0), 0), dtype=pl.Int32).alias("regime_id")
         ])
     )
 
-    # Vertical Concat to allow two signals at the same index/time
     df_out = pl.concat([df_buys, df_sells]).sort("idx", "side")
-
-    # Make sure to pass CACHE_SIGNAL_SCHEMA if enforce_schema expects a dict, 
-    # or ensure get_schema("signals") in your schema.py is updated to these 4 columns.
     return df_out
 
 
