@@ -8,6 +8,16 @@ from pathlib import Path
 
 import requests
 
+import sys
+import os
+
+# Ensure 'dags' folder is in the path so we can import 'etl'
+root_dir = os.path.dirname(os.path.abspath(__file__))
+dags_path = os.path.join(root_dir, "dags")
+if dags_path not in sys.path:
+    sys.path.insert(0, dags_path)
+
+
 from etl.kraken_api import fetch_ohlc, fetch_futures_ohlc
 
 ROOT = Path(__file__).resolve().parent
