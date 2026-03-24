@@ -1,6 +1,6 @@
 {
   "delay_seconds": 3,
-  "interval_minutes": [5, 60, 1440],
+  "interval_minutes": [5],
   "pairs": [
     {
       "pair": "XXBTZUSD",
