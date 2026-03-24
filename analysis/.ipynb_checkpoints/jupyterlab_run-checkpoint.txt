@@ -1,2 +1,0 @@
-conda activate dev_env
-jupyter lab --ip=0.0.0.0 --no-browser

@@ -32,6 +32,6 @@ jobs:
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_DATA_CHANNEL_ID: ${{ secrets.TG_DATA_CHANNEL_ID }}
-          PYTHONPATH:
+          PYTHONPATH: ${{ github.workspace }}/dags
         run: |
           python satellite_ingest.py
