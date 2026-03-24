@@ -1,0 +1,18 @@
+{
+  "delay_seconds": 3,
+  "interval_minutes": [5, 60, 1440],
+  "pairs": [
+    {
+      "pair": "XXBTZUSD",
+      "market_type": "spot"
+    },
+    {
+      "pair": "XETHZUSD",
+      "market_type": "spot"
+    },
+    {
+      "pair": "XAUTUSD",
+      "market_type": "spot"
+    }
+  ]
+}

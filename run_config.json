@@ -19,7 +19,7 @@
   "sl_exit_at_zero": true,
   "exit_windows": [12, 24, 48, 72],
   "signal_timeframe_modifier": 3,
-  "entry_lookback_units": [6, 8, 12, 16],  
+  "entry_lookback_units": [6, 8, 12], 
   "ma_periods": [32, 64, 96, 128],
   "ma_reversion": [false],
   "stoch_k": [6],
@@ -29,7 +29,7 @@
   "use_stochastic": [true],
   "bbw_periods": [48, 96],
   "bbw_std": [2.5],
-  "bbw_thresholds":[25, 50, 100],
+  "bbw_thresholds":[50],
   "use_bbw": [false, true],
   "BTC_SETTINGS": {
     "spread": 0.0002

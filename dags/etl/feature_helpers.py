@@ -42,52 +42,203 @@ def normalize_signals_times(df_signals: pl.DataFrame, df_main: Optional[pl.DataF
 
     return df
 
-# -------- helper: safely extract per-trade gap arrays (entry/exit) ----------
 def get_ma_price_gaps_for_indices(
     df_main: pl.DataFrame,
     entry_idxs: np.ndarray,
     exit_idxs: np.ndarray,
+    regime_cfg: Optional[dict] = None,
+    run_cfg: Optional[dict] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    
-    n_entry = entry_idxs.shape[0] if entry_idxs is not None else 0
-    n_exit = exit_idxs.shape[0] if exit_idxs is not None else 0
+    """
+    Return signed MA gap features for trade entry/exit rows.
 
-    # Initialize results
-    gap_a_entry, gap_b_entry = np.full(n_entry, np.nan, dtype=np.float32), np.full(n_entry, np.nan, dtype=np.float32)
-    gap_a_exit, gap_b_exit = np.full(n_exit, np.nan, dtype=np.float32), np.full(n_exit, np.nan, dtype=np.float32)
+    gap_a = fast_ma - slow_ma
+    gap_b = (fast_ma - slow_ma) / slow_ma   if slow_ma != 0 else 0
+
+    Uses the active MA columns from ma_int + ma_periods when possible.
+    Falls back to the first two available kama_* columns.
+    Never returns NaN.
+    """
+    regime_cfg = regime_cfg or {}
+    run_cfg = run_cfg or {}
+
+    n_entry = int(entry_idxs.shape[0]) if entry_idxs is not None else 0
+    n_exit = int(exit_idxs.shape[0]) if exit_idxs is not None else 0
+
+    gap_a_entry = np.zeros(n_entry, dtype=np.float32)
+    gap_b_entry = np.zeros(n_entry, dtype=np.float32)
+    gap_a_exit = np.zeros(n_exit, dtype=np.float32)
+    gap_b_exit = np.zeros(n_exit, dtype=np.float32)
 
     if df_main is None or df_main.height == 0:
         return gap_a_entry, gap_b_entry, gap_a_exit, gap_b_exit
 
-    # 1. Grab raw prices and MAs (guaranteed to exist by precompute)
-    close_arr = df_main["close"].to_numpy().astype(np.float32)
-    
-    for i, char in enumerate(['a', 'b']):
-        ma_col = f"ma_{char}"
-        if ma_col not in df_main.columns:
-            continue
-            
-        ma_arr = df_main[ma_col].to_numpy().astype(np.float32)
-        
-        # 2. Calculate Gaps only for the needed indices to save memory
-        # Entry Gaps
-        valid_entry = (entry_idxs >= 0) & (entry_idxs < ma_arr.shape[0])
-        if valid_entry.any():
-            idx = entry_idxs[valid_entry]
-            # (Price / MA) - 1
-            gap_vals = (close_arr[idx] / ma_arr[idx]) - 1.0
-            if i == 0: gap_a_entry[valid_entry] = gap_vals
-            else: gap_b_entry[valid_entry] = gap_vals
+    # Find active MA columns from regime_cfg / run_cfg.
+    ma_periods = regime_cfg.get("ma_periods", run_cfg.get("ma_periods", [])) or []
+    if isinstance(ma_periods, (int, float)):
+        ma_periods = [ma_periods]
 
-        # Exit Gaps
-        valid_exit = (exit_idxs >= 0) & (exit_idxs < ma_arr.shape[0])
-        if valid_exit.any():
-            idx = exit_idxs[valid_exit]
-            gap_vals = (close_arr[idx] / ma_arr[idx]) - 1.0
-            if i == 0: gap_a_exit[valid_exit] = gap_vals
-            else: gap_b_exit[valid_exit] = gap_vals
+    ma_int = int(regime_cfg.get("ma_int", 0) or 0)
+
+    active_ma_cols = []
+    for i in range(len(ma_periods)):
+        if (ma_int >> i) & 1:
+            col = f"kama_{chr(97 + i)}"
+            if col in df_main.columns:
+                active_ma_cols.append(col)
+
+    # Fallback: use the first available kama_* columns
+    if len(active_ma_cols) < 2:
+        kama_cols = [c for c in df_main.columns if c.startswith("kama_")]
+        kama_cols = sorted(kama_cols)
+        if len(kama_cols) >= 2:
+            active_ma_cols = kama_cols[:2]
+
+    if len(active_ma_cols) < 2:
+        # not enough MA columns to compute a spread
+        return gap_a_entry, gap_b_entry, gap_a_exit, gap_b_exit
+
+    fast_col = active_ma_cols[0]
+    slow_col = active_ma_cols[1]
+
+    fast_arr = (
+        df_main[fast_col]
+        .fill_nan(0.0)
+        .fill_null(0.0)
+        .to_numpy()
+        .astype(np.float64, copy=False)
+    )
+    slow_arr = (
+        df_main[slow_col]
+        .fill_nan(0.0)
+        .fill_null(0.0)
+        .to_numpy()
+        .astype(np.float64, copy=False)
+    )
+
+    def _fill_gaps(idxs: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        idxs = np.asarray(idxs, dtype=np.int64)
+        if idxs.size == 0:
+            return np.zeros(0, dtype=np.float32), np.zeros(0, dtype=np.float32)
+
+        valid = (idxs >= 0) & (idxs < fast_arr.shape[0])
+        if not valid.any():
+            return np.zeros(idxs.size, dtype=np.float32), np.zeros(idxs.size, dtype=np.float32)
+
+        out_a = np.zeros(idxs.size, dtype=np.float32)
+        out_b = np.zeros(idxs.size, dtype=np.float32)
+
+        pos = idxs[valid]
+        fast_v = fast_arr[pos]
+        slow_v = slow_arr[pos]
+
+        fast_v = np.nan_to_num(fast_v, nan=0.0, posinf=0.0, neginf=0.0)
+        slow_v = np.nan_to_num(slow_v, nan=0.0, posinf=0.0, neginf=0.0)
+
+        spread = fast_v - slow_v
+        spread_pct = np.where(slow_v != 0.0, spread / slow_v, 0.0)
+
+        out_a[valid] = spread.astype(np.float32)
+        out_b[valid] = spread_pct.astype(np.float32)
+        return out_a, out_b
+
+    gap_a_entry, gap_b_entry = _fill_gaps(entry_idxs)
+    gap_a_exit, gap_b_exit = _fill_gaps(exit_idxs)
 
     return gap_a_entry, gap_b_entry, gap_a_exit, gap_b_exit
+
+def add_volatility_index_features(df: pl.DataFrame, run_cfg: dict) -> pl.DataFrame:
+    """
+    Add causal rolling volatility-index style features on df_main.close.
+
+    Volatility Index:
+        (rolling_max - rolling_min) / rolling_min
+
+    Assumption:
+        1 month = 30 days
+
+    Uses the base candle size from BASE_MINUTES.
+    """
+    if df is None or df.height == 0:
+        return df
+
+    base_min = int(run_cfg.get("BASE_MINUTES", 5))
+
+    # Optional: if you want to use the signal timeframe instead of the base candle size,
+    # set this to True in run_cfg and multiply by signal_timeframe_modifier.
+    use_signal_tf = bool(run_cfg.get("volatility_use_signal_timeframe", False))
+    modifier = int(run_cfg.get("signal_timeframe_modifier", 3)) if use_signal_tf else 1
+    effective_min = max(1, base_min * modifier)
+
+    # window sizes in bars
+    windows = {
+        "rng_24h": int(round((24 * 60) / effective_min)),
+        "rng_72h": int(round((72 * 60) / effective_min)),
+        "rng_1w": int(round((7 * 24 * 60) / effective_min)),
+        "rng_1m": int(round((30 * 24 * 60) / effective_min)),
+    }
+
+    exprs = []
+    for col_name, win in windows.items():
+        win = max(1, win)
+
+        rolling_min = pl.col("close").rolling_min(window_size=win, min_periods=win)
+        rolling_max = pl.col("close").rolling_max(window_size=win, min_periods=win)
+
+        exprs.append(
+            (
+                ((rolling_max - rolling_min) / rolling_min)
+                .fill_nan(0.0)
+                .fill_null(0.0)
+                .cast(pl.Float32)
+                .alias(col_name)
+            )
+        )
+
+    return df.with_columns(exprs)
+
+def get_volatility_index_for_indices(
+    df_main: pl.DataFrame,
+    entry_idxs: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Extract volatility index values at trade entry positions.
+    Returns:
+        rng_24h_entry, rng_72h_entry, rng_1w_entry, rng_1m_entry
+    """
+    if entry_idxs is None:
+        entry_idxs = np.asarray([], dtype=np.int64)
+    else:
+        entry_idxs = np.asarray(entry_idxs, dtype=np.int64)
+
+    n = entry_idxs.shape[0]
+    zero = np.zeros(n, dtype=np.float32)
+
+    if df_main is None or df_main.height == 0 or n == 0:
+        return zero, zero.copy(), zero.copy(), zero.copy()
+
+    cols = ["rng_24h", "rng_72h", "rng_1w", "rng_1m"]
+    out = []
+
+    for c in cols:
+        if c not in df_main.columns:
+            out.append(zero.copy())
+            continue
+
+        arr = (
+            df_main[c]
+            .fill_nan(0.0)
+            .fill_null(0.0)
+            .to_numpy()
+            .astype(np.float32, copy=False)
+        )
+
+        idxs = np.clip(entry_idxs, 0, max(0, arr.shape[0] - 1))
+        vals = arr[idxs]
+        vals = np.nan_to_num(vals, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+        out.append(vals)
+
+    return tuple(out)
 
 
 # Precompute Function

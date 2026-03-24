@@ -46,25 +46,23 @@ def _market_type_for_pair(pair: str) -> str:
     return "future" if pair.startswith("PF_") else "spot"
 
 
-def _estimate_needed_bars(cfg: dict) -> int:
-    live = cfg.get("live_signal", {})
+def _estimate_needed_bars(pair_cfg: dict) -> int:
+    base_min = int(pair_cfg.get("BASE_MINUTES", 5))
+    modifier = int(pair_cfg.get("signal_timeframe_modifier", 3))
 
-    base_min = int(cfg.get("BASE_MINUTES", 5))
-    modifier = int(cfg.get("signal_timeframe_modifier", 3))
-
-    ma_periods = live.get("ma_periods", cfg.get("ma_periods", [])) or []
+    ma_periods = pair_cfg.get("ma_periods", []) or []
     if isinstance(ma_periods, (int, float)):
-        ma_periods = [ma_periods]
+        ma_periods = [int(ma_periods)]
 
-    entry_lookback = int(live.get("entry_lookback_units", cfg.get("entry_lookback_units", 0)) or 0)
+    entry_lookback = int(pair_cfg.get("entry_lookback_units", 0) or 0)
 
-    stoch_k = live.get("stoch_k", cfg.get("stoch_k", [])) or []
+    stoch_k = pair_cfg.get("stoch_k", []) or []
     if isinstance(stoch_k, (int, float)):
-        stoch_k = [stoch_k]
+        stoch_k = [int(stoch_k)]
 
-    bbw_periods = live.get("bbw_periods", cfg.get("bbw_periods", [])) or []
+    bbw_periods = pair_cfg.get("bbw_periods", []) or []
     if isinstance(bbw_periods, (int, float)):
-        bbw_periods = [bbw_periods]
+        bbw_periods = [int(bbw_periods)]
 
     max_units = 0
     for x in ma_periods:
@@ -134,57 +132,49 @@ def _load_recent_df_main(pair: str, market_type: str, limit_rows: int) -> pl.Dat
 
     return df
 
-
-def _build_live_signal_frame(df_main: pl.DataFrame, cfg: dict, pair: str, market_type: str) -> pl.DataFrame:
-    live = dict(cfg.get("live_signal", {}))
+def _build_live_signal_frame(
+    df_main: pl.DataFrame,
+    pair_params: dict,
+    pair: str,
+    market_type: str,
+) -> pl.DataFrame:
+    # Build runtime config for the existing signal function
+    live = dict(pair_params)
 
     live["pair"] = pair
     live["market_type"] = market_type
 
-    # Make sure the signal helper sees scalar values where it expects them.
-    # Keep the original grid arrays in cfg, but live_signal should hold the chosen regime.
-    if "ma_periods" not in live and "ma_periods" in cfg:
-        live["ma_periods"] = cfg["ma_periods"]
-    if "entry_lookback_units" not in live and "entry_lookback_units" in cfg:
-        live["entry_lookback_units"] = cfg["entry_lookback_units"]
-    if "stoch_k" not in live and "stoch_k" in cfg:
-        live["stoch_k"] = cfg["stoch_k"]
-    if "stoch_d" not in live and "stoch_d" in cfg:
-        live["stoch_d"] = cfg["stoch_d"]
-    if "stoch_s" not in live and "stoch_s" in cfg:
-        live["stoch_s"] = cfg["stoch_s"]
-    if "bbw_periods" not in live and "bbw_periods" in cfg:
-        live["bbw_periods"] = cfg["bbw_periods"]
-    if "bbw_std" not in live and "bbw_std" in cfg:
-        live["bbw_std"] = cfg["bbw_std"]
+    # Keep ma_periods as the source of truth
+    ma_periods = live.get("ma_periods", []) or []
+    if isinstance(ma_periods, (int, float)):
+        ma_periods = [int(ma_periods)]
+    ma_periods = [int(x) for x in ma_periods]
+    live["ma_periods"] = ma_periods
 
-    # Compute all precomputed live features on the slice.
-    # This is the same idea as your backtest precompute path, but on the recent live window only.
-    df_feat, live = precompute_all_possible_features(df_main, live)
+    # Convert ma_periods -> ma_int bitmask for generate_filtered_signals()
+    # If you want all listed MAs active, set all bits on.
+    # Example: 2 periods -> ma_int = 0b11 = 3
+    live["ma_int"] = (1 << len(ma_periods)) - 1 if ma_periods else 0
 
-    # generate_filtered_signals expects the chosen stochastic column and thresholds
-    # in the runtime config.
+    # Make sure stochastic settings are present
     if "stoch_col" not in live and live.get("use_stochastic", False):
         k = live.get("stoch_k")
         d = live.get("stoch_d")
         s = live.get("stoch_s")
-        if isinstance(k, list):
-            k = k[0] if k else None
-        if isinstance(d, list):
-            d = d[0] if d else None
-        if isinstance(s, list):
-            s = s[0] if s else None
         if k is not None and d is not None and s is not None:
             live["stoch_col"] = f"stoch_k{int(k)}_d{int(d)}_s{int(s)}"
 
-    if "stoch_lower" not in live:
-        thr = live.get("stoch_thresholds", cfg.get("stoch_thresholds", [[20, 80]]))
+    if "stoch_lower" not in live or "stoch_upper" not in live:
+        thr = live.get("stoch_thresholds", [[20, 80]])
         if isinstance(thr, list) and thr and isinstance(thr[0], list) and len(thr[0]) >= 2:
             live["stoch_lower"] = thr[0][0]
             live["stoch_upper"] = thr[0][1]
 
-    df_signals = generate_filtered_signals(df_feat, live, df_main=df_feat)
-    return df_signals
+    # Precompute features on the recent slice
+    df_feat, live = precompute_all_possible_features(df_main, live)
+
+    # Keep the exact same downstream signal generator
+    return generate_filtered_signals(df_feat, live, df_main=df_feat)
 
 
 def _pick_latest_signal(df_signals: pl.DataFrame) -> pl.DataFrame:
@@ -262,7 +252,7 @@ def kraken_signal_ingest():
     @task()
     def build_one(pair: str, cfg: dict) -> dict:
         market_type = _market_type_for_pair(pair)
-        needed_rows = _estimate_needed_bars(cfg)
+        needed_rows = _estimate_needed_bars(params)
         limit_rows = min(needed_rows, LIVE_MAX_ROWS)
 
         df_main = _load_recent_df_main(pair, market_type, limit_rows)
@@ -286,7 +276,7 @@ def kraken_signal_ingest():
                 "reason": "no df_main rows",
             }
 
-        df_signals = _build_live_signal_frame(df_main, cfg, pair, market_type)
+        df_signals = _build_live_signal_frame(df_main, params, pair, market_type)
         latest = _pick_latest_signal(df_signals)
 
         if latest.is_empty():

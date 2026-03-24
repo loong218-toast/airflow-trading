@@ -8,3 +8,4 @@ polars>=1.21.0
 adbc-driver-postgresql
 adbc-driver-manager
 psycopg2-binary
+python-dotenv

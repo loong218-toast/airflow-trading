@@ -61,7 +61,12 @@ EQUITY_SCHEMA: Dict[str, pl.DataType] = {
     "ma_p_gap_a_entry": pl.Float32,
     "ma_p_gap_b_entry": pl.Float32,
     "ma_p_gap_a_exit":  pl.Float32,
-    "ma_p_gap_b_exit": pl.Float32
+    "ma_p_gap_b_exit": pl.Float32,
+
+    "rng_24h_entry": pl.Float32,
+    "rng_72h_entry": pl.Float32,
+    "rng_1w_entry": pl.Float32,
+    "rng_1m_entry": pl.Float32
 }
 
 CACHE_SIGNAL_SCHEMA: Dict[str, pl.DataType] = {

@@ -31,6 +31,7 @@ with DAG(
             interval_minutes INT NOT NULL,
             time TIMESTAMP WITH TIME ZONE NOT NULL,
             time_ns BIGINT NOT NULL,
+            market_type TEXT DEFAULT 'spot',
             open REAL,
             high REAL,
             low REAL,
@@ -45,7 +46,7 @@ with DAG(
             interval_minutes INT NOT NULL,
             time TIMESTAMP WITH TIME ZONE NOT NULL,
             time_ns BIGINT NOT NULL,
-            tick_type TEXT DEFAULT 'trade', -- trade, mark, or spot
+            market_type TEXT DEFAULT future', -- trade, mark, or spot
             open REAL,
             high REAL,
             low REAL,

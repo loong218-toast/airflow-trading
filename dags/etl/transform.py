@@ -17,6 +17,8 @@ os.environ["POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR"] = "load_as_storage"
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
+BASE_MINUTES = 5
+
 def get_transform_watermark(engine: Engine, pair: str, market_type: str) -> Optional[int]:
     with engine.begin() as conn:
         row = conn.execute(
@@ -35,10 +37,13 @@ def get_transform_watermark(engine: Engine, pair: str, market_type: str) -> Opti
 def load_candles_from_db_polars(
     engine,
     pair: str,
-    interval_minutes: int = 5,
+    interval_minutes: int = BASE_MINUTES,
     market_type: str = "spot",
     start_after_ns: Optional[int] = None,
 ) -> pl.DataFrame:
+    if interval_minutes != BASE_MINUTES:
+        raise ValueError("df_main is 5m-only. Use interval_minutes=5 here.")
+
     table = "ohlc_spot_raw" if market_type == "spot" else "ohlc_future_raw"
 
     q = f"""
@@ -141,12 +146,10 @@ def build_and_save_df_main_to_sql(engine, pair: str, market_type: str = "spot", 
 
     from etl.db import get_transform_watermark
 
+    base_minutes = BASE_MINUTES
     last_time_ns = get_transform_watermark(engine, pair, market_type)
 
-    # Keep a small overlap so change_24h can be calculated correctly.
-    # For 5m candles, 24h = 288 bars.
     overlap_bars = int(run_config.get("transform_overlap_bars", 300))
-    base_minutes = int(run_config.get("BASE_MINUTES", 5))
     overlap_ns = overlap_bars * base_minutes * 60 * 1_000_000_000
 
     start_after_ns = None

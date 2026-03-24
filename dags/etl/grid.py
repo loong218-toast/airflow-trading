@@ -36,7 +36,9 @@ from etl.feature_helpers import (
     normalize_signals_times,
     generate_filtered_signals,
     selected_gap_col_for_ma_int,
-    get_ma_price_gaps_for_indices
+    get_ma_price_gaps_for_indices,
+    add_volatility_index_features,
+    get_volatility_index_for_indices
 )
 from etl.db import get_engine
 
@@ -109,9 +111,13 @@ def heartbeat_log(tag: str, extra: dict | None = None):
     extra = extra or {}
     logger.info(f"💓 {tag} | cpu={cpu:.1f}% mem={mem//1024//1024}MB {extra}")
 
-def _split_period_windows_from_pl(df: pl.DataFrame, months: int,
-                                  min_dt: Optional[datetime.datetime] = None,
-                                  max_dt: Optional[datetime.datetime] = None) -> List[tuple]:
+def _split_period_windows_from_pl(
+    df: pl.DataFrame,
+    months: int,
+    min_dt: Optional[datetime.datetime] = None,
+    max_dt: Optional[datetime.datetime] = None,
+    include_partial_tail: bool = False,
+) -> List[tuple]:
     import datetime as _dt
 
     def _parse(dt_in):
@@ -162,16 +168,23 @@ def _split_period_windows_from_pl(df: pl.DataFrame, months: int,
         return []
 
     start = _dt.datetime(min_dt.year, min_dt.month, 1)
-    end_bound = _dt.datetime(max_dt.year, max_dt.month, 1)
     windows = []
     cur = start
-    while cur <= end_bound:
+
+    while True:
         m = cur.month - 1 + int(months)
         y = cur.year + (m // 12)
         mm = (m % 12) + 1
         end = _dt.datetime(year=y, month=mm, day=1)
+
+        if end > max_dt:
+            if include_partial_tail and cur < max_dt:
+                windows.append((cur, max_dt))
+            break
+
         windows.append((cur, end))
         cur = end
+
     return windows
 
 def _list(x, default):
@@ -630,6 +643,8 @@ def prepare_worker_data(session_dir: Path, run_cfg: dict):
     # prepare_worker_data should call it so df_main contains the precomputed feature columns.
     df_main, updated_cfg = precompute_all_possible_features(df_main, run_cfg)
     run_cfg["lookback_map"] = updated_cfg.get("lookback_map")
+
+    df_main = add_volatility_index_features(df_main, run_cfg)
     logger.debug("prepare_worker_data: after precompute cols=%s", df_main.columns)
 
     # feature columns are anything not in DF_MAIN base set
@@ -856,6 +871,10 @@ def stage_equity_from_preview(
     ma_p_gap_b_entry: Optional[np.ndarray] = None,
     ma_p_gap_a_exit: Optional[np.ndarray] = None,
     ma_p_gap_b_exit: Optional[np.ndarray] = None,
+    rng_24h_entry: Optional[np.ndarray] = None,
+    rng_72h_entry: Optional[np.ndarray] = None,
+    rng_1w_entry: Optional[np.ndarray] = None,
+    rng_1m_entry: Optional[np.ndarray] = None,
 ) -> Tuple[float, int, float]:
     """
     Stage equity rows only after the DD gate already passed.
@@ -872,13 +891,14 @@ def stage_equity_from_preview(
 
     def _prepare_gap(arr, target_len):
         if arr is None or arr.size == 0:
-            return np.full(target_len, np.nan, dtype=np.float32)
+            return np.zeros(target_len, dtype=np.float32)
         a = np.asarray(arr, dtype=np.float32)
+        a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
         if a.shape[0] != target_len:
             if a.shape[0] > target_len:
                 a = a[:target_len]
             else:
-                pad = np.full(target_len - a.shape[0], np.nan, dtype=np.float32)
+                pad = np.zeros(target_len - a.shape[0], dtype=np.float32)
                 a = np.concatenate([a, pad])
         return a
 
@@ -887,6 +907,11 @@ def stage_equity_from_preview(
     gap_b_entry = _prepare_gap(ma_p_gap_b_entry, gap_len)
     gap_a_exit = _prepare_gap(ma_p_gap_a_exit, gap_len)
     gap_b_exit = _prepare_gap(ma_p_gap_b_exit, gap_len)
+
+    rng_24h_entry = _prepare_gap(rng_24h_entry, gap_len)
+    rng_72h_entry = _prepare_gap(rng_72h_entry, gap_len)
+    rng_1w_entry = _prepare_gap(rng_1w_entry, gap_len)
+    rng_1m_entry = _prepare_gap(rng_1m_entry, gap_len)
 
     equity_data = {
         "regime_id": int(regime_id),
@@ -903,6 +928,11 @@ def stage_equity_from_preview(
         "ma_p_gap_b_entry": gap_b_entry,
         "ma_p_gap_a_exit": gap_a_exit,
         "ma_p_gap_b_exit": gap_b_exit,
+
+        "rng_24h_entry": rng_24h_entry,
+        "rng_72h_entry": rng_72h_entry,
+        "rng_1w_entry": rng_1w_entry,
+        "rng_1m_entry": rng_1m_entry,
     }
 
     try:
@@ -980,7 +1010,6 @@ def _run_backtest_grid(
     total_in_batch: int,
     combos: List[Tuple[float, float]],
 ):
-    months = int(run_cfg["sl_tp_interval_months"])
 
     df_main = data_ctx["df_main"]
     main_close_arr = data_ctx["main_close_arr"]
@@ -1146,6 +1175,11 @@ def _run_backtest_grid(
             closed_entry_idxs = entry_idx[mask_closed].astype(np.int64)
             closed_exit_idxs = exit_idx[mask_closed].astype(np.int64)
 
+            rng_24h_entry, rng_72h_entry, rng_1w_entry, rng_1m_entry = get_volatility_index_for_indices(
+                df_main=df_main,
+                entry_idxs=closed_entry_idxs,
+            )
+
             pnl_pct_arr, exit_times_ns, equity_arr, current_max_dd, breached = compute_equity_preview(
                 closed_rets=closed_rets,
                 closed_entry_idxs=closed_entry_idxs,
@@ -1189,7 +1223,11 @@ def _run_backtest_grid(
             dd_pass += 1
 
             gap_entry_a, gap_entry_b, gap_exit_a, gap_exit_b = get_ma_price_gaps_for_indices(
-                df_main, closed_entry_idxs, closed_exit_idxs
+                df_main=df_main,
+                entry_idxs=closed_entry_idxs,
+                exit_idxs=closed_exit_idxs,
+                regime_cfg=regime_cfg,
+                run_cfg=run_cfg,
             )
 
             final_balance, win_pos, max_dd = stage_equity_from_preview(
@@ -1209,6 +1247,10 @@ def _run_backtest_grid(
                 ma_p_gap_b_entry=gap_entry_b,
                 ma_p_gap_a_exit=gap_exit_a,
                 ma_p_gap_b_exit=gap_exit_b,
+                rng_24h_entry=rng_24h_entry,
+                rng_72h_entry=rng_72h_entry,
+                rng_1w_entry=rng_1w_entry,
+                rng_1m_entry=rng_1m_entry,
             )
             staged_equity += 1
 
@@ -1263,7 +1305,15 @@ def process_era_combos(
       - No internal computation of lookback; an absent lookback_map entry is an error.
     """
     # validate data_ctx
-    required_keys = ("df_main", "main_time_ns_arr", "feature_cols", "lookback_map")
+    required_keys = (
+        "df_main", 
+        "main_time_ns_arr", 
+        "main_close_arr",    
+        "main_spread_arr",   
+        "main_funding_arr",  
+        "feature_cols", 
+        "lookback_map"
+    )
     missing = [k for k in required_keys if k not in data_ctx]
     if missing:
         raise RuntimeError(f"data_ctx missing required keys: {missing}. This system enforces precomputed lookback_map and features.")
@@ -1284,7 +1334,13 @@ def process_era_combos(
     sl_vals, tp_vals = _expand_sl_tp({**run_cfg, **regime_cfg})
     combos = _prune_by_min_rr(sl_vals, tp_vals, float(run_cfg.get("min_rr", 3.0)))
 
-    windows = _split_period_windows_from_pl(df_main, months, min_dt=grid_start, max_dt=grid_end)
+    windows = _split_period_windows_from_pl(
+        df_main,
+        months,
+        min_dt=grid_start,
+        max_dt=grid_end,
+        include_partial_tail=False,   # drop the short final window
+    )
     logger.debug("process_era_combos: regime=%s windows=%d", regime_id, len(windows))
 
     empty_era_streak = 0
