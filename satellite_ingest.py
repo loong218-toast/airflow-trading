@@ -35,7 +35,7 @@ def normalize_to_ns(df):
     if df is None or df.empty or "time_ns" not in df.columns:
         return df
     # Check the first row. Use .iloc to get the value.
-    if df["time_ns"].iloc < 10**11: 
+    if df["time_ns"].iloc < 10**11:
         df["time_ns"] = (df["time_ns"] * 1_000_000_000).astype("int64")
     return df
 
@@ -46,7 +46,7 @@ def fetch_pair(pair: str, market_type: str, interval: int):
         return fetch_futures_ohlc(pair, interval)
 
     if market_type in {"spot", "xstock"}:
-        return fetch_ohlc(pair, interval)
+        return fetch_ohlc(pair, interval, market_type=market_type)
 
     raise ValueError(f"Unsupported market_type: {market_type}")
 
@@ -168,7 +168,8 @@ def main() -> None:
                 time.sleep(delay_seconds)
                 continue
 
-            snapshot_id = build_snapshot_id(pair, int(last * 1_000_000_000))
+            last_ns = int(last * 1_000_000_000) if last < 10**11 else int(last)
+            snapshot_id = build_snapshot_id(pair, last_ns)
             key = (pair, interval, market_type, snapshot_id)
 
             if key in sent_keys:

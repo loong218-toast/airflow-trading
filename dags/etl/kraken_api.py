@@ -79,6 +79,10 @@ def fetch_ohlc(pair: str, interval: int, since: int = None):
     params = {"pair": pair, "interval": interval}
     if since:
         params["since"] = int(since)
+
+    if market_type == "xstock":
+        params["asset_class"] = "tokenized_asset"
+        
     url = f"{API_BASE}/OHLC"
     r = requests.get(url, params=params, timeout=20)
     r.raise_for_status()
