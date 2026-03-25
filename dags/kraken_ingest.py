@@ -39,32 +39,6 @@ STATE_PATH = Path(
 VALID_MARKET_TYPES = {"spot", "future", "xstock"}
 
 
-def _load_runtime_env() -> None:
-    try:
-        from dotenv import load_dotenv
-    except Exception:
-        logger.warning("python-dotenv not available; using existing container environment.")
-        return
-
-    loaded = None
-    for path in ENV_CANDIDATES:
-        if path.exists():
-            load_dotenv(path, override=False)
-            loaded = path
-            break
-
-    if loaded:
-        logger.info("Loaded environment from %s", loaded)
-    else:
-        logger.warning(
-            "No .env file found in %s. Falling back to existing container environment.",
-            [str(p) for p in ENV_CANDIDATES],
-        )
-
-
-_load_runtime_env()
-
-
 def _db_uri() -> str:
     db_user = os.getenv("POSTGRES_USER")
     db_pass = os.getenv("POSTGRES_PASSWORD")

@@ -319,8 +319,8 @@ def kraken_signal_ingest():
             logger.info("No valid signals found.")
             return {"sent": False, "count": 0}
 
-        token = Variable.get("TELEGRAM_BOT_TOKEN")
-        chat_id = Variable.get("TELEGRAM_CHAT_ID")
+        token = os.getenv("TG_BOT_TOKEN_SIGNAL")
+        chat_id = os.getenv("TG_CHAT_ID")
 
         all_rows = []
         for r in valid:
@@ -365,10 +365,10 @@ def kraken_signal_ingest():
 
         return {"sent": True, "count": len(fresh_rows), "status_code": resp.status_code}
 
-cfg = load_cfg()
-items = resolve_pairs(cfg)
+    cfg = load_cfg()
+    items = resolve_pairs(cfg)
 
-mapped = build_one.partial(cfg=cfg).expand(item=items)
-send_telegram(mapped)
+    mapped = build_one.partial(cfg=cfg).expand(item=items)
+    send_telegram(mapped)
 
 kraken_signal_ingest_dag = kraken_signal_ingest()

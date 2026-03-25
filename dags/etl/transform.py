@@ -6,7 +6,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 import pandas as pd
 import time
-from etl.db import save_df_to_sql, update_transform_metadata, get_engine
+from etl.db import save_df_to_sql, update_transform_metadata
 import gc, math
 import polars as pl
 import re
@@ -24,6 +24,116 @@ RAW_TABLES = {
     "future": "ohlc_future_raw",
     "xstock": "ohlc_xstock_raw",
 }
+
+def needs_transform(engine: Engine, pair: str, market_type: str) -> bool:
+    latest_raw = get_latest_raw_time_ns(engine, pair, market_type)
+    if latest_raw is None:
+        return False
+
+    last_done = get_transform_watermark(engine, pair, market_type)
+    if last_done is None:
+        return True
+
+    return int(latest_raw) > int(last_done)
+
+def get_latest_raw_time_ns(engine: Engine, pair: str, market_type: str) -> Optional[int]:
+    market_type = (market_type or "spot").lower().strip()
+    if market_type not in RAW_TABLES:
+        raise ValueError(f"Unsupported market_type: {market_type}")
+
+    table = RAW_TABLES[market_type]
+
+    with engine.begin() as conn:
+        row = conn.execute(
+            text(f"""
+                SELECT MAX(time_ns)
+                FROM {table}
+                WHERE pair = :p
+                  AND interval_minutes = :m
+            """),
+            {"p": pair, "m": BASE_MINUTES},
+        ).fetchone()
+
+    if not row or row[0] is None:
+        return None
+    return int(row[0])
+
+def discover_pending_transform_items(engine: Engine) -> list[dict]:
+    tables = {
+        "spot": "ohlc_spot_raw",
+        "future": "ohlc_future_raw",
+        "xstock": "ohlc_xstock_raw",
+    }
+
+    parts = []
+    params = {}
+
+    for market_type, table_name in tables.items():
+        reg_name = f"reg_{market_type}"
+        parts.append(f"""
+            SELECT pair, '{market_type}' AS market_type, MAX(time_ns) AS latest_raw_time_ns
+            FROM {table_name}
+            WHERE interval_minutes = :base_minutes
+            GROUP BY pair
+        """)
+        params["base_minutes"] = BASE_MINUTES
+
+    with engine.begin() as conn:
+        existing = {}
+        for market_type, table_name in tables.items():
+            row = conn.execute(
+                text("SELECT to_regclass(:name)"),
+                {"name": table_name},
+            ).fetchone()
+            existing[market_type] = row is not None and row[0] is not None
+
+        union_parts = []
+        for market_type, table_name in tables.items():
+            if not existing[market_type]:
+                continue
+            union_parts.append(f"""
+                SELECT pair, '{market_type}' AS market_type, MAX(time_ns) AS latest_raw_time_ns
+                FROM {table_name}
+                WHERE interval_minutes = :base_minutes
+                GROUP BY pair
+            """)
+
+        if not union_parts:
+            return []
+
+        sql = f"""
+            WITH raw_latest AS (
+                {" UNION ALL ".join(union_parts)}
+            ),
+            meta AS (
+                SELECT pair, market_type, last_time_ns
+                FROM transform_metadata
+            )
+            SELECT
+                r.pair,
+                r.market_type,
+                r.latest_raw_time_ns,
+                m.last_time_ns
+            FROM raw_latest r
+            LEFT JOIN meta m
+              ON m.pair = r.pair
+             AND m.market_type = r.market_type
+            WHERE r.latest_raw_time_ns IS NOT NULL
+              AND (m.last_time_ns IS NULL OR r.latest_raw_time_ns > m.last_time_ns)
+            ORDER BY r.market_type, r.pair
+        """
+
+        rows = conn.execute(text(sql), {"base_minutes": BASE_MINUTES}).fetchall()
+
+    return [
+        {
+            "pair": str(row[0]),
+            "market_type": str(row[1]),
+            "latest_raw_time_ns": int(row[2]),
+            "last_time_ns": None if row[3] is None else int(row[3]),
+        }
+        for row in rows
+    ]
 
 def get_transform_watermark(engine: Engine, pair: str, market_type: str) -> Optional[int]:
     with engine.begin() as conn:
@@ -57,59 +167,62 @@ def load_candles_from_db_polars(
     table = RAW_TABLES[market_type]
 
     if market_type == "future":
-        q = f"""
-            SELECT f.time AT TIME ZONE 'UTC' AS time,
-                   f.open, f.high, f.low, f.close, f.volume, f.time_ns,
-                   COALESCE(h.funding_rate_rel, 0) AS funding_rate
+        base_query = f"""
+            SELECT
+                f.time AT TIME ZONE 'UTC' AS time,
+                f.open, f.high, f.low, f.close, f.volume, f.time_ns,
+                COALESCE(h.funding_rate_rel, 0) AS funding_rate
             FROM {table} f
             LEFT JOIN funding_history_raw h
                    ON f.pair = h.pair
                   AND date_trunc('minute', f.time) = date_trunc('minute', h.time)
-            WHERE f.pair = $1
-              AND f.interval_minutes = $2
-              AND ($3::bigint IS NULL OR f.time_ns > $3)
-            ORDER BY f.time ASC
+            WHERE f.pair = :pair
+              AND f.interval_minutes = :interval_minutes
         """
     elif market_type == "xstock":
-        q = f"""
-            SELECT f.time AT TIME ZONE 'UTC' AS time,
-                   f.open, f.high, f.low, f.close, f.volume, f.time_ns,
-                   NULL::double precision AS funding_rate
+        base_query = f"""
+            SELECT
+                f.time AT TIME ZONE 'UTC' AS time,
+                f.open, f.high, f.low, f.close, f.volume, f.time_ns,
+                NULL::double precision AS funding_rate
             FROM {table} f
-            WHERE f.pair = $1
-              AND f.interval_minutes = $2
-              AND ($3::bigint IS NULL OR f.time_ns > $3)
-            ORDER BY f.time ASC
+            WHERE f.pair = :pair
+              AND f.interval_minutes = :interval_minutes
         """
     else:
-        q = f"""
-            SELECT f.time AT TIME ZONE 'UTC' AS time,
-                   f.open, f.high, f.low, f.close, f.volume, f.time_ns,
-                   COALESCE(h.funding_rate_rel, 0) AS funding_rate
+        base_query = f"""
+            SELECT
+                f.time AT TIME ZONE 'UTC' AS time,
+                f.open, f.high, f.low, f.close, f.volume, f.time_ns,
+                COALESCE(h.funding_rate_rel, 0) AS funding_rate
             FROM {table} f
             LEFT JOIN funding_history_raw h
                    ON f.pair = h.pair
                   AND date_trunc('minute', f.time) = date_trunc('minute', h.time)
-            WHERE f.pair = $1
-              AND f.interval_minutes = $2
-              AND ($3::bigint IS NULL OR f.time_ns > $3)
-            ORDER BY f.time ASC
+            WHERE f.pair = :pair
+              AND f.interval_minutes = :interval_minutes
         """
 
-    url = engine.url
-    uri = f"postgresql://{url.username}:{url.password}@{url.host}:{url.port or 5432}/{url.database}"
+    params = {
+        "pair": pair,
+        "interval_minutes": int(interval_minutes),
+    }
 
-    df_pl = pl.read_database_uri(
-        query=q,
-        uri=uri,
-        engine="adbc",
-        execute_options={"parameters": [pair, interval_minutes, start_after_ns]},
-    )
+    if start_after_ns is not None:
+        query = base_query + " AND f.time_ns > :start_after_ns ORDER BY f.time ASC"
+        params["start_after_ns"] = int(start_after_ns)
+    else:
+        query = base_query + " ORDER BY f.time ASC"
 
-    if df_pl.is_empty():
-        return df_pl
+    with engine.connect() as conn:
+        df_pd = pd.read_sql_query(text(query), conn, params=params)
 
-    df_pl = (
+    if df_pd.empty:
+        return pl.DataFrame()
+
+    df_pl = pl.from_pandas(df_pd)
+
+    return (
         df_pl.with_columns([
             pl.col("time").cast(pl.Datetime("us", "UTC")),
             pl.col("open").cast(pl.Float32),
@@ -123,8 +236,6 @@ def load_candles_from_db_polars(
         .unique(subset=["time"])
         .sort("time")
     )
-
-    return df_pl
 
 
 def build_df_main_from_5m_polars(df_pl: pl.DataFrame, run_config: Dict) -> Tuple[pl.DataFrame, Dict]:
@@ -179,8 +290,6 @@ def build_df_main_from_5m_polars(df_pl: pl.DataFrame, run_config: Dict) -> Tuple
 def build_and_save_df_main_to_sql(engine, pair: str, market_type: str = "spot", run_config: Optional[Dict] = None) -> Dict:
     run_config = run_config or {}
     logger.info(f"🚀 Starting transform for {pair} ({market_type})")
-
-    from etl.db import get_transform_watermark
 
     base_minutes = BASE_MINUTES
     last_time_ns = get_transform_watermark(engine, pair, market_type)

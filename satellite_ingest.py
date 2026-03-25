@@ -141,7 +141,13 @@ def main() -> None:
             continue
         sent_keys.add((str(pair), int(interval_minutes), market_type, snapshot_id))
 
-    for item in cfg["pairs"]:
+    pairs_list = cfg.get("pairs") or cfg.get("static_pairs")
+    
+    if pairs_list is None:
+        print(f"❌ ERROR: No pairs list found in config (checked 'pairs' and 'static_pairs').")
+        return
+
+    for item in pairs_list:
         pair = item["pair"]
         market_type = str(item.get("market_type", "spot")).lower().strip()
         if market_type not in VALID_MARKET_TYPES:

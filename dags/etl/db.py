@@ -47,7 +47,7 @@ def get_engine(sqlalchemy_uri: str, application_name: Optional[str] = None) -> E
 
 def bulk_upsert_candles(engine: Engine, df, pair: str, interval_minutes: int, market_type: str) -> int:
     if df is None or df.is_empty():
-        return 0
+        raise ValueError(f"No rows to upsert for {pair} ({market_type})")
 
     market_type = (market_type or "spot").lower().strip()
 
@@ -61,6 +61,11 @@ def bulk_upsert_candles(engine: Engine, df, pair: str, interval_minutes: int, ma
         raise ValueError(f"Unsupported market_type: {market_type}")
 
     target_table, include_funding = table_map[market_type]
+
+    required = {"time", "time_ns", "open", "high", "low", "close", "volume"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns for {pair} ({market_type}): {sorted(missing)}")
 
     df = df.with_columns([
         pl.lit(pair).alias("pair"),
@@ -77,14 +82,16 @@ def bulk_upsert_candles(engine: Engine, df, pair: str, interval_minutes: int, ma
             df = df.drop("funding_rate")
         cols = ["pair", "interval_minutes", "time", "time_ns", "open", "high", "low", "close", "volume"]
 
+    max_time_ns = int(df.select(pl.col("time_ns").max()).item())
+
     df_temp = df.with_columns(pl.col("time").dt.strftime("%Y-%m-%d %H:%M:%S%z"))
     text_buf = io.StringIO()
     df_temp.select(cols).write_csv(text_buf, separator="\t", include_header=False, null_value="\\N")
     text_buf.seek(0)
 
     with closing(engine.raw_connection()) as raw_conn:
-        with raw_conn.cursor() as cur:
-            try:
+        try:
+            with raw_conn.cursor() as cur:
                 cur.execute(
                     f"CREATE TEMP TABLE tmp_ingest (LIKE {target_table} INCLUDING DEFAULTS) ON COMMIT DROP;"
                 )
@@ -99,13 +106,34 @@ def bulk_upsert_candles(engine: Engine, df, pair: str, interval_minutes: int, ma
                     ON CONFLICT (pair, interval_minutes, time) DO UPDATE SET {update_stmt};
                 """
                 cur.execute(query)
-                raw_conn.commit()
-            except Exception as e:
+
+            raw_conn.commit()
+
+        except Exception as e:
+            try:
                 raw_conn.rollback()
-                logger.error(f"Bulk upsert failed for {pair} ({market_type}): {e}")
-                raise
-            finally:
-                text_buf.close()
+            except Exception:
+                pass
+            logger.error("Bulk upsert failed for %s (%s): %s", pair, market_type, e)
+            raise
+
+    with engine.connect() as conn:
+        row = conn.execute(
+            text(f"""
+                SELECT 1
+                FROM {target_table}
+                WHERE pair = :p
+                  AND interval_minutes = :m
+                  AND time_ns = :ts
+                LIMIT 1
+            """),
+            {"p": pair, "m": int(interval_minutes), "ts": max_time_ns},
+        ).fetchone()
+
+    if not row:
+        raise RuntimeError(
+            f"Upsert completed but verification failed for {pair} ({market_type}) into {target_table}"
+        )
 
     gc.collect()
     return len(df)
