@@ -53,11 +53,11 @@ def _db_uri() -> str:
 
 
 def _get_telegram_token_and_chat_id() -> tuple[str, str]:
-    token = os.getenv("TG_BOT_TOKEN")
+    token = os.getenv("TG_BOT_TOKEN_SIGNAL")
     chat_id = os.getenv("TG_DATA_CHANNEL_ID")
 
     if not token:
-        raise RuntimeError("TG_BOT_TOKEN is missing.")
+        raise RuntimeError("TG_BOT_TOKEN_SIGNAL is missing.")
     if not chat_id:
         raise RuntimeError("TG_DATA_CHANNEL_ID is missing.")
 
@@ -156,6 +156,19 @@ def _read_parquet_file(path: Path) -> pl.DataFrame:
         pl.col("pair").cast(pl.Utf8),
         pl.col("market_type").cast(pl.Utf8),
         pl.col("interval_minutes").cast(pl.Int64),
+        pl.col("time").cast(pl.Datetime("ns", "UTC")),
+        pl.col("time_ns").cast(pl.Int64),
+    ])
+
+    df = df.with_columns(
+        pl.when(pl.col("time_ns") < 10**11)
+        .then(pl.col("time_ns") * 1_000_000_000)
+        .otherwise(pl.col("time_ns"))
+        .alias("time_ns")
+    )
+
+    # Now cast to Datetime safely
+    df = df.with_columns([
         pl.col("time").cast(pl.Datetime("ns", "UTC")),
         pl.col("time_ns").cast(pl.Int64),
     ])

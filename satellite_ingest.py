@@ -1,3 +1,4 @@
+# satellite_ingest.py (called from github action, can't read sql)
 from __future__ import annotations
 
 import json
@@ -30,6 +31,13 @@ def load_config() -> dict:
         raise FileNotFoundError(f"Missing config: {path}")
     return json.loads(path.read_text(encoding="utf-8"))
 
+def normalize_to_ns(df):
+    if df is None or df.empty or "time_ns" not in df.columns:
+        return df
+    # If the timestamp is < 10^11, it's in seconds. Convert to ns.
+    if df["time_ns"].iloc < 10**11:
+        df["time_ns"] = (df["time_ns"] * 1_000_000_000).astype(int)
+    return df
 
 def fetch_pair(pair: str, market_type: str, interval: int):
     market_type = str(market_type).lower().strip()
@@ -159,6 +167,7 @@ def main() -> None:
             interval = int(interval)
 
             df, last = fetch_pair(pair, market_type, interval)
+            df = normalize_to_ns(df)
             if df is None or df.empty:
                 print(f"skip {pair} {market_type} {interval}: empty")
                 time.sleep(delay_seconds)

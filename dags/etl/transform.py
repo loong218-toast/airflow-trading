@@ -36,22 +36,16 @@ def needs_transform(engine: Engine, pair: str, market_type: str) -> bool:
 
     return int(latest_raw) > int(last_done)
 
-def get_latest_raw_time_ns(engine: Engine, pair: str, market_type: str) -> Optional[int]:
-    market_type = (market_type or "spot").lower().strip()
-    if market_type not in RAW_TABLES:
-        raise ValueError(f"Unsupported market_type: {market_type}")
-
-    table = RAW_TABLES[market_type]
-
+def get_latest_df_main_time_ns(engine: Engine, pair: str, market_type: str) -> Optional[int]:
     with engine.begin() as conn:
         row = conn.execute(
-            text(f"""
+            text("""
                 SELECT MAX(time_ns)
-                FROM {table}
+                FROM df_main
                 WHERE pair = :p
-                  AND interval_minutes = :m
+                  AND market_type = :m
             """),
-            {"p": pair, "m": BASE_MINUTES},
+            {"p": pair, "m": market_type},
         ).fetchone()
 
     if not row or row[0] is None:
@@ -65,75 +59,79 @@ def discover_pending_transform_items(engine: Engine) -> list[dict]:
         "xstock": "ohlc_xstock_raw",
     }
 
-    parts = []
-    params = {}
+    # First, let's peek at what intervals actually exist (Debug logging)
+    with engine.begin() as conn:
+        for market_type, table_name in tables.items():
+            debug_stats = conn.execute(text(f"""
+                SELECT interval_minutes, COUNT(*), MIN(time), MAX(time)
+                FROM {table_name}
+                GROUP BY interval_minutes
+            """)).fetchall()
+            for row in debug_stats:
+                logger.info(f"📊 Table {table_name} contains: Interval={row}, Rows={row}, Range={row} to {row}")
+
+    pending = []
 
     for market_type, table_name in tables.items():
-        reg_name = f"reg_{market_type}"
-        parts.append(f"""
-            SELECT pair, '{market_type}' AS market_type, MAX(time_ns) AS latest_raw_time_ns
-            FROM {table_name}
-            WHERE interval_minutes = :base_minutes
-            GROUP BY pair
-        """)
-        params["base_minutes"] = BASE_MINUTES
+        with engine.begin() as conn:
+            rows = conn.execute(
+                text(f"""
+                    SELECT pair, MAX(time_ns) AS latest_raw_time_ns
+                    FROM {table_name}
+                    WHERE interval_minutes = :base_minutes
+                    GROUP BY pair
+                """),
+                {"base_minutes": BASE_MINUTES},
+            ).fetchall()
 
-    with engine.begin() as conn:
-        existing = {}
-        for market_type, table_name in tables.items():
-            row = conn.execute(
-                text("SELECT to_regclass(:name)"),
-                {"name": table_name},
-            ).fetchone()
-            existing[market_type] = row is not None and row[0] is not None
-
-        union_parts = []
-        for market_type, table_name in tables.items():
-            if not existing[market_type]:
+        for pair, latest_raw_time_ns in rows:
+            if latest_raw_time_ns is None:
                 continue
-            union_parts.append(f"""
-                SELECT pair, '{market_type}' AS market_type, MAX(time_ns) AS latest_raw_time_ns
-                FROM {table_name}
-                WHERE interval_minutes = :base_minutes
-                GROUP BY pair
-            """)
 
-        if not union_parts:
-            return []
+            # --- FIX 1: Normalize Raw Timestamp Scale for comparison ---
+            # If Raw is in seconds (10 digits), scale to nanoseconds (19 digits)
+            if latest_raw_time_ns < 10**11:
+                normalized_raw = int(latest_raw_time_ns * 1_000_000_000)
+            else:
+                normalized_raw = int(latest_raw_time_ns)
 
-        sql = f"""
-            WITH raw_latest AS (
-                {" UNION ALL ".join(union_parts)}
-            ),
-            meta AS (
-                SELECT pair, market_type, last_time_ns
-                FROM transform_metadata
-            )
-            SELECT
-                r.pair,
-                r.market_type,
-                r.latest_raw_time_ns,
-                m.last_time_ns
-            FROM raw_latest r
-            LEFT JOIN meta m
-              ON m.pair = r.pair
-             AND m.market_type = r.market_type
-            WHERE r.latest_raw_time_ns IS NOT NULL
-              AND (m.last_time_ns IS NULL OR r.latest_raw_time_ns > m.last_time_ns)
-            ORDER BY r.market_type, r.pair
-        """
+            eff = get_latest_df_main_time_ns(engine, str(pair), market_type)
+            
+            # Use normalized_raw for the "if" check
+            if eff is None or normalized_raw > int(eff):
+                logger.info(f"✅ Pending: {pair} (Raw NS: {normalized_raw} > Main: {eff})")
+                pending.append({
+                    "pair": str(pair),
+                    "market_type": market_type,
+                    "latest_raw_time_ns": normalized_raw, # Use the fixed version
+                    "last_time_ns": None if eff is None else int(eff),
+                })
+            else:
+                logger.info(f"⏭️ Skipping {pair}: Raw {normalized_raw} is not ahead of Watermark {eff}.")
 
-        rows = conn.execute(text(sql), {"base_minutes": BASE_MINUTES}).fetchall()
+    pending.sort(key=lambda x: (x["market_type"], x["pair"]))
+    return pending
 
-    return [
-        {
-            "pair": str(row[0]),
-            "market_type": str(row[1]),
-            "latest_raw_time_ns": int(row[2]),
-            "last_time_ns": None if row[3] is None else int(row[3]),
-        }
-        for row in rows
-    ]
+def get_effective_watermark(engine: Engine, pair: str, market_type: str) -> Optional[int]:
+    meta = get_transform_watermark(engine, pair, market_type)
+    main = get_latest_df_main_time_ns(engine, pair, market_type)
+
+    # Jan 1, 2010 in nanoseconds (approx 1.2e18)
+    # This is safe for your 2017 BTC data but blocks 10-digit "seconds" values
+    SAFETY_FLOOR_NS = 1_262_304_000_000_000_000 
+    
+    # Filter out None and anything that looks like "Seconds" (10-digits) 
+    # or "Epoch" (near 0)
+    values = [v for v in [meta, main] if v is not None and v > SAFETY_FLOOR_NS]
+    
+    if not values:
+        # If no valid high-precision timestamp exists, we return None 
+        # to trigger a full rebuild from the earliest raw data.
+        return None
+
+    # We take the MIN of valid values to ensure no data is skipped 
+    # if one table updated while the other failed.
+    return min(values)
 
 def get_transform_watermark(engine: Engine, pair: str, market_type: str) -> Optional[int]:
     with engine.begin() as conn:
@@ -255,8 +253,8 @@ def build_df_main_from_5m_polars(df_pl: pl.DataFrame, run_config: Dict) -> Tuple
     df = df.with_columns([
         (
             ((pl.col("close") - pl.col("close").shift(lookback_24h)) /
-             pl.col("close").shift(lookback_24h)) * 100.0
-        ).fill_null(0.0).cast(pl.Float32).alias("change_24h")
+            pl.col("close").shift(lookback_24h)) * 100.0
+        ).cast(pl.Float32).alias("change_24h") # REMOVE .fill_null(0.0) here to debug
     ])
 
     if "spread" not in df.columns:
@@ -289,12 +287,13 @@ def build_df_main_from_5m_polars(df_pl: pl.DataFrame, run_config: Dict) -> Tuple
 
 def build_and_save_df_main_to_sql(engine, pair: str, market_type: str = "spot", run_config: Optional[Dict] = None) -> Dict:
     run_config = run_config or {}
+    market_type = (market_type or "spot").lower().strip()
     logger.info(f"🚀 Starting transform for {pair} ({market_type})")
 
     base_minutes = BASE_MINUTES
-    last_time_ns = get_transform_watermark(engine, pair, market_type)
+    last_time_ns = get_effective_watermark(engine, pair, market_type)
 
-    overlap_bars = int(run_config.get("transform_overlap_bars", 300))
+    overlap_bars = int(run_config.get("transform_overlap_bars", 1000))
     overlap_ns = overlap_bars * base_minutes * 60 * 1_000_000_000
 
     start_after_ns = None
@@ -352,7 +351,7 @@ def build_and_save_df_main_to_sql(engine, pair: str, market_type: str = "spot", 
         gc.collect()
 
     last_ts = df_processed["time"].max()
-    new_last_time_ns = int(last_ts.timestamp() * 1e9)
+    new_last_time_ns = int(df_processed["time_ns"].max())
     update_transform_metadata(engine, pair, market_type, new_last_time_ns)
 
     logger.info(f"✅ Success: {pair} processed. New rows: {total_rows}. Last TS: {last_ts}")
