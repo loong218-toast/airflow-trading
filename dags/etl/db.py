@@ -10,6 +10,7 @@ from sqlalchemy import text
 import io
 import logging
 import gc
+import polars as pl
 
 logger = logging.getLogger(__name__)
 
@@ -45,42 +46,50 @@ def get_engine(sqlalchemy_uri: str, application_name: Optional[str] = None) -> E
 
 
 def bulk_upsert_candles(engine: Engine, df, pair: str, interval_minutes: int, market_type: str) -> int:
-    if df is None or df.empty:
+    if df is None or df.is_empty():
         return 0
 
-    df = df.copy()
-    df["pair"] = pair
-    df["interval_minutes"] = int(interval_minutes)
+    market_type = (market_type or "spot").lower().strip()
 
-    # 1. Define columns based on market type
-    if market_type == "future":
-        # Ensure the column exists in the DF before we try to COPY it
+    table_map = {
+        "spot": ("ohlc_spot_raw", False),
+        "future": ("ohlc_future_raw", True),
+        "xstock": ("ohlc_xstock_raw", False),
+    }
+
+    if market_type not in table_map:
+        raise ValueError(f"Unsupported market_type: {market_type}")
+
+    target_table, include_funding = table_map[market_type]
+
+    df = df.with_columns([
+        pl.lit(pair).alias("pair"),
+        pl.lit(int(interval_minutes)).alias("interval_minutes"),
+        pl.lit(market_type).alias("market_type"),
+    ])
+
+    if include_funding:
         if "funding_rate" not in df.columns:
-            df["funding_rate"] = 0.0
+            df = df.with_columns(pl.lit(0.0).alias("funding_rate"))
         cols = ["pair", "interval_minutes", "time", "time_ns", "open", "high", "low", "close", "volume", "funding_rate"]
-        target_table = "ohlc_future_raw"
     else:
+        if "funding_rate" in df.columns:
+            df = df.drop("funding_rate")
         cols = ["pair", "interval_minutes", "time", "time_ns", "open", "high", "low", "close", "volume"]
-        target_table = "ohlc_spot_raw"
 
-    # Format time for Postgres
-    df["time"] = df["time"].dt.strftime("%Y-%m-%d %H:%M:%S%z")
-
-    # Prepare buffer
-    buf = io.StringIO()
-    df[cols].to_csv(buf, sep="\t", index=False, header=False, na_rep="\\N")
-    buf.seek(0)
+    df_temp = df.with_columns(pl.col("time").dt.strftime("%Y-%m-%d %H:%M:%S%z"))
+    text_buf = io.StringIO()
+    df_temp.select(cols).write_csv(text_buf, separator="\t", include_header=False, null_value="\\N")
+    text_buf.seek(0)
 
     with closing(engine.raw_connection()) as raw_conn:
         with raw_conn.cursor() as cur:
             try:
-                # 2. Create Temp Table mirroring the REAL table schema
-                cur.execute(f"CREATE TEMP TABLE tmp_ingest (LIKE {target_table} INCLUDING DEFAULTS) ON COMMIT DROP;")
-                
-                # 3. Copy data into temp
-                cur.copy_from(buf, "tmp_ingest", sep="\t", null="\\N", columns=cols)
+                cur.execute(
+                    f"CREATE TEMP TABLE tmp_ingest (LIKE {target_table} INCLUDING DEFAULTS) ON COMMIT DROP;"
+                )
+                cur.copy_from(text_buf, "tmp_ingest", sep="\t", null="\\N", columns=cols)
 
-                # 4. Build upsert logic
                 update_cols = [c for c in cols if c not in ["pair", "interval_minutes", "time"]]
                 update_stmt = ", ".join([f"{c} = EXCLUDED.{c}" for c in update_cols])
 
@@ -90,16 +99,16 @@ def bulk_upsert_candles(engine: Engine, df, pair: str, interval_minutes: int, ma
                     ON CONFLICT (pair, interval_minutes, time) DO UPDATE SET {update_stmt};
                 """
                 cur.execute(query)
-                raw_conn.commit() # Everything worked!
+                raw_conn.commit()
             except Exception as e:
-                raw_conn.rollback() # Crucial: clears the "InFailedSqlTransaction" state
-                logger.error(f"Bulk upsert failed for {pair}: {e}")
-                raise e 
+                raw_conn.rollback()
+                logger.error(f"Bulk upsert failed for {pair} ({market_type}): {e}")
+                raise
             finally:
-                buf.close()
+                text_buf.close()
 
     gc.collect()
-    return int(len(df))
+    return len(df)
 
 def _sanitize_column_names_for_sql(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -119,6 +128,9 @@ def _sanitize_column_names_for_sql(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def save_df_to_sql(engine: Engine, df, pair: str, table_name: str = "df_main") -> int:
+
+    if hasattr(df, "to_pandas"):
+        df = df.to_pandas()
 
     # Build column defs for temp table creation
     col_defs = []

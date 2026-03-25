@@ -19,6 +19,12 @@ logging.basicConfig(level=logging.INFO)
 
 BASE_MINUTES = 5
 
+RAW_TABLES = {
+    "spot": "ohlc_spot_raw",
+    "future": "ohlc_future_raw",
+    "xstock": "ohlc_xstock_raw",
+}
+
 def get_transform_watermark(engine: Engine, pair: str, market_type: str) -> Optional[int]:
     with engine.begin() as conn:
         row = conn.execute(
@@ -44,21 +50,51 @@ def load_candles_from_db_polars(
     if interval_minutes != BASE_MINUTES:
         raise ValueError("df_main is 5m-only. Use interval_minutes=5 here.")
 
-    table = "ohlc_spot_raw" if market_type == "spot" else "ohlc_future_raw"
+    market_type = (market_type or "spot").lower().strip()
+    if market_type not in RAW_TABLES:
+        raise ValueError(f"Unsupported market_type: {market_type}")
 
-    q = f"""
-        SELECT f.time AT TIME ZONE 'UTC' AS time,
-               f.open, f.high, f.low, f.close, f.volume, f.time_ns,
-               COALESCE(h.funding_rate_rel, 0) AS funding_rate
-        FROM {table} f
-        LEFT JOIN funding_history_raw h
-               ON f.pair = h.pair
-              AND date_trunc('minute', f.time) = date_trunc('minute', h.time)
-        WHERE f.pair = $1
-          AND f.interval_minutes = $2
-          AND ($3::bigint IS NULL OR f.time_ns > $3)
-        ORDER BY f.time ASC
-    """
+    table = RAW_TABLES[market_type]
+
+    if market_type == "future":
+        q = f"""
+            SELECT f.time AT TIME ZONE 'UTC' AS time,
+                   f.open, f.high, f.low, f.close, f.volume, f.time_ns,
+                   COALESCE(h.funding_rate_rel, 0) AS funding_rate
+            FROM {table} f
+            LEFT JOIN funding_history_raw h
+                   ON f.pair = h.pair
+                  AND date_trunc('minute', f.time) = date_trunc('minute', h.time)
+            WHERE f.pair = $1
+              AND f.interval_minutes = $2
+              AND ($3::bigint IS NULL OR f.time_ns > $3)
+            ORDER BY f.time ASC
+        """
+    elif market_type == "xstock":
+        q = f"""
+            SELECT f.time AT TIME ZONE 'UTC' AS time,
+                   f.open, f.high, f.low, f.close, f.volume, f.time_ns,
+                   NULL::double precision AS funding_rate
+            FROM {table} f
+            WHERE f.pair = $1
+              AND f.interval_minutes = $2
+              AND ($3::bigint IS NULL OR f.time_ns > $3)
+            ORDER BY f.time ASC
+        """
+    else:
+        q = f"""
+            SELECT f.time AT TIME ZONE 'UTC' AS time,
+                   f.open, f.high, f.low, f.close, f.volume, f.time_ns,
+                   COALESCE(h.funding_rate_rel, 0) AS funding_rate
+            FROM {table} f
+            LEFT JOIN funding_history_raw h
+                   ON f.pair = h.pair
+                  AND date_trunc('minute', f.time) = date_trunc('minute', h.time)
+            WHERE f.pair = $1
+              AND f.interval_minutes = $2
+              AND ($3::bigint IS NULL OR f.time_ns > $3)
+            ORDER BY f.time ASC
+        """
 
     url = engine.url
     uri = f"postgresql://{url.username}:{url.password}@{url.host}:{url.port or 5432}/{url.database}"

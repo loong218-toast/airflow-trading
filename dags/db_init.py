@@ -46,7 +46,7 @@ with DAG(
             interval_minutes INT NOT NULL,
             time TIMESTAMP WITH TIME ZONE NOT NULL,
             time_ns BIGINT NOT NULL,
-            market_type TEXT DEFAULT future', -- trade, mark, or spot
+            market_type TEXT DEFAULT 'future',
             open REAL,
             high REAL,
             low REAL,
@@ -56,9 +56,25 @@ with DAG(
             PRIMARY KEY (pair, interval_minutes, time)
         );
 
+        -- 3b. Create ohlc_xstock_raw
+        CREATE TABLE IF NOT EXISTS ohlc_xstock_raw (
+            pair TEXT NOT NULL,
+            interval_minutes INT NOT NULL,
+            time TIMESTAMP WITH TIME ZONE NOT NULL,
+            time_ns BIGINT NOT NULL,
+            market_type TEXT DEFAULT 'xstock',
+            open REAL,
+            high REAL,
+            low REAL,
+            close REAL,
+            volume REAL,
+            PRIMARY KEY (pair, interval_minutes, time)
+        );
+
         -- 4. Indexes for fast time-series queries
         CREATE INDEX IF NOT EXISTS ix_ohlc_spot_pair_time_ns ON ohlc_spot_raw (pair, time_ns);
         CREATE INDEX IF NOT EXISTS ix_ohlc_future_pair_time_ns ON ohlc_future_raw (pair, time_ns);
+        CREATE INDEX IF NOT EXISTS ix_ohlc_xstock_pair_time_ns ON ohlc_xstock_raw (pair, time_ns);
 
         -- 5. df_main (processed features / indicators)
         -- Added market_type to differentiate spot/future features

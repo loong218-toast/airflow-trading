@@ -52,10 +52,21 @@ def _db_uri() -> str:
         raise RuntimeError("POSTGRES_USER / POSTGRES_PASSWORD are required")
     return f"postgresql+psycopg2://{db_user}:{db_pass}@{db_host}/{db_name}"
 
+def _normalize_live_item(item: Any) -> Dict[str, str]:
+    if isinstance(item, str):
+        return {"pair": item, "market_type": "spot"}
 
-def _market_type_for_pair(pair: str) -> str:
-    return "future" if pair.startswith("PF_") else "spot"
+    if not isinstance(item, dict) or "pair" not in item:
+        raise ValueError(f"Invalid live item: {item}")
 
+    market_type = str(item.get("market_type", "spot")).lower().strip()
+    if market_type not in {"spot", "future", "xstock"}:
+        market_type = "spot"
+
+    return {
+        "pair": str(item["pair"]),
+        "market_type": market_type,
+    }
 
 def _estimate_needed_bars(pair_cfg: dict) -> int:
     base_min = _as_int(pair_cfg.get("BASE_MINUTES", 5), 5)
@@ -193,16 +204,17 @@ def _read_last_state() -> dict:
 
 
 def _write_last_state(state: dict) -> None:
-    STATE_PATH.write_text(json.dumps(state, indent=2, default=str), encoding="utf-8")
-
+    tmp = STATE_PATH.with_suffix(STATE_PATH.suffix + ".tmp")
+    tmp.write_text(json.dumps(state, indent=2, default=str), encoding="utf-8")
+    os.replace(tmp, STATE_PATH)
 
 def _build_message(rows: List[dict]) -> str:
     lines = ["Trading signal alert"]
     for r in rows:
         side = "BUY" if int(r["side"]) == 1 else "SELL"
         lines.append(
-            f"{side} | {r['pair']} | regime={r.get('regime_id')} | "
-            f"time_ns={r.get('time_ns')} | idx={r.get('idx')}"
+            f"{side} | {r['pair']} | {r.get('market_type')} | "
+            f"regime={r.get('regime_id')} | time_ns={r.get('time_ns')} | idx={r.get('idx')}"
         )
     return "\n".join(lines)
 
@@ -227,25 +239,35 @@ def kraken_signal_ingest():
         return cfg
 
     @task()
-    def resolve_pairs(cfg: dict) -> list[str]:
+    def resolve_pairs(cfg: dict) -> list[dict]:
         live = cfg.get("live_signal", {})
 
-        # per-pair map: {"XXBTZUSD": {...}, "PF_XBTUSD": {...}}
         if isinstance(live, dict) and live and all(isinstance(v, dict) for v in live.values()):
-            return list(live.keys())
+            items = []
+            for pair, params in live.items():
+                market_type = str(params.get("market_type", "spot")).lower().strip()
+                if market_type not in {"spot", "future", "xstock"}:
+                    market_type = "spot"
+                items.append({"pair": pair, "market_type": market_type})
+            return items
 
-        # single-pair legacy form
         pair = live.get("pair")
         if isinstance(pair, str):
-            return [pair]
+            return [{"pair": pair, "market_type": str(live.get("market_type", "spot")).lower().strip()}]
+
         if isinstance(pair, list):
-            return [str(x) for x in pair]
+            return [
+                {"pair": str(x), "market_type": str(live.get("market_type", "spot")).lower().strip()}
+                for x in pair
+            ]
 
         raise ValueError("No pairs found in signal_config.json")
 
     @task()
-    def build_one(pair: str, cfg: dict) -> dict:
-        market_type = _market_type_for_pair(pair)
+    def build_one(item: dict, cfg: dict) -> dict:
+        pair = str(item["pair"])
+        market_type = str(item["market_type"]).lower().strip()
+
         live_all = cfg.get("live_signal", {})
         params = live_all.get(pair, {}) if isinstance(live_all, dict) else {}
 
@@ -253,8 +275,6 @@ def kraken_signal_ingest():
         limit_rows = min(needed_rows, LIVE_MAX_ROWS)
 
         df_main = _load_recent_df_main(pair, market_type, limit_rows)
-
-        
 
         if not params:
             return {
@@ -283,31 +303,13 @@ def kraken_signal_ingest():
                 "reason": "no latest signal",
             }
 
-        # Convert to records and keep only meaningful rows.
-        rows = latest.select(["pair", "time_ns", "side", "regime_id", "idx"]).to_dicts()
-
-        state = _read_last_state()
-        fresh_rows = []
-        for row in rows:
-            key = _signal_key(row)
-            if state.get(key):
-                continue
-            fresh_rows.append(row)
-
-        if not fresh_rows:
-            return {
-                "pair": pair,
-                "market_type": market_type,
-                "has_signal": False,
-                "reason": "duplicate signal",
-            }
+        rows = latest.select(["pair", "market_type", "time_ns", "side", "regime_id", "idx"]).to_dicts()
 
         return {
             "pair": pair,
             "market_type": market_type,
             "has_signal": True,
-            "rows": fresh_rows,
-            "message": _build_message([{**r, "pair": pair} for r in fresh_rows]),
+            "rows": rows,
         }
 
     @task()
@@ -327,7 +329,20 @@ def kraken_signal_ingest():
         if not all_rows:
             return {"sent": False, "count": 0}
 
-        message = _build_message(all_rows)
+        state = _read_last_state()
+
+        fresh_rows = []
+        for row in all_rows:
+            key = _signal_key(row)
+            if state.get(key):
+                continue
+            fresh_rows.append(row)
+
+        if not fresh_rows:
+            logger.info("All signals are duplicates.")
+            return {"sent": False, "count": 0, "reason": "duplicate signal"}
+
+        message = _build_message(fresh_rows)
         logger.info("Telegram message:\n%s", message)
 
         url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -344,18 +359,16 @@ def kraken_signal_ingest():
         logger.info("Telegram response status=%s body=%s", resp.status_code, resp.text)
         resp.raise_for_status()
 
-        state = _read_last_state()
-        for row in all_rows:
+        for row in fresh_rows:
             state[_signal_key(row)] = True
         _write_last_state(state)
 
-        return {"sent": True, "count": len(all_rows), "status_code": resp.status_code}
+        return {"sent": True, "count": len(fresh_rows), "status_code": resp.status_code}
 
-    cfg = load_cfg()
-    pairs = resolve_pairs(cfg)
+cfg = load_cfg()
+items = resolve_pairs(cfg)
 
-    mapped = build_one.partial(cfg=cfg).expand(pair=pairs)
-    send_telegram(mapped)
-
+mapped = build_one.partial(cfg=cfg).expand(item=items)
+send_telegram(mapped)
 
 kraken_signal_ingest_dag = kraken_signal_ingest()

@@ -1,18 +1,12 @@
 {
-  "delay_seconds": 3,
+  "delay_seconds": 5,
   "interval_minutes": [5],
-  "pairs": [
-    {
-      "pair": "XXBTZUSD",
-      "market_type": "spot"
-    },
-    {
-      "pair": "XETHZUSD",
-      "market_type": "spot"
-    },
-    {
-      "pair": "XAUTUSD",
-      "market_type": "spot"
-    }
+  "top_n_spots": 20,
+  "top_n_futures": 10,
+  "top_n_stocks": 10,
+  "static_pairs": [
+    {"pair": "XXBTZUSD", "market_type": "spot"},
+    {"pair": "XETHZUSD", "market_type": "spot"},
+    {"pair": "XAUTUSD", "market_type": "spot"}
   ]
 }
