@@ -34,9 +34,9 @@ def load_config() -> dict:
 def normalize_to_ns(df):
     if df is None or df.empty or "time_ns" not in df.columns:
         return df
-    # If the timestamp is < 10^11, it's in seconds. Convert to ns.
-    if df["time_ns"].iloc < 10**11:
-        df["time_ns"] = (df["time_ns"] * 1_000_000_000).astype(int)
+    # Check the first row. Use .iloc to get the value.
+    if df["time_ns"].iloc < 10**11: 
+        df["time_ns"] = (df["time_ns"] * 1_000_000_000).astype("int64")
     return df
 
 def fetch_pair(pair: str, market_type: str, interval: int):
@@ -67,20 +67,15 @@ def load_manifest(path: Path) -> list[dict]:
         return []
 
 
-def build_snapshot_id(df, last: Any) -> str:
-    if last is not None:
-        try:
-            return str(int(last))
-        except Exception:
-            return str(last)
-
-    if df is not None and not df.empty and "time_ns" in df.columns:
-        try:
-            return str(int(df["time_ns"].max()))
-        except Exception:
-            pass
-
-    return str(int(time.time()))
+def build_snapshot_id(pair: str, time_ns: int) -> str:
+    """
+    Creates a unique identifier for a specific candle.
+    Since time_ns is now 10^18 (nanoseconds), this ensures 
+    uniqueness across different pairs at the same timestamp.
+    """
+    # pair: 'XXBTZUSD', time_ns: 1774466100000000000
+    # result: 'XXBTZUSD_1774466100000000000'
+    return f"{pair}_{time_ns}"
 
 
 def send_document(token: str, chat_id: str, file_path: Path, caption: str) -> int:
@@ -173,7 +168,7 @@ def main() -> None:
                 time.sleep(delay_seconds)
                 continue
 
-            snapshot_id = build_snapshot_id(df, last)
+            snapshot_id = build_snapshot_id(pair, int(last * 1_000_000_000))
             key = (pair, interval, market_type, snapshot_id)
 
             if key in sent_keys:

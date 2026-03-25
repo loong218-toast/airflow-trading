@@ -1,3 +1,4 @@
+# kraken_ingest.py
 from __future__ import annotations
 
 import json
@@ -147,32 +148,25 @@ def _telegram_download_file(token: str, file_path: str, local_path: Path) -> Non
 def _read_parquet_file(path: Path) -> pl.DataFrame:
     df = pl.read_parquet(path)
 
-    required = {"pair", "interval_minutes", "market_type", "time", "time_ns"}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"Missing columns in {path.name}: {sorted(missing)}")
-
-    df = df.with_columns([
-        pl.col("pair").cast(pl.Utf8),
-        pl.col("market_type").cast(pl.Utf8),
-        pl.col("interval_minutes").cast(pl.Int64),
-        pl.col("time").cast(pl.Datetime("ns", "UTC")),
-        pl.col("time_ns").cast(pl.Int64),
-    ])
-
+    # 1. Normalize the raw integer first BEFORE casting to Datetime
     df = df.with_columns(
         pl.when(pl.col("time_ns") < 10**11)
         .then(pl.col("time_ns") * 1_000_000_000)
         .otherwise(pl.col("time_ns"))
+        .cast(pl.Int64)
         .alias("time_ns")
     )
 
-    # Now cast to Datetime safely
+    # 2. Now create the time column from the normalized time_ns
     df = df.with_columns([
-        pl.col("time").cast(pl.Datetime("ns", "UTC")),
-        pl.col("time_ns").cast(pl.Int64),
+        pl.col("pair").cast(pl.Utf8),
+        pl.col("market_type").cast(pl.Utf8),
+        pl.col("interval_minutes").cast(pl.Int64),
+        # Use the already normalized time_ns to create the timestamp
+        (pl.col("time_ns") * 1).cast(pl.Datetime("ns", "UTC")).alias("time")
     ])
 
+    # 3. Cast floats
     for c in ["open", "high", "low", "close", "volume", "funding_rate", "spread"]:
         if c in df.columns:
             df = df.with_columns(pl.col(c).cast(pl.Float32))
