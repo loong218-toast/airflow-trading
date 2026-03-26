@@ -31,11 +31,12 @@ def load_config() -> dict:
         raise FileNotFoundError(f"Missing config: {path}")
     return json.loads(path.read_text(encoding="utf-8"))
 
+import pandas as pd
+
 def normalize_to_ns(df):
     if df is None or df.empty or "time_ns" not in df.columns:
         return df
-    # Ensure it says .iloc
-    if df["time_ns"].iloc < 10**11:
+    if int(df["time_ns"].iloc[0]) < 10**11:
         df["time_ns"] = (df["time_ns"] * 1_000_000_000).astype("int64")
     return df
 
