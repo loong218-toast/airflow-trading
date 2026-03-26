@@ -69,7 +69,7 @@ def get_tradeable_futures_symbols():
     ]
     return active_symbols
 
-def fetch_ohlc(pair: str, interval: int, since: int = None):
+def fetch_ohlc(pair: str, interval: int, since: int = None, market_type: str = "spot"):
     """
     pair: Kraken pair code like 'XXBTZUSD' or 'XBTUSD' depending on API mapping
     interval: minutes (1,5,15,30,60,240,1440,10080,21600 typical)

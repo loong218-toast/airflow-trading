@@ -34,7 +34,7 @@ def load_config() -> dict:
 def normalize_to_ns(df):
     if df is None or df.empty or "time_ns" not in df.columns:
         return df
-    # Check the first row. Use .iloc to get the value.
+    # Ensure it says .iloc
     if df["time_ns"].iloc < 10**11:
         df["time_ns"] = (df["time_ns"] * 1_000_000_000).astype("int64")
     return df
