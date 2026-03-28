@@ -301,12 +301,12 @@ def rank_spot_like_pairs(aclass_base: str, market_type: str, top_n: int) -> list
     df = df.sort_values(["volume", "pair"], ascending=[False, True]).head(top_n)
 
     out: list[dict] = []
-    for rank, (_, r) in enumerate(df.iterrows(), start=1):
+    for rank, row in enumerate(df.itertuples(index=False), start=1):
         out.append(
             {
-                "pair": str(r["symbol"]).upper(),
-                "market_type": "future",
-                "volume": float(r["_volume"]),
+                "pair": str(row.pair).upper(),
+                "market_type": market_type,
+                "volume": float(row.volume),
                 "current_rank": rank,
                 "source": "top_n",
             }
@@ -329,8 +329,17 @@ def rank_futures_pairs(top_n: int) -> list[dict]:
         return []
 
     df = fetch_futures_tickers_raw()
-    if df.empty or "symbol" not in df.columns:
+    if df.empty:
         return []
+
+    # Ensure there is a symbol column
+    if "symbol" not in df.columns:
+        possible_cols = [c for c in df.columns if "symbol" in c.lower()]
+        if possible_cols:
+            df = df.rename(columns={possible_cols[0]: "symbol"})
+        else:
+            print("❌ No symbol column found in futures tickers")
+            return []
 
     tradeable = get_tradeable_futures_symbols()
     if tradeable:
@@ -340,37 +349,26 @@ def rank_futures_pairs(top_n: int) -> list[dict]:
     if df.empty:
         return []
 
-    volume_candidates = [
-        "volume",
-        "volume24h",
-        "vol24h",
-        "vol",
-        "usdVolume24h",
-        "tradeVolume",
-    ]
+    # Find volume column
+    volume_candidates = ["volume", "volume24h", "vol24h", "vol", "usdVolume24h", "tradeVolume"]
     volume_col = next((c for c in volume_candidates if c in df.columns), None)
 
     if volume_col is None:
         fallback_cols = [c for c in df.columns if "vol" in c.lower() or "volume" in c.lower()]
         volume_col = fallback_cols[0] if fallback_cols else None
 
-    if volume_col is None:
-        df["_volume"] = 0.0
-    else:
-        df["_volume"] = pd.to_numeric(df[volume_col], errors="coerce").fillna(0.0)
+    df["_volume"] = pd.to_numeric(df[volume_col], errors="coerce").fillna(0.0) if volume_col else 0.0
 
     df = df.sort_values(["_volume", "symbol"], ascending=[False, True]).head(top_n)
 
     out: list[dict] = []
     for rank, row in enumerate(df.itertuples(index=False), start=1):
+        vol = getattr(row, volume_col, 0.0) if volume_col else 0.0
         out.append(
             {
                 "pair": str(row.symbol).upper(),
                 "market_type": "future",
-                "volume": float(
-                    getattr(row, "volume24h", None)
-                    or getattr(row, "volume", 0.0)
-                ),
+                "volume": float(vol),
                 "current_rank": rank,
                 "source": "top_n",
             }
