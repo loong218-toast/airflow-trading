@@ -301,12 +301,12 @@ def rank_spot_like_pairs(aclass_base: str, market_type: str, top_n: int) -> list
     df = df.sort_values(["volume", "pair"], ascending=[False, True]).head(top_n)
 
     out: list[dict] = []
-    for rank, row in enumerate(df.itertuples(index=False), start=1):
+    for rank, (_, r) in enumerate(df.iterrows(), start=1):
         out.append(
             {
-                "pair": str(row.pair).upper(),
-                "market_type": market_type,
-                "volume": float(row.volume),
+                "pair": str(r["symbol"]).upper(),
+                "market_type": "future",
+                "volume": float(r["_volume"]),
                 "current_rank": rank,
                 "source": "top_n",
             }
@@ -367,7 +367,10 @@ def rank_futures_pairs(top_n: int) -> list[dict]:
             {
                 "pair": str(row.symbol).upper(),
                 "market_type": "future",
-                "volume": float(getattr(row, "_volume")),
+                "volume": float(
+                    getattr(row, "volume24h", None)
+                    or getattr(row, "volume", 0.0)
+                ),
                 "current_rank": rank,
                 "source": "top_n",
             }
@@ -489,8 +492,15 @@ def build_universe(cfg: dict, state: dict[str, dict]) -> list[dict]:
 def normalize_to_ns(df):
     if df is None or df.empty or "time_ns" not in df.columns:
         return df
-    if int(df["time_ns"].iloc[0]) < 10**11:
-        df["time_ns"] = (df["time_ns"] * 1_000_000_000).astype("int64")
+    t = int(df["time_ns"].iloc[0])
+
+    if t < 10**10:              # seconds
+        df["time_ns"] = df["time_ns"] * 1_000_000_000
+    elif t < 10**13:            # milliseconds
+        df["time_ns"] = df["time_ns"] * 1_000_000
+    # else: already nanoseconds
+
+    df["time_ns"] = df["time_ns"].astype("int64")
     return df
 
 
