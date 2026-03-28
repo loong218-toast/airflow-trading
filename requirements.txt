@@ -4,8 +4,10 @@ sqlalchemy
 psycopg2-binary
 numba==0.64.0
 numpy>=1.22,<2.5
-polars>=1.21.0
+scipy
+polars>=1.39.3
 adbc-driver-postgresql
 adbc-driver-manager
 psycopg2-binary
 python-dotenv
+lightgbm

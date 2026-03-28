@@ -40,6 +40,11 @@ MASTER_SCHEMA: Dict[str, pl.DataType] = {
     "SL": pl.Float32,
     "TP": pl.Float32,
 
+    "use_sl_decay": pl.Boolean,
+    "sl_decay_pct": pl.Float32,
+    "sl_decay_interval": pl.Int32,
+    "sl_decay_stop_at_pos": pl.Boolean,
+
     # 4. Performance Metrics
     "total_pos": pl.Int32,
     "win_pos": pl.Int32,
@@ -88,6 +93,10 @@ CACHE_BACKTEST_SCHEMA: Dict[str, pl.DataType] = {
     "exit_idx": pl.List(pl.Int64),   # Array of actual trade exits
     "ret": pl.List(pl.Float32),      # Array of trade returns (use Float32 for RAM savings)
     "regime_id": pl.Int32,           # Link back to regime
+    "use_sl_decay": pl.Boolean,
+    "sl_decay_pct": pl.Float32,
+    "sl_decay_interval": pl.Int32,
+    "sl_decay_stop_at_pos": pl.Boolean,
 }
 
 DF_MAIN_SCHEMA: Dict[str, pl.DataType] = {

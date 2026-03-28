@@ -15,11 +15,10 @@ from etl.db import get_engine
 from etl.transform import build_df_main_from_5m_polars, load_candles_from_db_polars
 
 from etl.io_utils import (
-    _atomic_write_parquet,
     _ensure_full_lake_dir,
-    read_slice_from_full_lake,
     FULL_LAKE_DIR,
     MANIFEST_FILE,
+    atomic_write_parquet,
 )
 
 # Constants - ensure these match your environment
@@ -46,14 +45,6 @@ def _any_parquet_with_rows_under(dirpath: Path) -> bool:
     for p in list(dirpath.glob("*.parquet")) + list(dirpath.rglob("*.parquet")):
         if _parquet_has_rows(p): return True
     return False
-
-# --- Helper: Atomic Write ---
-
-def _atomic_write_parquet(df: pl.DataFrame, path: Path):
-    """Prevents file corruption by writing to a temp file first."""
-    tmp = path.with_suffix(".tmp.parquet")
-    df.write_parquet(tmp, compression="snappy")
-    tmp.replace(path)
 
 # --- Session Logic ---
 
@@ -131,18 +122,6 @@ def resolve_or_create_session(base_root: str, resume_if_possible: bool = True) -
     (candidate / "configs").mkdir()
     (candidate / "results").mkdir()
     return candidate
-
-
-
-logger = logging.getLogger(__name__)
-
-def _parquet_has_rows(p: Path) -> bool:
-    try:
-        if not p.exists(): return False
-        meta = pq.ParquetFile(str(p)).metadata
-        return getattr(meta, "num_rows", 0) > 0
-    except Exception:
-        return True
 
 
 def prepare_base_data(session_dir: str, db_uri: str, run_cfg: Dict[str, Any], force: bool = False, make_full: bool = False) -> Dict[str, Any]:
@@ -231,7 +210,7 @@ def prepare_base_data(session_dir: str, db_uri: str, run_cfg: Dict[str, Any], fo
     df_main = df_main.sort("time")
 
     # atomically write the global base file
-    _atomic_write_parquet(df_main, global_base_file)
+    atomic_write_parquet(df_main, global_base_file)
 
     actual_start = df_main["time"][0]
     actual_end = df_main["time"][-1]

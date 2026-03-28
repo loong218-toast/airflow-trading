@@ -55,13 +55,14 @@ from etl.cache import (
     stage_for_flush,
     load_backtest_cached,
     flush_all_buffers,
+    load_global_signals_cached,
+    stage_global_signals
 )
 
-from etl.io_utils import FULL_LAKE_DIR, _atomic_write_parquet
-from etl.merge_utils import combine_cache, combine_results_to_master
+from etl.io_utils import FULL_LAKE_DIR
+from etl.merge_utils import combine_cache, merge_batch_master_parts, combine_results_to_master
 from etl.master_io_utils import (
     buffer_master_row,
-    merge_parquet_files_fast,
     _flush_master_rows_buffer,
 )
 
@@ -69,39 +70,6 @@ from etl.schema import enforce_schema, get_schema, cast_to_schema, classify_frag
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
-
-# DEFAULT_RUN_CONFIG omitted for brevity - keep same as before
-DEFAULT_RUN_CONFIG = {
-    "pair": "XXBTZUSD",
-    "BASE_MINUTES": 5,
-    "ma_periods": [50, 600],
-    "sl_tp_in_pct": True,
-    "min_rr": 3.0,
-    "sl_range": {"min": 0.1, "max": 2.0, "step": 0.2},
-    "tp_range": {"min": 2.0, "max": 8.0, "step": 0.2},
-    "exit_windows": [1, 4, 12, 24, 48, 72, 168],
-    "entry_lookback_units": [0, 1, 4, 8, 12, 16, 20, 24, 48, 72, 168],
-    "ma_reversion": [False, True],
-    "use_stochastic": False,
-    "BTC_SETTINGS": {"spread": 0.0002},
-    "risk_pct": 0.005,
-    "funding_period_hours": 8,
-    "funding_rate_unit": "per_period",
-    "conservative_sl_first": True,
-    "treat_no_hit_as_loss": True,
-    "BATCH_SIZE": 80,
-    "grid_start_date": "2024-09-01T00:00:00Z",
-    "grid_end_date": "2025-09-15T23:59:59Z",
-    "max_dd_threshold": 0.20,
-    "PARQUET_FLUSH_ROWS": 50000,
-    "EQUITY_PARTITION_BY": "era_int",
-    "force_rebuild_cache": False,
-    "CACHE_USE_STREAMING_MERGE": True,
-    "CACHE_FLUSH_ROWS": 50000,
-    "CACHE_MAX_INMEM_ROWS": 20000,
-    "CACHE_TMP_DIR": None,
-    "PARALLEL_WORKERS": 1,
-}
 
 # ---------------- utilities ----------------
 def heartbeat_log(tag: str, extra: dict | None = None):
@@ -288,6 +256,11 @@ def generate_configs(session_dir: Path, run_cfg: dict) -> list[Path]:
     stoch_opts = _stoch_opts(run_cfg, use_stoch_list)
     bbw_opts = _bbw_opts(run_cfg, use_bbw_list)
 
+    use_sl_decay_list = _list(run_cfg.get("use_sl_decay"), [False])
+    sl_decay_pct_list = _list(run_cfg.get("sl_decay_pct"), [0.0])
+    sl_decay_interval_list = _list(run_cfg.get("sl_decay_interval"), [12])
+    sl_decay_stop_at_pos_list = _list(run_cfg.get("sl_decay_stop_at_pos"), [True])
+
     all_regime_configs = []
     idx = 0
 
@@ -297,25 +270,33 @@ def generate_configs(session_dir: Path, run_cfg: dict) -> list[Path]:
                 for bw in bbw_opts:
                     for lb_h in lookbacks:
                         for exit_h in exit_windows:
-                            regime = {
-                                "regime_id": f"{idx:05d}",
-                                "ma_int": int(ma_int),
-                                "ma_reversion": bool(ma_rev),
-                                "use_stochastic": bool(st["use_stochastic"]),
-                                "stoch_key": st["stoch_key"],
-                                "stoch_col": st["col"],
-                                "stoch_lower": st["low"],
-                                "stoch_upper": st["high"],
-                                "use_bbw": bool(bw["use_bbw"]),
-                                "bbw_periods": int(bw["bbw_periods"]),
-                                "bbw_std": float(bw["bbw_std"]),
-                                "bbw_thresholds": float(bw["bbw_thresholds"]),
-                                "entry_lookback_units": int(lb_h),
-                                "exit_window_h": int(exit_h),
-                                "ma_periods": ma_periods_sorted,
-                            }
-                            all_regime_configs.append(regime)
-                            idx += 1
+                            for use_decay in use_sl_decay_list:
+                                for decay_pct in sl_decay_pct_list:
+                                    for decay_interval in sl_decay_interval_list:
+                                        for decay_stop in sl_decay_stop_at_pos_list:
+                                            regime = {
+                                                "regime_id": f"{idx:05d}",
+                                                "ma_int": int(ma_int),
+                                                "ma_reversion": bool(ma_rev),
+                                                "use_stochastic": bool(st["use_stochastic"]),
+                                                "stoch_key": st["stoch_key"],
+                                                "stoch_col": st["col"],
+                                                "stoch_lower": st["low"],
+                                                "stoch_upper": st["high"],
+                                                "use_bbw": bool(bw["use_bbw"]),
+                                                "bbw_periods": int(bw["bbw_periods"]),
+                                                "bbw_std": float(bw["bbw_std"]),
+                                                "bbw_thresholds": float(bw["bbw_thresholds"]),
+                                                "entry_lookback_units": int(lb_h),
+                                                "exit_window_h": int(exit_h),
+                                                "ma_periods": ma_periods_sorted,
+                                                "use_sl_decay": bool(use_decay),
+                                                "sl_decay_pct": float(decay_pct),
+                                                "sl_decay_interval": int(decay_interval),
+                                                "sl_decay_stop_at_pos": bool(decay_stop),
+                                            }
+                                            all_regime_configs.append(regime)
+                                            idx += 1
 
     total_regimes = len(all_regime_configs)
     batch_size = int(run_cfg.get("BATCH_SIZE", 150))
@@ -709,104 +690,95 @@ def prepare_worker_data(session_dir: Path, run_cfg: dict):
         "main_spread_arr": _to_numpy_ensure(df_main["spread"], np.float32),
         "main_funding_arr": _to_numpy_ensure(df_main["funding_rate"], np.float32),
     }
-
-def _get_or_generate_signals(
-    era_label: str,
+def _get_or_generate_global_signals(
     regime_id: int,
     regime_cfg: dict,
     run_cfg: dict,
     data_ctx: dict,
-    start_idx: int,
-    end_idx: int,
+    months: int,
 ) -> pl.DataFrame:
     """
-    Strict signal loader/generator.
-
-    - data_ctx must include 'df_main' and 'feature_cols'.
-    - start_idx/end_idx computed by caller (no lookback calculation here).
-    - Caching behavior is controlled via run_cfg.
-    - Persist canonical signals to cache (strict schema), return annotated df_signals for in-memory use.
+    Build one global signal set for the full date range of the regime.
+    Cache it under era_label='GLOBAL' so it reuses your existing cache layout.
     """
-    # --- validate required context ---
-    if "df_main" not in data_ctx:
-        raise RuntimeError("data_ctx missing required key: 'df_main' (precomputed from prepare_worker_data)")
-    if "feature_cols" not in data_ctx:
-        raise RuntimeError("data_ctx missing required key: 'feature_cols' (precomputed from prepare_worker_data)")
-
-    df_main: pl.DataFrame = data_ctx["df_main"]
-    feature_cols: list = data_ctx["feature_cols"]
-
-    # Strict read from run_cfg (no external overrides)
-    months = int(run_cfg["sl_tp_interval_months"])  # intentionally KeyError if absent
     force_rebuild_cache = bool(run_cfg.get("force_rebuild_cache", False))
+    df_main: pl.DataFrame = data_ctx["df_main"]
 
-    # Validate indices
-    if start_idx is None or end_idx is None:
-        raise ValueError("start_idx and end_idx must be provided (no internal lookback computation allowed).")
-    if end_idx <= start_idx:
-        # empty era window -> return empty canonical signals DF
-        return pl.DataFrame([], schema=get_schema("signals"))
-
-    # 1) attempt to load canonical cached signals (strict schema)
-    df_signals_cached = None
     if not force_rebuild_cache:
         try:
-            df_signals_cached = load_signals_cached(months, era_label, str(regime_id))
+            cached = load_global_signals_cached(months, str(regime_id))
+            if cached is not None and not cached.is_empty():
+                return enforce_schema(cached, "signals", strict=False)
         except Exception as e:
-            logger.debug("signals cache read failed (will regenerate) cfg=%s era=%s: %s", regime_id, era_label, e)
-            df_signals_cached = None
+            logger.debug("global signal cache read failed cfg=%s: %s", regime_id, e)
 
-    # 2) if cached -> normalize, annotate with feature cols, and return
-    if df_signals_cached is not None and not df_signals_cached.is_empty():
-        df_signals_cached = normalize_signals_times(df_signals_cached, df_main=df_main)
-        if feature_cols:
-            # join feature columns for in-memory downstream work
-            df_signals_cached = df_signals_cached.join(df_main.select(["idx"] + feature_cols), on="idx", how="left")
-        return enforce_schema(df_signals_cached, "signals", strict=False)
+    df_signals = generate_filtered_signals(
+        df_main,
+        {**run_cfg, **regime_cfg, "regime_id": regime_id},
+        df_main=df_main,
+    )
 
-    # 3) generate signals from df slice (strict: caller provided indices)
-    slice_len = max(0, end_idx - start_idx)
-    if slice_len == 0:
-        return pl.DataFrame([], schema=get_schema("signals"))
-
-    df_input_slice = df_main.slice(start_idx, slice_len)
-    if df_input_slice is None or df_input_slice.height == 0:
-        return pl.DataFrame([], schema=get_schema("signals"))
-
-    try:
-        df_signals = generate_filtered_signals(df_input_slice, {**run_cfg, **regime_cfg, "regime_id": regime_id}, df_main=df_main)
-    except Exception as e:
-        # generation failure is critical — raise so caller can decide
-        raise RuntimeError(f"generate_filtered_signals failed for regime={regime_id} era={era_label}: {e}") from e
-
-    # annotate signals with precomputed feature columns for in-memory use
-    if not df_signals.is_empty() and feature_cols:
-        df_signals = df_signals.join(df_main.select(["idx"] + feature_cols), on="idx", how="left")
-
-    # Build canonical cache DF (strict schema) and stage it (so caches remain small)
     if not df_signals.is_empty():
         try:
             signals_for_cache = df_signals.select(["idx", "time_ns", "side", "regime_id"])
-        except Exception:
-            # fallback: enforce canonical schema via explicit construction
-            signals_for_cache = df_signals.with_columns(
-                [
-                    pl.col("idx").cast(pl.Int64),
-                    pl.col("time_ns").cast(pl.Int64),
-                    pl.col("side").cast(pl.Int8),
-                    pl.col("regime_id").cast(pl.Int32),
-                ]
-            ).select(["idx", "time_ns", "side", "regime_id"])
-
-        signals_for_cache = enforce_schema(signals_for_cache, "signals", strict=True)
-
-        try:
-            stage_for_flush("signals", months, era_label, str(regime_id), signals_for_cache)
+            signals_for_cache = enforce_schema(signals_for_cache, "signals", strict=True)
+            stage_global_signals(months, str(regime_id), signals_for_cache)
         except Exception as e:
-            logger.debug("stage_for_flush(signals) failed: %s", e)
+            logger.debug("stage_for_flush(global signals) failed cfg=%s: %s", regime_id, e)
 
-    # Return annotated DF for downstream (non-strict so features persist in-memory)
     return enforce_schema(df_signals, "signals", strict=False) if not df_signals.is_empty() else pl.DataFrame([], schema=get_schema("signals"))
+
+
+def _build_era_registry(
+    windows,
+    global_signals: pl.DataFrame,
+):
+    """
+    Precompute era boundaries and per-era signal stats.
+    """
+    if global_signals is None or global_signals.is_empty():
+        sig_times_all = np.asarray([], dtype=np.int64)
+        sig_sides_all = np.asarray([], dtype=np.int8)
+    else:
+        sig_times_all = global_signals["time_ns"].to_numpy(allow_copy=True).astype(np.int64)
+        sig_sides_all = global_signals["side"].to_numpy(allow_copy=True).astype(np.int8)
+
+    out = []
+    for (start, end) in windows:
+        if hasattr(start, "tzinfo") and start.tzinfo is not None:
+            start = start.replace(tzinfo=None)
+        if hasattr(end, "tzinfo") and end.tzinfo is not None:
+            end = end.replace(tzinfo=None)
+
+        era_label = start.strftime("%Y-%m")
+        try:
+            era_int = int(start.strftime("%Y%m%d"))
+        except Exception:
+            era_int = 0
+
+        start_ns = np.datetime64(start).astype("datetime64[ns]").astype(np.int64)
+        end_ns = np.datetime64(end).astype("datetime64[ns]").astype(np.int64)
+
+        mask_all = (sig_times_all >= start_ns) & (sig_times_all < end_ns)
+        buy_mask = mask_all & (sig_sides_all == 1)
+        sell_mask = mask_all & (sig_sides_all == -1)
+
+        out.append({
+            "era_label": era_label,
+            "era_int": era_int,
+            "start_ns": int(start_ns),
+            "end_ns": int(end_ns),
+            "buy_sig_n": int(buy_mask.sum()),
+            "sell_sig_n": int(sell_mask.sum()),
+            "buy_sig_min_ns": int(sig_times_all[buy_mask].min()) if buy_mask.any() else -1,
+            "buy_sig_max_ns": int(sig_times_all[buy_mask].max()) if buy_mask.any() else -1,
+            "sell_sig_min_ns": int(sig_times_all[sell_mask].min()) if sell_mask.any() else -1,
+            "sell_sig_max_ns": int(sig_times_all[sell_mask].max()) if sell_mask.any() else -1,
+            "buy_sig_mask": buy_mask,
+            "sell_sig_mask": sell_mask,
+        })
+
+    return out
 
 def compute_equity_preview(
     closed_rets: np.ndarray,
@@ -1096,6 +1068,10 @@ def _run_backtest_grid(
                     round(float(tp_val), 6),
                     int(side_flag),
                     int(regime_cfg.get("exit_window_h", 0)),
+                    int(bool(regime_cfg.get("use_sl_decay", False))),
+                    round(float(regime_cfg.get("sl_decay_pct", 0.0)), 6),
+                    int(regime_cfg.get("sl_decay_interval", 0)),
+                    int(bool(regime_cfg.get("sl_decay_stop_at_pos", True))),
                 )
                 hit = bucket_map.get(key)
                 if hit is not None:
@@ -1125,6 +1101,10 @@ def _run_backtest_grid(
                         conservative_sl_first=bool(run_cfg.get("conservative_sl_first", True)),
                         treat_no_hit_as_loss=bool(run_cfg.get("treat_no_hit_as_loss", True)),
                         side_flag=side_flag,
+                        use_sl_decay=bool(regime_cfg.get("use_sl_decay", False)),
+                        sl_decay_pct=float(regime_cfg.get("sl_decay_pct", 0.0)),
+                        sl_decay_interval=int(regime_cfg.get("sl_decay_interval", 0)),
+                        sl_decay_stop_at_pos=bool(regime_cfg.get("sl_decay_stop_at_pos", True)),
                     )
                     entry_idx = np.asarray(res.get("entry_idx", []), dtype=np.int64)
                     exit_idx = np.asarray(res.get("exit_idx", []), dtype=np.int64)
@@ -1140,6 +1120,10 @@ def _run_backtest_grid(
                             "side": [int(side_flag)],
                             "regime_id": [int(regime_id)],
                             "exit_window_h": [int(regime_cfg.get("exit_window_h", 0))],
+                            "use_sl_decay": [bool(regime_cfg.get("use_sl_decay", False))],
+                            "sl_decay_pct": [float(regime_cfg.get("sl_decay_pct", 0.0))],
+                            "sl_decay_interval": [int(regime_cfg.get("sl_decay_interval", 0))],
+                            "sl_decay_stop_at_pos": [bool(regime_cfg.get("sl_decay_stop_at_pos", True))],
                             "entry_idx": pl.Series([entry_idx], dtype=pl.List(pl.Int64)),
                             "exit_idx": pl.Series([exit_idx], dtype=pl.List(pl.Int64)),
                             "ret": pl.Series([rets], dtype=pl.List(pl.Float32)),
@@ -1293,43 +1277,37 @@ def process_era_combos(
     total_in_batch: int
 ) -> Tuple[int, int]:
     """
-    Strict per-era processing loop.
+    Global signals once, global trade simulation once per combo/side,
+    then slice the global trade arrays by era.
 
-    Requirements (no legacy or fallback logic):
-      - `data_ctx` MUST contain:
-         * "df_main" (polars DataFrame)
-         * "main_time_ns_arr" (numpy int64 array of timestamps in ns)
-         * "feature_cols" (list of precomputed feature column names)
-         * "lookback_map" (dict mapping era_label -> lookback_minutes)  <-- MANDATORY
-      - `run_cfg` MUST contain "sl_tp_interval_months" (int) and other grid params.
-      - No internal computation of lookback; an absent lookback_map entry is an error.
+    Keeps your streaming writes:
+      - signal cache is written once under era_label='GLOBAL'
+      - backtest cache is still written per era/regime/combo
+      - equity/master rows are still staged incrementally
     """
-    # validate data_ctx
     required_keys = (
-        "df_main", 
-        "main_time_ns_arr", 
-        "main_close_arr",    
-        "main_spread_arr",   
-        "main_funding_arr",  
-        "feature_cols", 
-        "lookback_map"
+        "df_main",
+        "main_time_ns_arr",
+        "main_close_arr",
+        "main_spread_arr",
+        "main_funding_arr",
+        "feature_cols",
+        "lookback_map",
     )
     missing = [k for k in required_keys if k not in data_ctx]
     if missing:
-        raise RuntimeError(f"data_ctx missing required keys: {missing}. This system enforces precomputed lookback_map and features.")
+        raise RuntimeError(f"data_ctx missing required keys: {missing}")
 
     df_main: pl.DataFrame = data_ctx["df_main"]
     main_time_ns_arr: np.ndarray = data_ctx["main_time_ns_arr"]
-    lookback_map: dict = data_ctx["lookback_map"]  # strict: must exist and cover all eras
-    feature_cols: list = data_ctx["feature_cols"]
+    main_close_arr: np.ndarray = data_ctx["main_close_arr"]
+    main_spread_arr: np.ndarray = data_ctx["main_spread_arr"]
+    main_funding_arr: np.ndarray = data_ctx["main_funding_arr"]
+    lookback_map: dict = data_ctx["lookback_map"]
 
-    # grid params (strict read)
-    months = int(run_cfg["sl_tp_interval_months"])  # KeyError if absent intentionally
+    months = int(run_cfg["sl_tp_interval_months"])
     grid_start = pd.to_datetime(run_cfg["grid_start_date"]).to_pydatetime()
     grid_end = pd.to_datetime(run_cfg["grid_end_date"]).to_pydatetime()
-
-    processed_inc = 0
-    skipped_inc = 0
 
     sl_vals, tp_vals = _expand_sl_tp({**run_cfg, **regime_cfg})
     combos = _prune_by_min_rr(sl_vals, tp_vals, float(run_cfg.get("min_rr", 3.0)))
@@ -1339,120 +1317,422 @@ def process_era_combos(
         months,
         min_dt=grid_start,
         max_dt=grid_end,
-        include_partial_tail=False,   # drop the short final window
+        include_partial_tail=False,
     )
+
     logger.debug("process_era_combos: regime=%s windows=%d", regime_id, len(windows))
 
+    # one global signal set for this regime
+    global_signals = _get_or_generate_global_signals(
+        regime_id=regime_id,
+        regime_cfg=regime_cfg,
+        run_cfg=run_cfg,
+        data_ctx=data_ctx,
+        months=months,
+    )
+
+    era_registry = _build_era_registry(windows, global_signals)
+
+    # pre-load era backtest caches once
+    bucket_maps_by_era = {}
+    if not bool(run_cfg.get("force_rebuild_cache", False)):
+        for era in era_registry:
+            era_label = era["era_label"]
+            bucket_map = {}
+            try:
+                bucket_df = load_backtest_cached(months, era_label, str(regime_id))
+                if bucket_df is not None and not bucket_df.is_empty():
+                    for row in bucket_df.iter_rows(named=True):
+                        key = (
+                            int(row["sig_n"]),
+                            int(row["sig_min_ns"]),
+                            int(row["sig_max_ns"]),
+                            round(float(row["SL"]), 6),
+                            round(float(row["TP"]), 6),
+                            int(row["side"]),
+                            int(row["exit_window_h"]),
+                            int(bool(row.get("use_sl_decay", False))),
+                            round(float(row.get("sl_decay_pct", 0.0)), 6),
+                            int(row.get("sl_decay_interval", 0)),
+                            int(bool(row.get("sl_decay_stop_at_pos", True))),
+                        )
+                        bucket_map[key] = row
+            except Exception as e:
+                logger.debug("load_backtest_cached failed cfg=%s era=%s: %s", regime_id, era_label, e)
+            bucket_maps_by_era[era_label] = bucket_map
+
+    # global signal arrays by side
+    if global_signals is not None and not global_signals.is_empty():
+        global_buys = global_signals.filter(pl.col("side") == 1)
+        global_sells = global_signals.filter(pl.col("side") == -1)
+    else:
+        global_buys = pl.DataFrame([], schema=get_schema("signals"))
+        global_sells = pl.DataFrame([], schema=get_schema("signals"))
+
+    buy_sig_idxs_all = global_buys["idx"].to_numpy(allow_copy=True).astype(np.int64) if not global_buys.is_empty() else np.asarray([], dtype=np.int64)
+    buy_sig_times_all = global_buys["time_ns"].to_numpy(allow_copy=True).astype(np.int64) if not global_buys.is_empty() else np.asarray([], dtype=np.int64)
+
+    sell_sig_idxs_all = global_sells["idx"].to_numpy(allow_copy=True).astype(np.int64) if not global_sells.is_empty() else np.asarray([], dtype=np.int64)
+    sell_sig_times_all = global_sells["time_ns"].to_numpy(allow_copy=True).astype(np.int64) if not global_sells.is_empty() else np.asarray([], dtype=np.int64)
+
+    # track how many master rows each era gets
+    era_master_rows_written = {era["era_label"]: 0 for era in era_registry}
+
+    dd_pass = 0
+    dd_fail = 0
+    cache_hit = 0
+    cache_miss = 0
+    staged_equity = 0
+    master_rows_written = 0
+    empty_rows_written = 0
+
+    # global simulation once per combo/side
+    for sl_val, tp_val in combos:
+        for side_flag, side_sig_idxs_all, side_sig_times_all in (
+            (1, buy_sig_idxs_all, buy_sig_times_all),
+            (-1, sell_sig_idxs_all, sell_sig_times_all),
+        ):
+            if side_sig_idxs_all.size == 0:
+                # no signals at all for this side; write zero rows for every era
+                for era in era_registry:
+                    era_label = era["era_label"]
+                    master_row_raw = _make_master_row(
+                        regime_id=regime_id,
+                        era_int=era["era_int"],
+                        side_flag=side_flag,
+                        sl_val=sl_val,
+                        tp_val=tp_val,
+                        total_pos=0,
+                        win_pos=0,
+                        balance=100.0,
+                        max_dd=0.0,
+                        regime_cfg=regime_cfg,
+                    )
+                    canonical = pl.DataFrame([master_row_raw]).pipe(enforce_schema, "master").to_dicts()[0]
+                    buffer_master_row(results_dir, batch_id, canonical)
+                    era_master_rows_written[era_label] += 1
+                    empty_rows_written += 1
+                    master_rows_written += 1
+                continue
+
+            # one global backtest for the whole regime/side/combo
+            try:
+                res = backtest_signals_sl_tp_rets(
+                    main_close_arr=main_close_arr,
+                    main_time_ns_arr=main_time_ns_arr,
+                    sig_idxs=side_sig_idxs_all,
+                    sl=float(sl_val),
+                    tp=float(tp_val),
+                    sl_tp_in_pct=bool(run_cfg.get("sl_tp_in_pct", True)),
+                    exit_window_h=int(regime_cfg.get("exit_window_h", 0)),
+                    base_minutes=int(run_cfg.get("BASE_MINUTES", 5)),
+                    spread=float(run_cfg.get("BTC_SETTINGS", {}).get("spread", 0.0)),
+                    conservative_sl_first=bool(run_cfg.get("conservative_sl_first", True)),
+                    treat_no_hit_as_loss=bool(run_cfg.get("treat_no_hit_as_loss", True)),
+                    side_flag=side_flag,
+                    use_sl_decay=bool(regime_cfg.get("use_sl_decay", False)),
+                    sl_decay_pct=float(regime_cfg.get("sl_decay_pct", 0.0)),
+                    sl_decay_interval=int(regime_cfg.get("sl_decay_interval", 0)),
+                    sl_decay_stop_at_pos=bool(regime_cfg.get("sl_decay_stop_at_pos", True)),
+                )
+            except Exception as e:
+                logger.error("Global backtest kernel error cfg=%s side=%s SL=%.4f TP=%.4f: %s", regime_id, side_flag, float(sl_val), float(tp_val), e)
+                continue
+
+            entry_idx_all = np.asarray(res.get("entry_idx", []), dtype=np.int64)
+            exit_idx_all = np.asarray(res.get("exit_idx", []), dtype=np.int64)
+            rets_all = np.asarray(res.get("rets", res.get("ret", [])), dtype=np.float64)
+
+            if entry_idx_all.size == 0:
+                # no trades generated at all; still write zero rows for every era
+                for era in era_registry:
+                    era_label = era["era_label"]
+                    master_row_raw = _make_master_row(
+                        regime_id=regime_id,
+                        era_int=era["era_int"],
+                        side_flag=side_flag,
+                        sl_val=sl_val,
+                        tp_val=tp_val,
+                        total_pos=0,
+                        win_pos=0,
+                        balance=100.0,
+                        max_dd=0.0,
+                        regime_cfg=regime_cfg,
+                    )
+                    canonical = pl.DataFrame([master_row_raw]).pipe(enforce_schema, "master").to_dicts()[0]
+                    buffer_master_row(results_dir, batch_id, canonical)
+                    era_master_rows_written[era_label] += 1
+                    empty_rows_written += 1
+                    master_rows_written += 1
+                continue
+
+            closed_mask_all = exit_idx_all >= 0
+            entry_time_ns_all = main_time_ns_arr[entry_idx_all]
+
+            for era in era_registry:
+                era_label = era["era_label"]
+                start_ns = era["start_ns"]
+                end_ns = era["end_ns"]
+                bucket_map = bucket_maps_by_era.get(era_label, {})
+
+                # era-side signal stats
+                if side_flag == 1:
+                    era_sig_mask = era["buy_sig_mask"]
+                    sig_n = era["buy_sig_n"]
+                    sig_min_ns = era["buy_sig_min_ns"]
+                    sig_max_ns = era["buy_sig_max_ns"]
+                else:
+                    era_sig_mask = era["sell_sig_mask"]
+                    sig_n = era["sell_sig_n"]
+                    sig_min_ns = era["sell_sig_min_ns"]
+                    sig_max_ns = era["sell_sig_max_ns"]
+
+                if sig_n == 0:
+                    master_row_raw = _make_master_row(
+                        regime_id=regime_id,
+                        era_int=era["era_int"],
+                        side_flag=side_flag,
+                        sl_val=sl_val,
+                        tp_val=tp_val,
+                        total_pos=0,
+                        win_pos=0,
+                        balance=100.0,
+                        max_dd=0.0,
+                        regime_cfg=regime_cfg,
+                    )
+                    canonical = pl.DataFrame([master_row_raw]).pipe(enforce_schema, "master").to_dicts()[0]
+                    buffer_master_row(results_dir, batch_id, canonical)
+                    era_master_rows_written[era_label] += 1
+                    empty_rows_written += 1
+                    master_rows_written += 1
+                    continue
+
+                # reuse era cache if present
+                entry_idx = None
+                exit_idx = None
+                rets = None
+
+                key = (
+                    int(sig_n),
+                    int(sig_min_ns),
+                    int(sig_max_ns),
+                    round(float(sl_val), 6),
+                    round(float(tp_val), 6),
+                    int(side_flag),
+                    int(regime_cfg.get("exit_window_h", 0)),
+                    int(bool(regime_cfg.get("use_sl_decay", False))),
+                    round(float(regime_cfg.get("sl_decay_pct", 0.0)), 6),
+                    int(regime_cfg.get("sl_decay_interval", 0)),
+                    int(bool(regime_cfg.get("sl_decay_stop_at_pos", True))),
+                )
+
+                hit = bucket_map.get(key)
+                if hit is not None:
+                    cache_hit += 1
+                    entry_idx = np.asarray(hit["entry_idx"], dtype=np.int64)
+                    exit_idx = np.asarray(hit["exit_idx"], dtype=np.int64)
+                    rets = np.asarray(hit["ret"], dtype=np.float64)
+                else:
+                    cache_miss += 1
+
+                    trade_mask = closed_mask_all & (entry_time_ns_all >= start_ns) & (entry_time_ns_all < end_ns)
+
+                    if not trade_mask.any():
+                        master_row_raw = _make_master_row(
+                            regime_id=regime_id,
+                            era_int=era["era_int"],
+                            side_flag=side_flag,
+                            sl_val=sl_val,
+                            tp_val=tp_val,
+                            total_pos=int(sig_n),
+                            win_pos=0,
+                            balance=100.0,
+                            max_dd=0.0,
+                            regime_cfg=regime_cfg,
+                        )
+                        canonical = pl.DataFrame([master_row_raw]).pipe(enforce_schema, "master").to_dicts()[0]
+                        buffer_master_row(results_dir, batch_id, canonical)
+                        era_master_rows_written[era_label] += 1
+                        empty_rows_written += 1
+                        master_rows_written += 1
+                        continue
+
+                    entry_idx = entry_idx_all[trade_mask].astype(np.int64)
+                    exit_idx = exit_idx_all[trade_mask].astype(np.int64)
+                    rets = rets_all[trade_mask].astype(np.float64)
+
+                    # write the era-combo backtest cache in the same structure you already use
+                    try:
+                        res_df = pl.DataFrame(
+                            {
+                                "sig_n": [sig_n],
+                                "sig_min_ns": [sig_min_ns],
+                                "sig_max_ns": [sig_max_ns],
+                                "SL": [float(sl_val)],
+                                "TP": [float(tp_val)],
+                                "side": [int(side_flag)],
+                                "regime_id": [int(regime_id)],
+                                "exit_window_h": [int(regime_cfg.get("exit_window_h", 0))],
+                                "use_sl_decay": [bool(regime_cfg.get("use_sl_decay", False))],
+                                "sl_decay_pct": [float(regime_cfg.get("sl_decay_pct", 0.0))],
+                                "sl_decay_interval": [int(regime_cfg.get("sl_decay_interval", 0))],
+                                "sl_decay_stop_at_pos": [bool(regime_cfg.get("sl_decay_stop_at_pos", True))],
+                                "entry_idx": pl.Series([entry_idx], dtype=pl.List(pl.Int64)),
+                                "exit_idx": pl.Series([exit_idx], dtype=pl.List(pl.Int64)),
+                                "ret": pl.Series([rets], dtype=pl.List(pl.Float32)),
+                            }
+                        ).pipe(enforce_schema, "backtest", strict=True)
+
+                        stage_for_flush("backtest", months, era_label, str(regime_id), res_df)
+                    except Exception as e:
+                        logger.error("Backtest cache write failed cfg=%s era=%s: %s", regime_id, era_label, e)
+
+                mask_closed = np.asarray([]) if exit_idx is None else (exit_idx >= 0)
+                if not (mask_closed.size and mask_closed.any()):
+                    master_row_raw = _make_master_row(
+                        regime_id=regime_id,
+                        era_int=era["era_int"],
+                        side_flag=side_flag,
+                        sl_val=sl_val,
+                        tp_val=tp_val,
+                        total_pos=int(sig_n),
+                        win_pos=0,
+                        balance=100.0,
+                        max_dd=0.0,
+                        regime_cfg=regime_cfg,
+                    )
+                    canonical = pl.DataFrame([master_row_raw]).pipe(enforce_schema, "master").to_dicts()[0]
+                    buffer_master_row(results_dir, batch_id, canonical)
+                    era_master_rows_written[era_label] += 1
+                    empty_rows_written += 1
+                    master_rows_written += 1
+                    continue
+
+                closed_rets = rets[mask_closed]
+                closed_entry_idxs = entry_idx[mask_closed].astype(np.int64)
+                closed_exit_idxs = exit_idx[mask_closed].astype(np.int64)
+
+                rng_24h_entry, rng_72h_entry, rng_1w_entry, rng_1m_entry = get_volatility_index_for_indices(
+                    df_main=df_main,
+                    entry_idxs=closed_entry_idxs,
+                )
+
+                pnl_pct_arr, exit_times_ns, equity_arr, current_max_dd, breached = compute_equity_preview(
+                    closed_rets=closed_rets,
+                    closed_entry_idxs=closed_entry_idxs,
+                    closed_exit_idxs=closed_exit_idxs,
+                    main_close_arr=main_close_arr,
+                    main_time_ns_arr=main_time_ns_arr,
+                    main_spread_arr=main_spread_arr,
+                    main_funding_arr=main_funding_arr,
+                    sl_val=float(sl_val),
+                    tp_val=float(tp_val),
+                    run_cfg=run_cfg,
+                )
+
+                if breached:
+                    dd_fail += 1
+                    final_balance = float(equity_arr[-1]) if equity_arr.size else 100.0
+                    win_pos = int(np.count_nonzero(closed_rets > 0.0)) if closed_rets.size else 0
+
+                    master_row_raw = _make_master_row(
+                        regime_id=regime_id,
+                        era_int=era["era_int"],
+                        side_flag=side_flag,
+                        sl_val=sl_val,
+                        tp_val=tp_val,
+                        total_pos=int(sig_n),
+                        win_pos=win_pos,
+                        balance=final_balance,
+                        max_dd=current_max_dd,
+                        regime_cfg=regime_cfg,
+                    )
+                    canonical = pl.DataFrame([master_row_raw]).pipe(enforce_schema, "master").to_dicts()[0]
+                    buffer_master_row(results_dir, batch_id, canonical)
+                    era_master_rows_written[era_label] += 1
+                    master_rows_written += 1
+                    continue
+
+                dd_pass += 1
+
+                gap_entry_a, gap_entry_b, gap_exit_a, gap_exit_b = get_ma_price_gaps_for_indices(
+                    df_main=df_main,
+                    entry_idxs=closed_entry_idxs,
+                    exit_idxs=closed_exit_idxs,
+                    regime_cfg=regime_cfg,
+                    run_cfg=run_cfg,
+                )
+
+                final_balance, win_pos, max_dd = stage_equity_from_preview(
+                    pnl_pct_arr=pnl_pct_arr,
+                    exit_times_ns=exit_times_ns,
+                    equity_arr=equity_arr,
+                    closed_entry_idxs=closed_entry_idxs,
+                    closed_exit_idxs=closed_exit_idxs,
+                    sl_val=float(sl_val),
+                    tp_val=float(tp_val),
+                    regime_id=regime_id,
+                    era_int=era["era_int"],
+                    side_flag=side_flag,
+                    stager=stager,
+                    max_dd=current_max_dd,
+                    ma_p_gap_a_entry=gap_entry_a,
+                    ma_p_gap_b_entry=gap_entry_b,
+                    ma_p_gap_a_exit=gap_exit_a,
+                    ma_p_gap_b_exit=gap_exit_b,
+                    rng_24h_entry=rng_24h_entry,
+                    rng_72h_entry=rng_72h_entry,
+                    rng_1w_entry=rng_1w_entry,
+                    rng_1m_entry=rng_1m_entry,
+                )
+                staged_equity += 1
+
+                master_row_raw = _make_master_row(
+                    regime_id=regime_id,
+                    era_int=era["era_int"],
+                    side_flag=side_flag,
+                    sl_val=sl_val,
+                    tp_val=tp_val,
+                    total_pos=int(sig_n),
+                    win_pos=win_pos,
+                    balance=final_balance,
+                    max_dd=max_dd,
+                    regime_cfg=regime_cfg,
+                )
+                canonical = pl.DataFrame([master_row_raw]).pipe(enforce_schema, "master").to_dicts()[0]
+                buffer_master_row(results_dir, batch_id, canonical)
+                era_master_rows_written[era_label] += 1
+                master_rows_written += 1
+
+    # final streak check over eras, after all combo/side work
     empty_era_streak = 0
     max_empty_era_streak = int(run_cfg.get("MAX_EMPTY_ERA_STREAK", 2))
-
-    # iterate strictly over precomputed windows (eras)
-    for (start, end) in windows:
-        if hasattr(start, "tzinfo") and start.tzinfo is not None:
-            start = start.replace(tzinfo=None)
-        if hasattr(end, "tzinfo") and end.tzinfo is not None:
-            end = end.replace(tzinfo=None)
-
-        era_label = start.strftime("%Y-%m")
-        try:
-            era_int = int(start.strftime("%Y%m%d"))
-        except Exception:
-            era_int = 0
-
-        # require lookback entry for this era (no fallback allowed)
-        if era_label not in lookback_map:
-            raise RuntimeError(f"Missing precomputed lookback for era '{era_label}' in data_ctx['lookback_map']. Aborting; no fallback allowed.")
-        lookback_hours = int(lookback_map[era_label])
-
-        lookback_delta = datetime.timedelta(hours=lookback_hours)
-        input_start = start - lookback_delta
-
-        # convert to ns and clamp to df_main range
-        start_ns = np.datetime64(input_start).astype("datetime64[ns]").astype(np.int64)
-        end_ns = np.datetime64(end).astype("datetime64[ns]").astype(np.int64)
-
-        min_ns = int(main_time_ns_arr[0])
-        max_ns = int(main_time_ns_arr[-1])
-        if start_ns < min_ns:
-            start_ns = min_ns
-        if end_ns > max_ns:
-            end_ns = max_ns
-
-        # LOGICAL CHECK: Is this era even inside our data?
-        if end_ns < min_ns or start_ns > max_ns:
-            logger.warning(f"SKIP Era {era_label}: Entirely outside data range. "
-                        f"Data: {pd.to_datetime(min_ns)} to {pd.to_datetime(max_ns)}")
-            continue
-
-        start_idx = int(np.searchsorted(main_time_ns_arr, start_ns, side="left"))
-        end_idx = int(np.searchsorted(main_time_ns_arr, end_ns, side="left"))
-
-        if start_idx == end_idx:
-            # This happens if the timestamps are so close they fall into the same candle 
-            # OR if the range is in a gap in your data.
-            logger.error(f"⚠️ INDEX COLLISION for Era {era_label}: start_idx and end_idx are both {start_idx}. "
-                        f"Search range: {input_start} to {end}. Slice will be empty!")
-
-        logger.debug("ERA %s start_idx=%d end_idx=%d lookback=%d", era_label, start_idx, end_idx, lookback_hours)
-
-        # generate or load signals (slicing done inside)
-        df_signals = _get_or_generate_signals(
-            era_label=era_label,
-            regime_id=regime_id,
-            regime_cfg=regime_cfg,
-            run_cfg=run_cfg,
-            data_ctx=data_ctx,
-            start_idx=start_idx,
-            end_idx=end_idx,
-        )
-
-        # run backtests (this function reads arrays and flags from data_ctx / run_cfg)
-        summary = _run_backtest_grid(
-            regime_id=regime_id,
-            regime_cfg=regime_cfg,
-            run_cfg=run_cfg,
-            data_ctx=data_ctx,
-            df_signals=df_signals,
-            months=months,
-            era_label=era_label,
-            era_int=era_int,
-            results_dir=results_dir,
-            batch_id=batch_id,
-            stager=stager,
-            max_dd_threshold=max_dd_threshold,
-            current_idx=current_idx,
-            total_in_batch=total_in_batch,
-            combos=combos,
-        )
-
-        current_regime_display = current_idx + 1
-
-        logger.info(
-            f"📊 [Batch {batch_id}] Regime {current_regime_display}/{total_in_batch} (ID:{regime_id}) | "
-            f"Era: {era_label} | PASS: {summary['dd_pass']} | FAIL: {summary['dd_fail']} | "
-            f"Streak: {empty_era_streak}/{max_empty_era_streak}"
-        )
-
-        if summary["master_rows_written"] == 0:
-            logger.warning(
-                f"⚠️ Skipping Era {era_label} for regime={regime_id}: "
-                f"All {summary['dd_fail']} combos failed DD threshold {max_dd_threshold}."
-            )
-            empty_era_streak += 1  # NOW your streak logic actually works!
-            
+    for era in era_registry:
+        era_label = era["era_label"]
+        if era_master_rows_written.get(era_label, 0) == 0:
+            empty_era_streak += 1
             if empty_era_streak >= max_empty_era_streak:
                 error_msg = f"❌ CRITICAL FAILURE: Regime {regime_id} killed. Hit max empty streak of {max_empty_era_streak}."
                 logger.error(error_msg)
-                
-                # This stops EVERYTHING and tells Airflow the task failed
                 raise RuntimeError(error_msg)
-            
-            continue # Go to the next era in the loop
+        else:
+            empty_era_streak = 0
 
-        processed_inc += 1
+    processed_inc = sum(1 for era in era_registry if era_master_rows_written.get(era["era_label"], 0) > 0)
+    skipped_inc = len(era_registry) - processed_inc
 
-    return processed_inc, skipped_inc
-
+    return {
+        "processed_inc": processed_inc,
+        "skipped_inc": skipped_inc,
+        "dd_pass": dd_pass,
+        "dd_fail": dd_fail,
+        "cache_hit": cache_hit,
+        "cache_miss": cache_miss,
+        "staged_equity": staged_equity,
+        "master_rows_written": master_rows_written,
+        "empty_rows_written": empty_rows_written,
+    }
+    
 def compute_config_and_save(batch_path: str, session_dir: str, compute_backtest: bool = True) -> Dict:
     try:
         _HAS_PSUTIL = True
@@ -1541,10 +1821,16 @@ def compute_config_and_save(batch_path: str, session_dir: str, compute_backtest:
             regime_cfg["entry_lookback_units"] = int(regime_cfg.get("entry_lookback_units", 0) or 0)
             regime_cfg["exit_window_h"] = int(regime_cfg.get("exit_window_h", 0) or 0)
             regime_cfg["use_stochastic"] = bool(regime_cfg.get("use_stochastic", False))
+
             regime_cfg["bbw_periods"] = int(regime_cfg.get("bbw_periods", 0) or 0)
             regime_cfg["bbw_std"] = float(regime_cfg.get("bbw_std", 0.0) or 0.0)
             regime_cfg["use_bbw"] = bool(regime_cfg.get("use_bbw", False))
             regime_cfg["bbw_thresholds"] = int(regime_cfg.get("bbw_thresholds", 0) or 0)
+
+            regime_cfg["use_sl_decay"] = bool(regime_cfg.get("use_sl_decay", False))
+            regime_cfg["sl_decay_pct"] = float(regime_cfg.get("sl_decay_pct", 0.0) or 0.0)
+            regime_cfg["sl_decay_interval"] = int(regime_cfg.get("sl_decay_interval", 0) or 0)
+            regime_cfg["sl_decay_stop_at_pos"] = bool(regime_cfg.get("sl_decay_stop_at_pos", True))
 
             regime_id = regime_cfg.get("regime_id")
             summary_path = results_dir / f"cfg_{regime_id}_summary.json"
@@ -1555,7 +1841,7 @@ def compute_config_and_save(batch_path: str, session_dir: str, compute_backtest:
             if processed_count % 5 == 0 or processed_count == 0:
                 logger.info("📑 [Batch %d] Progress: %d/%d (%.1f%%) ...", batch_id, idx, total_in_batch, (idx / total_in_batch) * 100.0)
 
-            p_inc, s_inc = process_era_combos(
+            result = process_era_combos(
                 regime_id=regime_id,
                 regime_cfg=regime_cfg,
                 run_cfg=run_cfg,
@@ -1565,8 +1851,15 @@ def compute_config_and_save(batch_path: str, session_dir: str, compute_backtest:
                 stager=stager,
                 max_dd_threshold=max_dd_threshold,
                 current_idx=idx,
-                total_in_batch=total_in_batch
+                total_in_batch=total_in_batch,
             )
+
+            if isinstance(result, dict):
+                p_inc = int(result.get("processed_inc", 0))
+                s_inc = int(result.get("skipped_inc", 0))
+            else:
+                p_inc, s_inc = result
+
             processed_count += p_inc
             skipped_count += s_inc
 
@@ -1590,23 +1883,11 @@ def compute_config_and_save(batch_path: str, session_dir: str, compute_backtest:
         except Exception:
             logger.debug("flush_all_buffers() failed")
 
-        # Merge master metrics parts into batch master (unchanged)
-        parts_dir = results_dir / "master_parts" / f"batch_{batch_id:04d}"
-        parts = sorted(parts_dir.glob("*.parquet")) if parts_dir.exists() else []
-        if parts:
-            try:
-                merge_parquet_files_fast(parts, results_dir / f"batch_{batch_id:04d}_master_metrics.parquet")
-            except Exception as e:
-                logger.exception("Failed to merge master parts for batch %s: %s", batch_id, e)
-                raise
-        else:
-            try:
-                empty_df = pl.DataFrame([]).pipe(enforce_schema, "master")
-                empty_out = results_dir / f"batch_{batch_id:04d}_master_metrics.parquet"
-                empty_df.write_parquet(str(empty_out), compression="snappy")
-            except Exception as e:
-                logger.exception("Failed to write empty master parquet for batch %s: %s", batch_id, e)
-                raise
+        try:
+            merge_batch_master_parts(session_dir, batch_id)
+        except Exception as e:
+            logger.exception("Failed to merge master parts for batch %s: %s", batch_id, e)
+            raise
 
     logger.info("🏁 Batch %s finished. Processed: %d, Skipped: %d", batch_path.name, processed_count, skipped_count)
     return {"batch": batch_path.name, "processed": processed_count, "skipped": skipped_count}

@@ -14,6 +14,13 @@ from etl.schema import get_schema, enforce_schema
 
 _LOG = logging.getLogger(__name__)
 
+GLOBAL_SIGNAL_ERA = "__global__"
+
+def load_global_signals_cached(months: int, regime_id: str) -> Optional[pl.DataFrame]:
+    return load_cached("signals", months, GLOBAL_SIGNAL_ERA, regime_id)
+
+def stage_global_signals(months: int, regime_id: str, df_new: pl.DataFrame) -> None:
+    stage_for_flush("signals", months, GLOBAL_SIGNAL_ERA, regime_id, df_new)
 
 @lru_cache(maxsize=1)
 def _cache_settings() -> Dict[str, Any]:
@@ -275,9 +282,11 @@ def load_backtest_cached(months: int, era_label: str, regime_id: str) -> Optiona
     return load_cached("backtest", months, era_label, regime_id)
 
 __all__ = [
-    "load_cached", 
-    "load_signals_cached", 
-    "load_backtest_cached", 
-    "stage_for_flush", 
-    "inspect_cache_root"
+    "load_cached",
+    "load_signals_cached",
+    "load_backtest_cached",
+    "load_global_signals_cached",
+    "stage_for_flush",
+    "stage_global_signals",
+    "inspect_cache_root",
 ]

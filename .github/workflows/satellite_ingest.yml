@@ -5,6 +5,9 @@ on:
   schedule:
     - cron: "0 */6 * * *"
 
+permissions:
+  contents: write
+
 concurrency:
   group: satellite-ingest
   cancel-in-progress: false
@@ -17,6 +20,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -35,3 +40,17 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}/dags
         run: |
           python satellite_ingest.py
+
+      - name: Commit updated universe state
+        if: success()
+        run: |
+          if git diff --quiet -- selected_universe.json; then
+            echo "No universe changes."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add selected_universe.json
+          git commit -m "Update satellite universe state"
+          git push
