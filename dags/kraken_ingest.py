@@ -190,7 +190,6 @@ def kraken_ingest():
     @task(execution_timeout=TASK_TIMEOUT, pool="ingest_pool", priority_weight=1)
     def consume_telegram_parquets() -> dict:
         token, chat_id = _get_telegram_token_and_chat_id()
-
         engine = get_engine(_db_uri())
         inbox = Path("/tmp/telegram_inbox")
         inbox.mkdir(parents=True, exist_ok=True)
@@ -223,7 +222,6 @@ def kraken_ingest():
                         or update.get("edited_channel_post")
                         or update.get("message")
                     )
-
                     if not post:
                         _write_cursor(update_id)
                         last_update_id = update_id
@@ -233,21 +231,12 @@ def kraken_ingest():
                     actual_id = str(chat.get("id"))
 
                     if actual_id != chat_id:
-                        if chat.get("type") == "private":
-                            logger.info("Ignoring private message from %s", actual_id)
-                        else:
-                            logger.info(
-                                "Ignoring update from different chat. expected=%s got=%s",
-                                chat_id,
-                                actual_id,
-                            )
                         _write_cursor(update_id)
                         last_update_id = update_id
                         continue
 
                     doc = post.get("document")
                     if not doc:
-                        logger.info("Update %s is not a document, skipping.", update_id)
                         _write_cursor(update_id)
                         last_update_id = update_id
                         continue
@@ -258,45 +247,68 @@ def kraken_ingest():
                         last_update_id = update_id
                         continue
 
-                    file_path = _telegram_get_file_path(token, doc["file_id"])
-                    local_path = inbox / file_name
-                    _telegram_download_file(token, file_path, local_path)
+                    try:
+                        # Download and read parquet
+                        file_path = _telegram_get_file_path(token, doc["file_id"])
+                        local_path = inbox / file_name
+                        _telegram_download_file(token, file_path, local_path)
 
-                    df = _read_parquet_file(local_path)
+                        df = _read_parquet_file(local_path)
 
-                    pair = str(df["pair"][0])
-                    interval_minutes = int(df["interval_minutes"][0])
-                    market_type = str(df["market_type"][0]).lower().strip()
+                        pair = str(df["pair"][0])
+                        interval_minutes = int(df["interval_minutes"][0])
+                        market_type = str(df["market_type"][0]).lower().strip()
 
-                    if market_type not in VALID_MARKET_TYPES:
-                        raise ValueError(f"Unsupported market_type in {file_name}: {market_type}")
+                        if market_type not in VALID_MARKET_TYPES:
+                            raise ValueError(f"Unsupported market_type in {file_name}: {market_type}")
 
-                    bulk_upsert_candles(
-                        engine=engine,
-                        df=df,
-                        pair=pair,
-                        interval_minutes=interval_minutes,
-                        market_type=market_type,
-                    )
+                        bulk_upsert_candles(
+                            engine=engine,
+                            df=df,
+                            pair=pair,
+                            interval_minutes=interval_minutes,
+                            market_type=market_type,
+                        )
 
-                    _telegram_delete_message(token, chat_id, int(post["message_id"]))
+                        _telegram_delete_message(token, chat_id, int(post["message_id"]))
 
-                    if interval_minutes == 5:
-                        affected_pairs.add(pair)
+                        if interval_minutes == 5:
+                            affected_pairs.add(pair)
 
-                    processed_messages.append(
-                        {
-                            "pair": pair,
-                            "interval_minutes": interval_minutes,
-                            "market_type": market_type,
-                            "message_id": int(post["message_id"]),
-                            "file_name": file_name,
-                            "rows": int(df.height),
-                        }
-                    )
+                        processed_messages.append(
+                            {
+                                "pair": pair,
+                                "interval_minutes": interval_minutes,
+                                "market_type": market_type,
+                                "message_id": int(post["message_id"]),
+                                "file_name": file_name,
+                                "rows": int(df.height),
+                            }
+                        )
 
-                    _write_cursor(update_id)
-                    last_update_id = update_id
+                        # ✅ Log success
+                        logger.info(
+                            "Successfully consumed parquet: %s | pair=%s | interval=%s | market_type=%s | rows=%d",
+                            file_name,
+                            pair,
+                            interval_minutes,
+                            market_type,
+                            df.height,
+                        )
+
+                    except Exception as e:
+                        # ❌ Log failure with file name and exception
+                        logger.error(
+                            "Failed to consume parquet: %s | update_id=%s | error=%s",
+                            file_name,
+                            update_id,
+                            e,
+                            exc_info=True,
+                        )
+
+                    finally:
+                        _write_cursor(update_id)
+                        last_update_id = update_id
 
                 finally:
                     if local_path is not None:

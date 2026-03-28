@@ -91,13 +91,11 @@ with DAG(
         funding_rate NUMERIC(12, 10), 
         spread REAL,         
         change_24h REAL,     
-        era_int BIGINT,
         is_outlier BOOLEAN DEFAULT FALSE,
         PRIMARY KEY (pair, market_type, time)
     );
 
         CREATE INDEX IF NOT EXISTS ix_dfmain_pair_time_ns ON df_main (pair, time_ns);
-        CREATE INDEX IF NOT EXISTS ix_dfmain_era ON df_main (era_int);
 
         CREATE TABLE IF NOT EXISTS signal_state_latest (
         pair TEXT NOT NULL,

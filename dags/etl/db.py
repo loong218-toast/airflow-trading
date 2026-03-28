@@ -67,6 +67,9 @@ def bulk_upsert_candles(engine: Engine, df, pair: str, interval_minutes: int, ma
     if missing:
         raise ValueError(f"Missing required columns for {pair} ({market_type}): {sorted(missing)}")
 
+    if "era_int" in df.columns:
+        df = df.drop("era_int")
+
     df = df.with_columns([
         pl.lit(pair).alias("pair"),
         pl.lit(int(interval_minutes)).alias("interval_minutes"),
@@ -163,11 +166,13 @@ def save_df_to_sql(engine: Engine, df, pair: str, table_name: str = "df_main") -
     # Build column defs for temp table creation
     col_defs = []
     for col in df.columns:
+        if col == "era_int":
+            continue  # skip
         if col in ("pair", "market_type"):
             col_defs.append(f"{col} TEXT")
         elif col == "time":
             col_defs.append("time TIMESTAMPTZ")
-        elif col.endswith("_ns") or col in ("time_ns", "era_int"):
+        elif col.endswith("_ns"):
             col_defs.append(f"{col} BIGINT")
         elif col == "is_outlier":
             col_defs.append(f"{col} BOOLEAN")

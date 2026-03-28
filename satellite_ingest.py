@@ -30,6 +30,17 @@ KRAKEN_FUTURES_BASE = "https://futures.kraken.com"
 
 VALID_MARKET_TYPES = {"spot", "future", "xstock"}
 
+def escape_md(text: Any) -> str:
+    if text is None:
+        return ""
+    return (
+        str(text)
+        .replace("_", "\\_")
+        .replace("*", "\\*")
+        .replace("[", "\\[")
+        .replace("]", "\\]")
+        .replace("`", "\\`")
+    )
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()

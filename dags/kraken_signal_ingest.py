@@ -105,7 +105,7 @@ def _load_recent_df_main(pair: str, market_type: str, limit_rows: int) -> pl.Dat
     query = """
         SELECT
             pair, market_type, time, time_ns, open, high, low, close,
-            volume, funding_rate, spread, era_int
+            volume, funding_rate, spread
         FROM df_main
         WHERE pair = $1 AND market_type = $2
         ORDER BY time_ns DESC
@@ -138,7 +138,6 @@ def _load_recent_df_main(pair: str, market_type: str, limit_rows: int) -> pl.Dat
         pl.col("volume").cast(pl.Float32),
         pl.col("spread").cast(pl.Float32),
         pl.col("funding_rate").cast(pl.Float32),
-        pl.col("era_int").cast(pl.Int64),
     ]).sort("time").with_row_index("idx")
 
 def _build_live_signal_frame(
@@ -303,6 +302,11 @@ def kraken_signal_ingest():
                 "reason": "no latest signal",
             }
 
+        latest = latest.with_columns([
+            pl.lit(pair).alias("pair"),
+            pl.lit(market_type).alias("market_type"),
+        ])
+
         rows = latest.select(["pair", "market_type", "time_ns", "side", "regime_id", "idx"]).to_dicts()
 
         return {
@@ -320,7 +324,7 @@ def kraken_signal_ingest():
             return {"sent": False, "count": 0}
 
         token = os.getenv("TG_BOT_TOKEN_SIGNAL")
-        chat_id = os.getenv("TG_CHAT_ID")
+        chat_id = os.getenv("TG_SIGNAL_CHANNEL_ID")
 
         all_rows = []
         for r in valid:
