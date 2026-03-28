@@ -501,6 +501,52 @@ def normalize_to_ns(df):
     df["time_ns"] = df["time_ns"].astype("int64")
     return df
 
+def get_pinned_message(token: str, chat_id: str) -> dict | None:
+    url = f"https://api.telegram.org/bot{token}/getChat"
+    r = requests.get(url, params={"chat_id": chat_id}, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    if not data.get("ok"):
+        return None
+    return data["result"].get("pinned_message")
+
+
+def pin_message(token: str, chat_id: str, message_id: int, disable_notification: bool = True):
+    url = f"https://api.telegram.org/bot{token}/pinChatMessage"
+    r = requests.post(url, data={
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "disable_notification": str(disable_notification).lower()
+    }, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+
+def send_or_update_instruments(token: str, chat_id: str, text: str) -> int:
+    pinned = get_pinned_message(token, chat_id)
+    if pinned:
+        message_id = pinned["message_id"]
+        url = f"https://api.telegram.org/bot{token}/editMessageText"
+        r = requests.post(url, data={
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+            "parse_mode": "Markdown"
+        }, timeout=10)
+        r.raise_for_status()
+        return message_id
+    else:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        r = requests.post(url, data={
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "Markdown"
+        }, timeout=10)
+        r.raise_for_status()
+        message_id = r.json()["result"]["message_id"]
+        pin_message(token, chat_id, message_id)
+        return message_id
+
 
 def main() -> None:
     token = os.environ["TG_BOT_TOKEN"]
@@ -594,6 +640,12 @@ def main() -> None:
                 print(f"failed {pair} {market_type} {interval}: {e}")
                 time.sleep(delay_seconds)
                 continue
+
+    universe_text = "\n".join(
+        f"- {escape_md(item['pair'])} | {escape_md(item['market_type'])} | source: {escape_md(item['source'])}" 
+        for item in universe
+    )
+    send_or_update_instruments(token, chat_id, f"*Current Selected Instruments:*\n{universe_text}")
 
     atomic_write_json(manifest_path, sent_manifest)
 
