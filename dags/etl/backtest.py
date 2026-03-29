@@ -1,7 +1,5 @@
 # etl/backtest.py
 """
-Backtest numeric kernels focused on close-price only.
-
 - Uses close series only for hit detection (no high/low).
 - Memory-conscious: accept numpy arrays, use np.asarray for cheap view/cast.
 - Numba kernels compiled with cache; the per-signal kernel avoids parfor compile pitfalls.
@@ -9,48 +7,10 @@ Backtest numeric kernels focused on close-price only.
 
 from typing import Dict, Optional, Tuple
 import numpy as np
-from numba import njit, prange
+from numba import njit
 
+from etl.grid_row_builders import _make_master_row
 from etl.feature_helpers import get_ma_price_gaps_for_indices
-
-
-def _make_master_row(
-    regime_id: int,
-    era_int: int,
-    side_flag: int,
-    sl_val: float,
-    tp_val: float,
-    total_pos: int,
-    win_pos: int,
-    balance: float,
-    max_dd: float,
-    regime_cfg: dict,
-) -> dict:
-    return {
-        "balance": float(balance),
-        "SL": float(sl_val),
-        "TP": float(tp_val),
-        "win_pos": int(win_pos),
-        "total_pos": int(total_pos),
-        "side": int(side_flag),
-        "exit_window_h": int(regime_cfg.get("exit_window_h", 0)),
-        "era_int": int(era_int),
-        "regime_id": int(regime_id),
-        "ma_int": int(regime_cfg.get("ma_int", 0)),
-        "ma_reversion": bool(regime_cfg.get("ma_reversion", False)),
-        "entry_lookback_units": int(regime_cfg.get("entry_lookback_units", 0)),
-        "use_bbw": bool(regime_cfg.get("use_bbw", False)),
-        "bbw_periods": int(regime_cfg.get("bbw_periods", 0)),
-        "bbw_std": float(regime_cfg.get("bbw_std", 0.0)),
-        "bbw_thresholds": int(regime_cfg.get("bbw_thresholds", 0)),
-        "use_stochastic": bool(regime_cfg.get("use_stochastic", False)),
-        "stoch_key": str(regime_cfg.get("stoch_key", "OFF")),
-        "use_sl_decay": bool(regime_cfg.get("use_sl_decay", False)),
-        "sl_decay_pct": float(regime_cfg.get("sl_decay_pct", 0.0)),
-        "sl_decay_interval": int(regime_cfg.get("sl_decay_interval", 0)),
-        "sl_decay_stop_at_pos": bool(regime_cfg.get("sl_decay_stop_at_pos", True)),
-        "max_drawdown": float(max_dd),
-    }
 
 # -------------------------
 # small helpers
@@ -262,15 +222,24 @@ def compute_pnl_pct_vectorized(
 # -------------------------
 # backtest kernel (numba) - CLOSE-only per-signal (no parallel transform)
 # -------------------------
-# etl/backtest.py
 @njit(cache=True)
-def _backtest_kernel_close_only(
+def _backtest_kernel_ohlc(
     close_f64,
-    entry_idx_i64, entry_price_f64, side_i8,
-    sl_f64, tp_f64, sl_tp_in_pct_bool,
-    window_bars_i64, spread_f64,
-    conservative_sl_first_bool, treat_no_hit_as_loss_bool,
-    use_sl_decay_bool, sl_decay_pct_f64, sl_decay_interval_i64, sl_decay_stop_at_pos_bool
+    high_f64,
+    low_f64,
+    entry_idx_i64,
+    entry_price_f64,
+    side_i8,
+    sl_f64,
+    tp_f64,
+    sl_tp_in_pct_bool,
+    window_bars_i64,
+    spread_f64,
+    conservative_sl_first_bool,
+    use_sl_decay_bool,
+    sl_decay_pct_f64,
+    sl_decay_interval_i64,
+    sl_decay_stop_at_pos_bool,
 ):
     n_rows = close_f64.shape[0]
     n_signals = entry_idx_i64.shape[0]
@@ -280,14 +249,11 @@ def _backtest_kernel_close_only(
     for i in range(n_signals):
         entry_idx = int(entry_idx_i64[i])
         if entry_idx < 0 or entry_idx >= n_rows:
-            rets[i] = 0.0
-            exit_idx[i] = -1
             continue
 
         entry_price = float(entry_price_f64[i])
         side = int(side_i8[i])
 
-        # base SL / TP
         if sl_tp_in_pct_bool:
             if side == 1:
                 tp_price = entry_price * (1.0 + tp_f64 / 100.0)
@@ -303,7 +269,6 @@ def _backtest_kernel_close_only(
                 tp_price = entry_price - tp_f64
                 sl_price = entry_price + sl_f64
 
-        # spread adjustment
         if spread_f64 != 0.0:
             if side == 1:
                 tp_price_adj = tp_price - (spread_f64 / 2.0)
@@ -328,100 +293,71 @@ def _backtest_kernel_close_only(
 
         j = entry_idx + 1
 
-        if conservative_sl_first_bool:
+        while j <= max_j:
+            hi = high_f64[j]
+            lo = low_f64[j]
+
+            current_sl_price = sl_price_adj
+            if use_sl_decay_bool and sl_decay_interval_i64 > 0 and sl_decay_pct_f64 > 0.0:
+                elapsed = j - entry_idx
+                if elapsed >= sl_decay_interval_i64:
+                    steps = elapsed // sl_decay_interval_i64
+                    move = base_sl_dist * sl_decay_pct_f64 * float(steps)
+
+                    if side == 1:
+                        current_sl_price = sl_price_adj + move
+                        if sl_decay_stop_at_pos_bool and current_sl_price > entry_price:
+                            current_sl_price = entry_price
+                    else:
+                        current_sl_price = sl_price_adj - move
+                        if sl_decay_stop_at_pos_bool and current_sl_price < entry_price:
+                            current_sl_price = entry_price
+
             if side == 1:
-                while j <= max_j:
-                    c = close_f64[j]
+                hit_sl = lo <= current_sl_price
+                hit_tp = hi >= tp_price_adj
 
-                    current_sl_price = sl_price_adj
-                    if use_sl_decay_bool and sl_decay_interval_i64 > 0 and sl_decay_pct_f64 > 0.0:
-                        elapsed = j - entry_idx
-                        if elapsed >= sl_decay_interval_i64:
-                            steps = elapsed // sl_decay_interval_i64
-                            move = base_sl_dist * sl_decay_pct_f64 * float(steps)
-                            current_sl_price = sl_price_adj + move
-                            if sl_decay_stop_at_pos_bool and current_sl_price > entry_price:
-                                current_sl_price = entry_price
-
-                    if c <= current_sl_price:
-                        exit_at = j
+                if hit_sl and hit_tp:
+                    if conservative_sl_first_bool:
                         ret = (current_sl_price - entry_price) / entry_price
-                        break
-                    if c >= tp_price_adj:
-                        exit_at = j
+                    else:
                         ret = (tp_price_adj - entry_price) / entry_price
-                        break
-                    j += 1
+                    exit_at = j
+                    break
+
+                if hit_tp:
+                    exit_at = j
+                    ret = (tp_price_adj - entry_price) / entry_price
+                    break
+
+                if hit_sl:
+                    exit_at = j
+                    ret = (current_sl_price - entry_price) / entry_price
+                    break
+
             else:
-                while j <= max_j:
-                    c = close_f64[j]
+                hit_sl = hi >= current_sl_price
+                hit_tp = lo <= tp_price_adj
 
-                    current_sl_price = sl_price_adj
-                    if use_sl_decay_bool and sl_decay_interval_i64 > 0 and sl_decay_pct_f64 > 0.0:
-                        elapsed = j - entry_idx
-                        if elapsed >= sl_decay_interval_i64:
-                            steps = elapsed // sl_decay_interval_i64
-                            move = base_sl_dist * sl_decay_pct_f64 * float(steps)
-                            current_sl_price = sl_price_adj - move
-                            if sl_decay_stop_at_pos_bool and current_sl_price < entry_price:
-                                current_sl_price = entry_price
-
-                    if c >= current_sl_price:
-                        exit_at = j
+                if hit_sl and hit_tp:
+                    if conservative_sl_first_bool:
                         ret = (entry_price - current_sl_price) / entry_price
-                        break
-                    if c <= tp_price_adj:
-                        exit_at = j
+                    else:
                         ret = (entry_price - tp_price_adj) / entry_price
-                        break
-                    j += 1
-        else:
-            if side == 1:
-                while j <= max_j:
-                    c = close_f64[j]
+                    exit_at = j
+                    break
 
-                    current_sl_price = sl_price_adj
-                    if use_sl_decay_bool and sl_decay_interval_i64 > 0 and sl_decay_pct_f64 > 0.0:
-                        elapsed = j - entry_idx
-                        if elapsed >= sl_decay_interval_i64:
-                            steps = elapsed // sl_decay_interval_i64
-                            move = base_sl_dist * sl_decay_pct_f64 * float(steps)
-                            current_sl_price = sl_price_adj + move
-                            if sl_decay_stop_at_pos_bool and current_sl_price > entry_price:
-                                current_sl_price = entry_price
+                if hit_tp:
+                    exit_at = j
+                    ret = (entry_price - tp_price_adj) / entry_price
+                    break
 
-                    if c >= tp_price_adj:
-                        exit_at = j
-                        ret = (tp_price_adj - entry_price) / entry_price
-                        break
-                    if c <= current_sl_price:
-                        exit_at = j
-                        ret = (current_sl_price - entry_price) / entry_price
-                        break
-                    j += 1
-            else:
-                while j <= max_j:
-                    c = close_f64[j]
+                if hit_sl:
+                    exit_at = j
+                    ret = (entry_price - current_sl_price) / entry_price
+                    break
 
-                    current_sl_price = sl_price_adj
-                    if use_sl_decay_bool and sl_decay_interval_i64 > 0 and sl_decay_pct_f64 > 0.0:
-                        elapsed = j - entry_idx
-                        if elapsed >= sl_decay_interval_i64:
-                            steps = elapsed // sl_decay_interval_i64
-                            move = base_sl_dist * sl_decay_pct_f64 * float(steps)
-                            current_sl_price = sl_price_adj - move
-                            if sl_decay_stop_at_pos_bool and current_sl_price < entry_price:
-                                current_sl_price = entry_price
-
-                    if c <= tp_price_adj:
-                        exit_at = j
-                        ret = (entry_price - tp_price_adj) / entry_price
-                        break
-                    if c >= current_sl_price:
-                        exit_at = j
-                        ret = (entry_price - current_sl_price) / entry_price
-                        break
-                    j += 1
+            j += 1
 
         if exit_at == -1:
             last_idx = min(entry_idx + int(window_bars_i64), n_rows - 1)
@@ -596,6 +532,8 @@ def precompute_kernel_arrays(df_main, side_df, exit_window_h: int, base_minutes:
 # -------------------------
 def backtest_from_arrays(
     close: np.ndarray,
+    high: np.ndarray,
+    low: np.ndarray,
     entry_idx_arr: np.ndarray,
     entry_price_arr: np.ndarray,
     side_arr: np.ndarray,
@@ -605,33 +543,45 @@ def backtest_from_arrays(
     window_bars: int = -1,
     spread: float = 0.0,
     conservative_sl_first: bool = True,
-    treat_no_hit_as_loss: bool = True,
     use_sl_decay: bool = False,
     sl_decay_pct: float = 0.0,
     sl_decay_interval: int = 0,
     sl_decay_stop_at_pos: bool = True,
 ) -> Dict:
     close = np.asarray(close, dtype=np.float64)
+    high = np.asarray(high, dtype=np.float64)
+    low = np.asarray(low, dtype=np.float64)
     entry_idx_arr = np.asarray(entry_idx_arr, dtype=np.int64)
     entry_price_arr = np.asarray(entry_price_arr, dtype=np.float64)
     side_arr = np.asarray(side_arr, dtype=np.int8)
 
-    rets, exit_idx = _backtest_kernel_close_only(
+    rets, exit_idx = _backtest_kernel_ohlc(
         close,
-        entry_idx_arr, entry_price_arr, side_arr,
-        float(sl), float(tp), bool(sl_tp_in_pct),
-        int(window_bars), float(spread),
-        bool(conservative_sl_first), bool(treat_no_hit_as_loss),
-        bool(use_sl_decay), float(sl_decay_pct), int(sl_decay_interval), bool(sl_decay_stop_at_pos),
+        high,
+        low,
+        entry_idx_arr,
+        entry_price_arr,
+        side_arr,
+        float(sl),
+        float(tp),
+        bool(sl_tp_in_pct),
+        int(window_bars),
+        float(spread),
+        bool(conservative_sl_first),
+        bool(use_sl_decay),
+        float(sl_decay_pct),
+        int(sl_decay_interval),
+        bool(sl_decay_stop_at_pos),
     )
 
     return {"rets": rets, "exit_idx": exit_idx, "entry_idx": entry_idx_arr}
 
 # -------------------------
 # public wrapper (compatible signature)
-# -------------------------
 def backtest_signals_sl_tp_rets(
     main_close_arr: np.ndarray,
+    main_high_arr: np.ndarray,
+    main_low_arr: np.ndarray,
     main_time_ns_arr: np.ndarray,
     sig_idxs: np.ndarray,
     sl: float = 0.0,
@@ -641,7 +591,6 @@ def backtest_signals_sl_tp_rets(
     base_minutes: int = 5,
     spread: float = 0.0,
     conservative_sl_first: bool = True,
-    treat_no_hit_as_loss: bool = True,
     side_flag: int = 1,
     use_sl_decay: bool = False,
     sl_decay_pct: float = 0.0,
@@ -665,6 +614,8 @@ def backtest_signals_sl_tp_rets(
 
     return backtest_from_arrays(
         close=main_close_arr,
+        high=main_high_arr,
+        low=main_low_arr,
         entry_idx_arr=sig_idxs.astype(np.int64),
         entry_price_arr=entry_price_arr,
         side_arr=side_arr,
@@ -674,7 +625,6 @@ def backtest_signals_sl_tp_rets(
         window_bars=window_bars,
         spread=spread,
         conservative_sl_first=conservative_sl_first,
-        treat_no_hit_as_loss=treat_no_hit_as_loss,
         use_sl_decay=use_sl_decay,
         sl_decay_pct=sl_decay_pct,
         sl_decay_interval=sl_decay_interval,
@@ -684,47 +634,46 @@ def backtest_signals_sl_tp_rets(
 # -------------------------
 # helper: warmup - compile numba functions ahead of time
 # -------------------------
-def warmup_numba_kernels():
-    """
-    Run kernels with tiny arrays to trigger numba compilation in advance.
-    Call once before spawning worker processes.
-    """
-    n = 32
-    close = np.ones(n, dtype=np.float64)
-    entry_idxs = np.zeros(4, dtype=np.int64)
-    entry_prices = np.ones(4, dtype=np.float64)
-    sides = np.ones(4, dtype=np.int8)
+# def warmup_numba_kernels():
+#     n = 32
+#     close = np.ones(n, dtype=np.float64)
+#     high = np.ones(n, dtype=np.float64) * 1.01
+#     low = np.ones(n, dtype=np.float64) * 0.99
+#     entry_idxs = np.zeros(4, dtype=np.int64)
+#     entry_prices = np.ones(4, dtype=np.float64)
+#     sides = np.ones(4, dtype=np.int8)
 
-    _ = _backtest_kernel_close_only(
-        close,
-        entry_idxs,
-        entry_prices,
-        sides,
-        1.0,    # sl_f64
-        2.0,    # tp_f64
-        True,   # sl_tp_in_pct_bool
-        10,     # window_bars_i64
-        0.0,    # spread_f64
-        True,   # conservative_sl_first_bool
-        True,   # treat_no_hit_as_loss_bool
-        False,  # use_sl_decay_bool
-        0.0,    # sl_decay_pct_f64
-        0,      # sl_decay_interval_i64
-        True,   # sl_decay_stop_at_pos_bool
-    )
+#     _ = _backtest_kernel_ohlc(
+#         close,
+#         high,
+#         low,
+#         entry_idxs,
+#         entry_prices,
+#         sides,
+#         1.0,
+#         2.0,
+#         True,
+#         10,
+#         0.0,
+#         True,
+#         False,
+#         0.0,
+#         0,
+#         True,
+#     )
 
-    _ = _compute_windows_numba(close, np.arange(n, dtype=np.int64), entry_idxs, np.int32(4))
+#     _ = _compute_windows_numba(close, np.arange(n, dtype=np.int64), entry_idxs, np.int32(4))
 
-    _ = _grid_kernel_numba(
-        close.astype(np.float32),
-        close.astype(np.float32),
-        close.astype(np.float32),
-        np.arange(n, dtype=np.int64),
-        np.arange(n, dtype=np.int64),
-        np.array([1.0], dtype=np.float32),
-        np.array([2.0], dtype=np.float32),
-        np.float32(0.0),
-        np.float32(1.0),
-        np.int32(0),
-        np.int32(1),
-    )
+#     _ = _grid_kernel_numba(
+#         close.astype(np.float32),
+#         close.astype(np.float32),
+#         close.astype(np.float32),
+#         np.arange(n, dtype=np.int64),
+#         np.arange(n, dtype=np.int64),
+#         np.array([1.0], dtype=np.float32),
+#         np.array([2.0], dtype=np.float32),
+#         np.float32(0.0),
+#         np.float32(1.0),
+#         np.int32(0),
+#         np.int32(1),
+#     )

@@ -32,13 +32,11 @@ from airflow.exceptions import AirflowFailException
 
 from etl.transform import build_df_main_from_5m_polars, load_candles_from_db_polars
 from etl.feature_helpers import (
-    precompute_all_possible_features,
     normalize_signals_times,
     generate_filtered_signals,
-    selected_gap_col_for_ma_int,
     get_ma_price_gaps_for_indices,
-    add_volatility_index_features,
-    get_volatility_index_for_indices
+    add_regime_amp_index_features,
+    get_regime_amp_index_for_indices,
 )
 from etl.db import get_engine
 
@@ -46,8 +44,7 @@ from etl.backtest import (
     backtest_signals_sl_tp_rets,
     fast_compound_equity,
     fast_compound_equity_gate,
-    compute_pnl_pct_vectorized,
-    warmup_numba_kernels,
+    compute_pnl_pct_vectorized
 )
 
 from etl.cache import (
@@ -65,6 +62,10 @@ from etl.master_io_utils import (
     buffer_master_row,
     _flush_master_rows_buffer,
 )
+
+from etl.profiling import maybe_profile
+
+from etl.grid_row_builders import _make_master_row
 
 from etl.schema import enforce_schema, get_schema, cast_to_schema, classify_fragment
 
@@ -154,203 +155,6 @@ def _split_period_windows_from_pl(
         cur = end
 
     return windows
-
-def _list(x, default):
-    if x is None:
-        return list(default)
-    if isinstance(x, list):
-        return x
-    if isinstance(x, tuple):
-        return list(x)
-    return [x]
-
-def _stoch_opts(cfg, use_stoch_list):
-    out = []
-
-    ks = _list(cfg.get("stoch_k"), [12]) if "stoch_k" in cfg else _list(cfg.get("k"), [12])
-    ds = _list(cfg.get("stoch_d"), [3]) if "stoch_d" in cfg else _list(cfg.get("d"), [3])
-    ss = _list(cfg.get("stoch_s"), [3]) if "stoch_s" in cfg else _list(cfg.get("s"), [3])
-    ths = _list(cfg.get("stoch_thresholds"), [[20, 80]]) if "stoch_thresholds" in cfg else _list(cfg.get("thresholds"), [[20, 80]])
-
-    for use_stoch in use_stoch_list:
-        if not use_stoch:
-            out.append({
-                "use_stochastic": False,
-                "stoch_key": "OFF",
-                "col": None,
-                "low": None,
-                "high": None,
-            })
-            continue
-
-        for k, d, s, t in product(ks, ds, ss, ths):
-            if not isinstance(t, (list, tuple)) or len(t) != 2:
-                raise ValueError(f"Invalid stoch_threshold entry: {t!r}")
-
-            low = float(t[0])
-            high = float(t[1])
-
-            out.append({
-                "use_stochastic": True,
-                "stoch_key": f"k{k}_d{d}_s{s}_l{low:g}_u{high:g}",
-                "col": f"stoch_k{k}_d{d}_s{s}",
-                "low": low,
-                "high": high,
-            })
-
-    return out
-
-def _bbw_opts(cfg, use_bbw_list):
-    out = []
-
-    periods = [int(x) for x in _list(cfg.get("bbw_periods"), [96]) if int(x) > 0]
-    stds = [float(x) for x in _list(cfg.get("bbw_std"), [2.5])]
-    ths = [float(x) for x in _list(cfg.get("bbw_thresholds"), [50])]
-
-    for use_bbw in use_bbw_list:
-        if not use_bbw:
-            out.append({
-                "use_bbw": False,
-                "bbw_periods": 0,
-                "bbw_std": 0.0,
-                "bbw_thresholds": 0.0,
-            })
-            continue
-
-        for p, s, t in product(periods, stds, ths):
-            out.append({
-                "use_bbw": True,
-                "bbw_periods": p,
-                "bbw_std": s,
-                "bbw_thresholds": t,
-            })
-
-    return out
-
-def _write_batch(path: Path, batch_id: int, rows: list[dict]) -> None:
-    with open(path, "w", encoding="utf8") as f:
-        json.dump({"batch_id": batch_id, "regimes": rows}, f, indent=2)
-
-def generate_configs(session_dir: Path, run_cfg: dict) -> list[Path]:
-    cfg_dir = session_dir / "configs"
-    cfg_dir.mkdir(parents=True, exist_ok=True)
-
-    exit_windows = _list(run_cfg.get("exit_windows"), [24])
-    lookbacks = _list(run_cfg.get("entry_lookback_units"), [24])
-
-    sl_vals, tp_vals = _expand_sl_tp(run_cfg)
-    combos = _prune_by_min_rr(sl_vals, tp_vals, float(run_cfg.get("min_rr", 3.0)))
-
-    ma_periods = run_cfg.get("ma_periods", []) or []
-    if not isinstance(ma_periods, list):
-        ma_periods = list(ma_periods)
-
-    ma_periods_sorted = sorted({int(x) for x in ma_periods})
-    n_bits = len(ma_periods_sorted)
-    max_ma_int = (1 << n_bits) if n_bits > 0 else 1
-
-    ma_reversion_list = _list(run_cfg.get("ma_reversion"), [False])
-    use_stoch_list = _list(run_cfg.get("use_stochastic"), [False, True])
-    use_bbw_list = _list(run_cfg.get("use_bbw"), [False, True])
-
-    stoch_opts = _stoch_opts(run_cfg, use_stoch_list)
-    bbw_opts = _bbw_opts(run_cfg, use_bbw_list)
-
-    use_sl_decay_list = _list(run_cfg.get("use_sl_decay"), [False])
-    sl_decay_pct_list = _list(run_cfg.get("sl_decay_pct"), [0.0])
-    sl_decay_interval_list = _list(run_cfg.get("sl_decay_interval"), [12])
-    sl_decay_stop_at_pos_list = _list(run_cfg.get("sl_decay_stop_at_pos"), [True])
-
-    all_regime_configs = []
-    idx = 0
-
-    for ma_rev in ma_reversion_list:
-        for ma_int in range(0, max_ma_int):
-            for st in stoch_opts:
-                for bw in bbw_opts:
-                    for lb_h in lookbacks:
-                        for exit_h in exit_windows:
-                            for use_decay in use_sl_decay_list:
-                                for decay_pct in sl_decay_pct_list:
-                                    for decay_interval in sl_decay_interval_list:
-                                        for decay_stop in sl_decay_stop_at_pos_list:
-                                            regime = {
-                                                "regime_id": f"{idx:05d}",
-                                                "ma_int": int(ma_int),
-                                                "ma_reversion": bool(ma_rev),
-                                                "use_stochastic": bool(st["use_stochastic"]),
-                                                "stoch_key": st["stoch_key"],
-                                                "stoch_col": st["col"],
-                                                "stoch_lower": st["low"],
-                                                "stoch_upper": st["high"],
-                                                "use_bbw": bool(bw["use_bbw"]),
-                                                "bbw_periods": int(bw["bbw_periods"]),
-                                                "bbw_std": float(bw["bbw_std"]),
-                                                "bbw_thresholds": float(bw["bbw_thresholds"]),
-                                                "entry_lookback_units": int(lb_h),
-                                                "exit_window_h": int(exit_h),
-                                                "ma_periods": ma_periods_sorted,
-                                                "use_sl_decay": bool(use_decay),
-                                                "sl_decay_pct": float(decay_pct),
-                                                "sl_decay_interval": int(decay_interval),
-                                                "sl_decay_stop_at_pos": bool(decay_stop),
-                                            }
-                                            all_regime_configs.append(regime)
-                                            idx += 1
-
-    total_regimes = len(all_regime_configs)
-    batch_size = int(run_cfg.get("BATCH_SIZE", 150))
-    saved_batch_paths = []
-
-    logger.info("=" * 60)
-    logger.info("🚀 GRID CONFIG GENERATION (BATCH MODE)")
-    logger.info("📈 Total Unique Regimes: %d", total_regimes)
-    logger.info("📦 Batch Size: %d | Expected Tasks: %d", batch_size, math.ceil(total_regimes / batch_size))
-    logger.info("🧪 SL/TP combos per regime: %d", len(combos))
-    logger.info("📊 Total Backtests to be run: %d", total_regimes * len(combos))
-    logger.info("=" * 60)
-
-    for i in range(0, total_regimes, batch_size):
-        batch_slice = all_regime_configs[i : i + batch_size]
-        batch_num = i // batch_size
-        batch_payload = {"batch_id": batch_num, "regimes": batch_slice}
-        batch_filename = cfg_dir / f"batch_{batch_num:04d}.json"
-
-        with open(batch_filename, "w", encoding="utf8") as f:
-            json.dump(batch_payload, f, indent=2)
-
-        saved_batch_paths.append(batch_filename)
-        if len(saved_batch_paths) % 20 == 0 or i + batch_size >= total_regimes:
-            logger.info("📝 Written %d batch files...", len(saved_batch_paths))
-
-    return saved_batch_paths
-
-def list_pending_config_paths(session_dir: Path) -> List[str]:
-    cfg_dir = session_dir / "configs"
-    results_dir = session_dir / "results"
-    batch_files = sorted(cfg_dir.glob("batch_*.json"))
-    pending_batches = []
-
-    for batch_path in batch_files:
-        try:
-            with open(batch_path, "r", encoding="utf8") as f:
-                batch_data = json.load(f)
-
-            regimes = batch_data.get("regimes", [])
-
-            is_batch_complete = True
-            for r in regimes:
-                regime_id = r.get("regime_id")
-                result_file = results_dir / f"cfg_{regime_id}_summary.json"
-                if not result_file.exists():
-                    is_batch_complete = False
-                    break
-            if not is_batch_complete:
-                pending_batches.append(str(batch_path))
-        except Exception:
-            pending_batches.append(str(batch_path))
-    logger.info("🔍 Checked %d batches: %d still pending.", len(batch_files), len(pending_batches))
-    return pending_batches
 
 class EquityStager:
     """
@@ -569,127 +373,43 @@ def _to_numpy_ensure(arr_series: pl.Series, dtype):
     return a
 
 def prepare_worker_data(session_dir: Path, run_cfg: dict):
-    base_file = Path(FULL_LAKE_DIR) / "base_data_full.parquet"
-    if not base_file.exists():
-        raise RuntimeError(f"Base data file not found at {base_file}")
+    from etl.feature_prep import load_prepared_feature_ref
 
-    # Read once (collect) then normalize
-    logger.debug("prepare_worker_data: reading base file %s", str(base_file))
-    df_main = pl.read_parquet(str(base_file))
+    session_dir = Path(session_dir)
 
-    df_main = df_main.sort("time")
+    ref = load_prepared_feature_ref(session_dir)
+    prepared_path = Path(ref["parquet_path"])
+    if not prepared_path.exists():
+        raise RuntimeError(f"Prepared feature parquet missing at {prepared_path}")
 
-    # Normalize core columns and types
-    norm_exprs = []
-    if "time" in df_main.columns:
-        norm_exprs.append(pl.col("time").dt.replace_time_zone(None).alias("time"))
-    if "time_ns" in df_main.columns:
-        norm_exprs.append(pl.col("time_ns").cast(pl.Int64).alias("time_ns"))
-    else:
-        if "time" in df_main.columns:
-            norm_exprs.append(pl.col("time").cast(pl.Datetime("ns")).cast(pl.Int64).alias("time_ns"))
-    if "close" in df_main.columns:
-        norm_exprs.append(pl.col("close").cast(pl.Float32).alias("close"))
-    else:
-        raise RuntimeError("df_main missing required 'close' column")
-    norm_exprs.append(
-        pl.col("spread").fill_null(0.0).cast(pl.Float32).alias("spread")
-        if "spread" in df_main.columns
-        else pl.lit(0.0).cast(pl.Float32).alias("spread")
-    )
-    norm_exprs.append(
-        pl.col("funding_rate").fill_null(0.0).cast(pl.Float32).alias("funding_rate")
-        if "funding_rate" in df_main.columns
-        else pl.lit(0.0).cast(pl.Float32).alias("funding_rate")
-    )
+    df_main = pl.read_parquet(str(prepared_path))
 
-    df_main = df_main.with_columns(norm_exprs).with_row_count("idx").with_columns(pl.col("idx").cast(pl.Int64))
+    run_cfg["lookback_map"] = dict(ref.get("lookback_map", {}))
+    run_cfg["ma_cols"] = list(ref.get("ma_cols", []))
+    run_cfg["stoch_cols"] = list(ref.get("stoch_cols", []))
+    run_cfg["bbw_cols"] = list(ref.get("bbw_cols", []))
+    run_cfg["feature_cache_path"] = str(prepared_path)
 
-    # Downcast any Float64 to Float32
-    float64_cols = [c for c, dt in df_main.schema.items() if dt == pl.Float64]
-    if float64_cols:
-        df_main = df_main.with_columns([pl.col(c).cast(pl.Float32) for c in float64_cols])
+    base_cols = {
+        "pair", "market_type", "time", "time_ns", "open", "high", "low",
+        "close", "volume", "funding_rate", "spread", "era_int", "idx",
+    }
 
-    try:
-        # Keep feature columns: non-strict enforcement (casts base cols but keeps extras)
-        df_main = enforce_schema(df_main, "df_main", strict=False)
-    except Exception as e:
-        logger.error(f"CRITICAL: enforce_schema failed: {e}")
-        raise
-
-    base_cols = set(df_main.columns)
-
-    # --- IMPORTANT: call the single-source precompute function to *add feature cols* ---
-    # precompute_all_possible_features is the canonical place that creates ma_a/ma_b, pct_d_slow, breakout_Xh, etc.
-    # prepare_worker_data should call it so df_main contains the precomputed feature columns.
-    df_main, updated_cfg = precompute_all_possible_features(df_main, run_cfg)
-    run_cfg["lookback_map"] = updated_cfg.get("lookback_map")
-
-    df_main = add_volatility_index_features(df_main, run_cfg)
-    logger.debug("prepare_worker_data: after precompute cols=%s", df_main.columns)
-
-    # feature columns are anything not in DF_MAIN base set
-    feature_cols = [c for c in df_main.columns if c not in base_cols]
-
-    # Ensure numeric columns are Float32 to save memory
-    df_main = df_main.with_columns(
-        [pl.col(c).cast(pl.Float32) for c in df_main.columns if df_main.schema[c] in (pl.Float64, pl.Float32)]
-    )
-
-    logger.info(
-        "prepare_worker_data: df_main rows=%d cols=%d sample_cols=%s",
-        int(df_main.height),
-        len(df_main.columns),
-        df_main.columns[:20],
-    )
-
-    # ---------------------
-    # Load lookback_map (HOURS) — MUST be produced by precompute step (no worker computation)
-    #   - Try run_cfg["lookback_map"], then session_dir/lookback_map.json.
-    #   - If missing, fail loudly and instruct operator to run precompute stage.
-    # ---------------------
-    lookback_map = None
-    if "lookback_map" in run_cfg and isinstance(run_cfg["lookback_map"], dict) and run_cfg["lookback_map"]:
-        lookback_map = dict(run_cfg["lookback_map"])
-    else:
-        lb_file = Path(session_dir) / "lookback_map.json"
-        if lb_file.exists():
-            try:
-                lookback_map = json.loads(lb_file.read_text(encoding="utf8"))
-            except Exception as e:
-                logger.exception("Failed to read lookback_map from %s: %s", lb_file, e)
-                lookback_map = None
-
-    if not isinstance(lookback_map, dict) or not lookback_map:
-        # fail loudly: precompute must produce lookback_map
-        raise RuntimeError(
-            "Missing required lookback_map (era_label -> hours). "
-            "This must be produced by your precompute step (the single source of truth) and placed into run_cfg['lookback_map'] "
-            "or saved as session_dir/lookback_map.json. Worker will not compute defaults."
-        )
-
-    # Normalize and validate lookback_map values (hours)
-    normalized_lb_map: Dict[str, int] = {}
-    for k, v in lookback_map.items():
-        try:
-            vh = int(v)
-        except Exception:
-            raise RuntimeError(f"Invalid lookback_map value for '{k}': must be integer hours, got {v!r}")
-        if vh < 0:
-            raise RuntimeError(f"Invalid lookback_map value for '{k}': hours must be non-negative, got {vh}")
-        normalized_lb_map[str(k)] = vh
-
-    # return context
     return {
         "df_main": df_main,
-        "feature_cols": feature_cols,
         "base_cols": base_cols,
-        "lookback_map": normalized_lb_map,  # hours
+        "lookback_map": run_cfg["lookback_map"],
+        "ma_cols": run_cfg["ma_cols"],
+        "stoch_cols": run_cfg["stoch_cols"],
+        "bbw_cols": run_cfg["bbw_cols"],
         "main_close_arr": _to_numpy_ensure(df_main["close"], np.float32),
+        "main_high_arr": _to_numpy_ensure(df_main["high"], np.float32),
+        "main_low_arr": _to_numpy_ensure(df_main["low"], np.float32),
         "main_time_ns_arr": _to_numpy_ensure(df_main["time_ns"], np.int64),
         "main_spread_arr": _to_numpy_ensure(df_main["spread"], np.float32),
         "main_funding_arr": _to_numpy_ensure(df_main["funding_rate"], np.float32),
     }
+
 def _get_or_generate_global_signals(
     regime_id: int,
     regime_cfg: dict,
@@ -930,41 +650,6 @@ def stage_equity_from_preview(
 
     return final_balance, win_pos, float(max_dd)
 
-def _make_master_row(
-    regime_id: int,
-    era_int: int,
-    side_flag: int,
-    sl_val: float,
-    tp_val: float,
-    total_pos: int,
-    win_pos: int,
-    balance: float,
-    max_dd: float,
-    regime_cfg: dict,
-) -> dict:
-    return {
-        "balance": float(balance),
-        "SL": float(sl_val),
-        "TP": float(tp_val),
-        "win_pos": int(win_pos),
-        "total_pos": int(total_pos),
-        "side": int(side_flag),
-        "exit_window_h": int(regime_cfg.get("exit_window_h", 0)),
-        "era_int": int(era_int),
-        "regime_id": int(regime_id),
-        "ma_int": int(regime_cfg.get("ma_int", 0)),
-        "ma_reversion": bool(regime_cfg.get("ma_reversion", False)),
-        "entry_lookback_units": int(regime_cfg.get("entry_lookback_units", 0)),
-        "use_bbw": bool(regime_cfg.get("use_bbw", False)),
-        "bbw_periods": int(regime_cfg.get("bbw_periods", 0)),
-        "bbw_std": float(regime_cfg.get("bbw_std", 0.0)),
-        "bbw_thresholds": int(regime_cfg.get("bbw_thresholds", 0)),
-        "use_stochastic": bool(regime_cfg.get("use_stochastic", False)),
-        "stoch_key": str(regime_cfg.get("stoch_key", "OFF")),
-        "max_drawdown": float(max_dd),
-    }
-
-
 def _run_backtest_grid(
     regime_id: int,
     regime_cfg: dict,
@@ -985,6 +670,8 @@ def _run_backtest_grid(
 
     df_main = data_ctx["df_main"]
     main_close_arr = data_ctx["main_close_arr"]
+    main_high_arr = data_ctx["main_high_arr"]
+    main_low_arr = data_ctx["main_low_arr"]
     main_time_ns_arr = data_ctx["main_time_ns_arr"]
     main_spread_arr = data_ctx["main_spread_arr"]
     main_funding_arr = data_ctx["main_funding_arr"]
@@ -1043,8 +730,7 @@ def _run_backtest_grid(
                     max_dd=0.0,
                     regime_cfg=regime_cfg,
                 )
-                canonical = pl.DataFrame([master_row_raw]).pipe(enforce_schema, "master").to_dicts()[0]
-                buffer_master_row(results_dir, batch_id, canonical)
+                buffer_master_row(results_dir, batch_id, master_row_raw)
                 empty_rows_written += 1
                 master_rows_written += 1
                 continue
@@ -1090,6 +776,8 @@ def _run_backtest_grid(
                 try:
                     res = backtest_signals_sl_tp_rets(
                         main_close_arr=main_close_arr,
+                        main_high_arr=main_high_arr,
+                        main_low_arr=main_low_arr,
                         main_time_ns_arr=main_time_ns_arr,
                         sig_idxs=sig_idxs,
                         sl=float(sl_val),
@@ -1099,7 +787,6 @@ def _run_backtest_grid(
                         base_minutes=int(run_cfg.get("BASE_MINUTES", 5)),
                         spread=float(run_cfg.get("BTC_SETTINGS", {}).get("spread", 0.0)),
                         conservative_sl_first=bool(run_cfg.get("conservative_sl_first", True)),
-                        treat_no_hit_as_loss=bool(run_cfg.get("treat_no_hit_as_loss", True)),
                         side_flag=side_flag,
                         use_sl_decay=bool(regime_cfg.get("use_sl_decay", False)),
                         sl_decay_pct=float(regime_cfg.get("sl_decay_pct", 0.0)),
@@ -1150,8 +837,8 @@ def _run_backtest_grid(
                     max_dd=0.0,
                     regime_cfg=regime_cfg,
                 )
-                canonical = pl.DataFrame([master_row_raw]).pipe(enforce_schema, "master").to_dicts()[0]
-                buffer_master_row(results_dir, batch_id, canonical)
+                
+                buffer_master_row(results_dir, batch_id, master_row_raw)
                 master_rows_written += 1
                 continue
 
@@ -1159,7 +846,7 @@ def _run_backtest_grid(
             closed_entry_idxs = entry_idx[mask_closed].astype(np.int64)
             closed_exit_idxs = exit_idx[mask_closed].astype(np.int64)
 
-            rng_24h_entry, rng_72h_entry, rng_1w_entry, rng_1m_entry = get_volatility_index_for_indices(
+            rng_24h_entry, rng_72h_entry, rng_1w_entry, rng_1m_entry = get_regime_amp_for_indices(
                 df_main=df_main,
                 entry_idxs=closed_entry_idxs,
             )
@@ -1199,8 +886,8 @@ def _run_backtest_grid(
                     max_dd=current_max_dd,
                     regime_cfg=regime_cfg,
                 )
-                canonical = pl.DataFrame([master_row_raw]).pipe(enforce_schema, "master").to_dicts()[0]
-                buffer_master_row(results_dir, batch_id, canonical)
+                
+                buffer_master_row(results_dir, batch_id, master_row_raw)
                 master_rows_written += 1
                 continue
 
@@ -1250,8 +937,8 @@ def _run_backtest_grid(
                 max_dd=max_dd,
                 regime_cfg=regime_cfg,
             )
-            canonical = pl.DataFrame([master_row_raw]).pipe(enforce_schema, "master").to_dicts()[0]
-            buffer_master_row(results_dir, batch_id, canonical)
+            
+            buffer_master_row(results_dir, batch_id, master_row_raw)
             master_rows_written += 1
 
     return {
@@ -1289,9 +976,10 @@ def process_era_combos(
         "df_main",
         "main_time_ns_arr",
         "main_close_arr",
+        "main_high_arr",
+        "main_low_arr",
         "main_spread_arr",
         "main_funding_arr",
-        "feature_cols",
         "lookback_map",
     )
     missing = [k for k in required_keys if k not in data_ctx]
@@ -1301,6 +989,8 @@ def process_era_combos(
     df_main: pl.DataFrame = data_ctx["df_main"]
     main_time_ns_arr: np.ndarray = data_ctx["main_time_ns_arr"]
     main_close_arr: np.ndarray = data_ctx["main_close_arr"]
+    main_high_arr: np.ndarray = data_ctx["main_high_arr"]
+    main_low_arr: np.ndarray = data_ctx["main_low_arr"]
     main_spread_arr: np.ndarray = data_ctx["main_spread_arr"]
     main_funding_arr: np.ndarray = data_ctx["main_funding_arr"]
     lookback_map: dict = data_ctx["lookback_map"]
@@ -1408,8 +1098,8 @@ def process_era_combos(
                         max_dd=0.0,
                         regime_cfg=regime_cfg,
                     )
-                    canonical = pl.DataFrame([master_row_raw]).pipe(enforce_schema, "master").to_dicts()[0]
-                    buffer_master_row(results_dir, batch_id, canonical)
+                    
+                    buffer_master_row(results_dir, batch_id, master_row_raw)
                     era_master_rows_written[era_label] += 1
                     empty_rows_written += 1
                     master_rows_written += 1
@@ -1419,6 +1109,8 @@ def process_era_combos(
             try:
                 res = backtest_signals_sl_tp_rets(
                     main_close_arr=main_close_arr,
+                    main_high_arr=main_high_arr,
+                    main_low_arr=main_low_arr,
                     main_time_ns_arr=main_time_ns_arr,
                     sig_idxs=side_sig_idxs_all,
                     sl=float(sl_val),
@@ -1428,7 +1120,6 @@ def process_era_combos(
                     base_minutes=int(run_cfg.get("BASE_MINUTES", 5)),
                     spread=float(run_cfg.get("BTC_SETTINGS", {}).get("spread", 0.0)),
                     conservative_sl_first=bool(run_cfg.get("conservative_sl_first", True)),
-                    treat_no_hit_as_loss=bool(run_cfg.get("treat_no_hit_as_loss", True)),
                     side_flag=side_flag,
                     use_sl_decay=bool(regime_cfg.get("use_sl_decay", False)),
                     sl_decay_pct=float(regime_cfg.get("sl_decay_pct", 0.0)),
@@ -1459,8 +1150,8 @@ def process_era_combos(
                         max_dd=0.0,
                         regime_cfg=regime_cfg,
                     )
-                    canonical = pl.DataFrame([master_row_raw]).pipe(enforce_schema, "master").to_dicts()[0]
-                    buffer_master_row(results_dir, batch_id, canonical)
+                    
+                    buffer_master_row(results_dir, batch_id, master_row_raw)
                     era_master_rows_written[era_label] += 1
                     empty_rows_written += 1
                     master_rows_written += 1
@@ -1500,8 +1191,8 @@ def process_era_combos(
                         max_dd=0.0,
                         regime_cfg=regime_cfg,
                     )
-                    canonical = pl.DataFrame([master_row_raw]).pipe(enforce_schema, "master").to_dicts()[0]
-                    buffer_master_row(results_dir, batch_id, canonical)
+                    
+                    buffer_master_row(results_dir, batch_id, master_row_raw)
                     era_master_rows_written[era_label] += 1
                     empty_rows_written += 1
                     master_rows_written += 1
@@ -1550,8 +1241,8 @@ def process_era_combos(
                             max_dd=0.0,
                             regime_cfg=regime_cfg,
                         )
-                        canonical = pl.DataFrame([master_row_raw]).pipe(enforce_schema, "master").to_dicts()[0]
-                        buffer_master_row(results_dir, batch_id, canonical)
+                        
+                        buffer_master_row(results_dir, batch_id, master_row_raw)
                         era_master_rows_written[era_label] += 1
                         empty_rows_written += 1
                         master_rows_written += 1
@@ -1601,8 +1292,8 @@ def process_era_combos(
                         max_dd=0.0,
                         regime_cfg=regime_cfg,
                     )
-                    canonical = pl.DataFrame([master_row_raw]).pipe(enforce_schema, "master").to_dicts()[0]
-                    buffer_master_row(results_dir, batch_id, canonical)
+                    
+                    buffer_master_row(results_dir, batch_id, master_row_raw)
                     era_master_rows_written[era_label] += 1
                     empty_rows_written += 1
                     master_rows_written += 1
@@ -1612,7 +1303,7 @@ def process_era_combos(
                 closed_entry_idxs = entry_idx[mask_closed].astype(np.int64)
                 closed_exit_idxs = exit_idx[mask_closed].astype(np.int64)
 
-                rng_24h_entry, rng_72h_entry, rng_1w_entry, rng_1m_entry = get_volatility_index_for_indices(
+                rng_24h_entry, rng_72h_entry, rng_1w_entry, rng_1m_entry = get_regime_amp_index_for_indices(
                     df_main=df_main,
                     entry_idxs=closed_entry_idxs,
                 )
@@ -1647,8 +1338,8 @@ def process_era_combos(
                         max_dd=current_max_dd,
                         regime_cfg=regime_cfg,
                     )
-                    canonical = pl.DataFrame([master_row_raw]).pipe(enforce_schema, "master").to_dicts()[0]
-                    buffer_master_row(results_dir, batch_id, canonical)
+                    
+                    buffer_master_row(results_dir, batch_id, master_row_raw)
                     era_master_rows_written[era_label] += 1
                     master_rows_written += 1
                     continue
@@ -1699,8 +1390,8 @@ def process_era_combos(
                     max_dd=max_dd,
                     regime_cfg=regime_cfg,
                 )
-                canonical = pl.DataFrame([master_row_raw]).pipe(enforce_schema, "master").to_dicts()[0]
-                buffer_master_row(results_dir, batch_id, canonical)
+                
+                buffer_master_row(results_dir, batch_id, master_row_raw)
                 era_master_rows_written[era_label] += 1
                 master_rows_written += 1
 
@@ -1741,12 +1432,12 @@ def compute_config_and_save(batch_path: str, session_dir: str, compute_backtest:
         _HAS_PSUTIL = False
         _PROC = None
 
-    try:
-        logger.info("🔥 Worker-local Numba warmup starting...")
-        warmup_numba_kernels()
-        logger.info("🔥 Worker-local Numba warmup complete.")
-    except Exception as e:
-        logger.warning("Numba warmup failed: %s", e)
+    # try:
+    #     logger.info("🔥 Worker-local Numba warmup starting...")
+    #     warmup_numba_kernels()
+    #     logger.info("🔥 Worker-local Numba warmup complete.")
+    # except Exception as e:
+    #     logger.warning("Numba warmup failed: %s", e)
 
     batch_path = Path(batch_path)
     session_dir = Path(session_dir)
@@ -1755,13 +1446,12 @@ def compute_config_and_save(batch_path: str, session_dir: str, compute_backtest:
 
     session_snapshot = session_dir / "run_config.json"
     if not session_snapshot.exists():
-        # Fallback for safety, though it should exist from init_session_task
-        logger.warning("⚠️ Session run_config.json missing, falling back to global loader.")
-        run_cfg = _load_run_config()
-    else:
-        with open(session_snapshot, "r", encoding="utf8") as f:
-            run_cfg = json.load(f)
-        logger.info("✅ Loaded session-specific run_config from snapshot.")
+        raise AirflowFailException(f"FATAL: session run_config.json missing at {session_snapshot}")
+
+    with open(session_snapshot, "r", encoding="utf8") as f:
+        run_cfg = json.load(f)
+
+    logger.info("✅ Loaded session-specific run_config from snapshot.")
 
     results_dir = session_dir / "results"
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -1841,18 +1531,19 @@ def compute_config_and_save(batch_path: str, session_dir: str, compute_backtest:
             if processed_count % 5 == 0 or processed_count == 0:
                 logger.info("📑 [Batch %d] Progress: %d/%d (%.1f%%) ...", batch_id, idx, total_in_batch, (idx / total_in_batch) * 100.0)
 
-            result = process_era_combos(
-                regime_id=regime_id,
-                regime_cfg=regime_cfg,
-                run_cfg=run_cfg,
-                data_ctx=data_ctx,
-                results_dir=results_dir,
-                batch_id=batch_id,
-                stager=stager,
-                max_dd_threshold=max_dd_threshold,
-                current_idx=idx,
-                total_in_batch=total_in_batch,
-            )
+            with maybe_profile(f"regime_{regime_id}_process"):
+                result = process_era_combos(
+                    regime_id=regime_id,
+                    regime_cfg=regime_cfg,
+                    run_cfg=run_cfg,
+                    data_ctx=data_ctx,
+                    results_dir=results_dir,
+                    batch_id=batch_id,
+                    stager=stager,
+                    max_dd_threshold=max_dd_threshold,
+                    current_idx=idx,
+                    total_in_batch=total_in_batch,
+                )
 
             if isinstance(result, dict):
                 p_inc = int(result.get("processed_inc", 0))

@@ -188,6 +188,18 @@ def _pick_latest_signal(df_signals: pl.DataFrame) -> pl.DataFrame:
     latest_ns = df_signals["time_ns"].max()
     return df_signals.filter(pl.col("time_ns") == latest_ns).sort(["side", "idx"])
 
+def _combo_name(cfg: dict) -> str:
+    parts = []
+    if _as_int_list(cfg.get("ma_periods", [])):
+        parts.append("MA")
+    if _as_bool(cfg.get("use_stochastic", False), False):
+        parts.append("STOCH")
+    if _as_int(cfg.get("entry_lookback_units", 0), 0) > 0:
+        parts.append("LOOKBACK")
+    if _as_bool(cfg.get("use_bbw", False), False):
+        parts.append("BBW")
+    return "+".join(parts) if parts else "RAW"
+
 
 def _signal_key(row: dict) -> str:
     return f"{row.get('pair')}|{row.get('time_ns')}|{row.get('side')}|{row.get('regime_id')}"
@@ -292,22 +304,46 @@ def kraken_signal_ingest():
             }
 
         df_signals = _build_live_signal_frame(df_main, params, pair, market_type)
-        latest = _pick_latest_signal(df_signals)
-
-        if latest.is_empty():
+        if df_signals.is_empty():
             return {
                 "pair": pair,
                 "market_type": market_type,
                 "has_signal": False,
-                "reason": "no latest signal",
+                "reason": "no signal",
             }
 
-        latest = latest.with_columns([
-            pl.lit(pair).alias("pair"),
-            pl.lit(market_type).alias("market_type"),
-        ])
+        df_signals = df_signals.sort("time_ns")
+        latest_ts = df_signals["time_ns"].max()
+        prev_ts_df = df_signals.filter(pl.col("time_ns") < latest_ts)
 
-        rows = latest.select(["pair", "market_type", "time_ns", "side", "regime_id", "idx"]).to_dicts()
+        latest_rows = df_signals.filter(pl.col("time_ns") == latest_ts)
+        prev_rows = (
+            df_signals.filter(pl.col("time_ns") == prev_ts_df["time_ns"].max())
+            if not prev_ts_df.is_empty()
+            else pl.DataFrame()
+        )
+
+        combo = _combo_name(params)
+        rows = []
+
+        for row in latest_rows.select(["pair", "market_type", "time_ns", "side", "regime_id", "idx"]).to_dicts():
+            same_side_prev = not prev_rows.filter(
+                (pl.col("side") == row["side"]) & (pl.col("regime_id") == row["regime_id"])
+            ).is_empty()
+
+            if same_side_prev:
+                continue
+
+            row["combo"] = combo
+            rows.append(row)
+
+        if not rows:
+            return {
+                "pair": pair,
+                "market_type": market_type,
+                "has_signal": False,
+                "reason": "combo already active on previous bar",
+            }
 
         return {
             "pair": pair,

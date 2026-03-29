@@ -8,6 +8,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
 

@@ -54,7 +54,7 @@ def grid_search_pipeline():
         Strict loader: chooses which performance config to apply based on Airflow Variable PERFORMANCE_PROFILE.
         Sets environment variables and returns the merged run_config dict.
         """
-        from airflow.sdk import Variable  # local import so module import doesn't require Airflow at test-time
+
         profile = Variable.get("PERFORMANCE_PROFILE", default="local").strip().lower()
         if profile not in ("local", "cloud"):
             raise ValueError("PERFORMANCE_PROFILE must be 'local' or 'cloud'")
@@ -83,7 +83,7 @@ def grid_search_pipeline():
         """Creates the session folder and generates batch configs, with resume safety checks."""
 
         from etl.session import resolve_or_create_session
-        from etl.grid import generate_configs
+        from etl.grid_config import generate_configs
 
         # parse current run config  
         current_cfg = apply_performance_and_run_config()
@@ -174,9 +174,50 @@ def grid_search_pipeline():
         return res.get("path")
 
     @task()
+    def prepare_features_task(session_dir: str):
+        from etl.feature_prep import prepare_feature_cache
+        
+        session_dir = Path(session_dir)
+        session_snapshot = session_dir / "run_config.json"
+        
+        if not session_snapshot.exists():
+            raise RuntimeError(f"Missing run_config snapshot at {session_snapshot}")
+
+        run_cfg = json.loads(session_snapshot.read_text(encoding="utf8"))
+
+        # --- FIX: Point directly to your master base data file ---
+        # Using DATA_LAKE_ROOT defined at the top of your DAG
+        base_path = Path(DATA_LAKE_ROOT) / "base_data_full" / "base_data_full.parquet"
+        
+        if not base_path.exists():
+            raise FileNotFoundError(f"CRITICAL: Base data not found at {base_path}. "
+                                    f"Ensure the ETL has written the full parquet first.")
+
+        # This generates/loads the technical indicators (MA, Stoch, etc.) 
+        # based on the run_cfg and stores them in a cache
+        prepared_path, manifest = prepare_feature_cache(
+            base_path=base_path,
+            run_cfg=run_cfg,
+            force_rebuild=bool(run_cfg.get("force_rebuild_cache", False)),
+        )
+
+        ref = {
+            "parquet_path": str(prepared_path),
+            "manifest_key": manifest["cache_key"],
+            "lookback_map": run_cfg.get("lookback_map", {}),
+            "ma_cols": run_cfg.get("ma_cols", []),
+            "stoch_cols": run_cfg.get("stoch_cols", []),
+            "bbw_cols": run_cfg.get("bbw_cols", []),
+        }
+
+        (session_dir / "prepared_main_ref.json").write_text(json.dumps(ref, indent=2), encoding="utf8")
+        logger.info("✅ Prepared feature cache ready: %s", prepared_path)
+        return str(prepared_path)
+
+    @task()
     def list_pending_task(session_dir: str):
         """Finds only the BATCH files that haven't been completed yet."""
-        from etl.grid import list_pending_config_paths
+        from etl.grid_config import list_pending_config_paths
         # This now looks for batch_*.json instead of cfg_*.json
         pending_batches = list_pending_config_paths(Path(session_dir))
         logger.info(f"📋 Found {len(pending_batches)} batches to process.")
@@ -224,6 +265,7 @@ def grid_search_pipeline():
     # 1. Setup
     s_path = init_session_task()
     p_data = prepare_task(s_path)
+    f_data = prepare_features_task(s_path)
     pending_batches = list_pending_task(s_path)
     p_data >> pending_batches
 
@@ -241,7 +283,7 @@ def grid_search_pipeline():
     )
     
     # Explicitly ensure prep is done before mapping
-    p_data >> compute_results
+    p_data >> f_data >> pending_batches
 
     combine_master = combine_results_task(s_path, dependencies=compute_results)
     combine_equity = combine_equity_task(s_path, dependencies=combine_master)

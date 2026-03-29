@@ -140,6 +140,13 @@ def prepare_base_data(session_dir: str, db_uri: str, run_cfg: Dict[str, Any], fo
     base_full_dir.mkdir(parents=True, exist_ok=True)
     global_base_file = base_full_dir / "base_data_full.parquet"
 
+    # session-local slice file
+    session_base_file = Path(session_dir) / "base_data_full.parquet"
+
+    target_base_file = global_base_file if make_full else session_base_file
+
+    
+
     if not isinstance(run_cfg, dict) or not run_cfg:
         raise ValueError("prepare_base_data MUST receive a valid run_cfg dictionary from the session snapshot.")
 
@@ -153,15 +160,14 @@ def prepare_base_data(session_dir: str, db_uri: str, run_cfg: Dict[str, Any], fo
     padding_days = run_cfg.get("padded_days", 15) 
     padded_start = grid_start - pd.Timedelta(days=padding_days)
 
-    # quick check: reuse existing global file if present and not forced and it has rows
-    if global_base_file.exists() and not force:
+    if target_base_file.exists() and not force:
         try:
-            if _parquet_has_rows(global_base_file):
-                logger.info("Reusing existing global base file: %s", global_base_file)
-                df_main = pl.read_parquet(str(global_base_file))
-                return {"status": "reused", "path": str(global_base_file), "rows": int(df_main.height)}
+            if _parquet_has_rows(target_base_file):
+                logger.info("Reusing existing base file: %s", target_base_file)
+                df_main = pl.read_parquet(str(target_base_file))
+                return {"status": "reused", "path": str(target_base_file), "rows": int(df_main.height)}
         except Exception as e:
-            logger.debug("Global base file exists but could not be read: %s (will rebuild)", e)
+            logger.debug("Base file exists but could not be read: %s (will rebuild)", e)
 
     # If we reach here, build the base file (either full or sliced)
     engine = get_engine(db_uri)
@@ -215,4 +221,4 @@ def prepare_base_data(session_dir: str, db_uri: str, run_cfg: Dict[str, Any], fo
     actual_start = df_main["time"][0]
     actual_end = df_main["time"][-1]
     logger.info(f"✅ Verified Range: {actual_start} TO {actual_end} (Rows: {df_main.height})")
-    return {"status": "written", "path": str(global_base_file), "rows": int(df_main.height)}
+    return {"status": "written", "path": str(target_base_file), "rows": int(df_main.height)}
