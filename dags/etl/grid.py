@@ -791,10 +791,10 @@ def _run_backtest_grid(
                         round(float(row["TP"]), 6),
                         int(row["side"]),
                         int(row["exit_window_h"]),
-                        int(bool(row.get("use_sl_decay", False))),
-                        round(float(row.get("sl_decay_pct", 0.0)), 6),
-                        int(row.get("sl_decay_interval", 0)),
-                        int(bool(row.get("sl_decay_stop_at_pos", True))),
+                        int(bool(row.get("use_trailing_sl", False))),
+                        round(float(row.get("trailing_sl_pct", 0.0)), 6),
+                        int(row.get("trailing_sl_interval", 0)),
+                        int(bool(row.get("trailing_sl_stop_at_pos", True))),
                         int(bool(row.get("use_limit_entry", True))),
                         int(row.get("limit_order_expiry_h", 0)),
                         int(row.get("trade_window_interval", 0)),
@@ -860,10 +860,10 @@ def _run_backtest_grid(
                 round(float(tp_val), 6),
                 int(side_flag),
                 int(regime_cfg.get("exit_window_h", 0)),
-                int(bool(regime_cfg.get("use_sl_decay", False))),
-                round(float(regime_cfg.get("sl_decay_pct", 0.0)), 6),
-                int(regime_cfg.get("sl_decay_interval", 0)),
-                int(bool(regime_cfg.get("sl_decay_stop_at_pos", True))),
+                int(bool(regime_cfg.get("use_trailing_sl", False))),
+                round(float(regime_cfg.get("trailing_sl_pct", 0.0)), 6),
+                int(regime_cfg.get("trailing_sl_interval", 0)),
+                int(bool(regime_cfg.get("trailing_sl_stop_at_pos", True))),
                 int(use_limit_entry),
                 int(limit_order_expiry_h),
                 int(trade_window_interval),
@@ -924,10 +924,10 @@ def _run_backtest_grid(
                         conservative_sl_first=bool(run_cfg.get("conservative_sl_first", True)),
                         side_flag=side_flag,
                         use_limit_entry=use_limit_entry,
-                        use_sl_decay=bool(regime_cfg.get("use_sl_decay", False)),
-                        sl_decay_pct=float(regime_cfg.get("sl_decay_pct", 0.0)),
-                        sl_decay_interval=int(regime_cfg.get("sl_decay_interval", 0)),
-                        sl_decay_stop_at_pos=bool(regime_cfg.get("sl_decay_stop_at_pos", True)),
+                        use_trailing_sl=bool(regime_cfg.get("use_trailing_sl", False)),
+                        trailing_sl_pct=float(regime_cfg.get("trailing_sl_pct", 0.0)),
+                        trailing_sl_interval=int(regime_cfg.get("trailing_sl_interval", 0)),
+                        trailing_sl_stop_at_pos=bool(regime_cfg.get("trailing_sl_stop_at_pos", True)),
                     )
 
                     entry_idx = np.asarray(res.get("entry_idx", []), dtype=np.int64)
@@ -949,10 +949,10 @@ def _run_backtest_grid(
                             "side": [int(side_flag)],
                             "regime_id": [int(regime_id)],
                             "exit_window_h": [int(regime_cfg.get("exit_window_h", 0))],
-                            "use_sl_decay": [bool(regime_cfg.get("use_sl_decay", False))],
-                            "sl_decay_pct": [float(regime_cfg.get("sl_decay_pct", 0.0))],
-                            "sl_decay_interval": [int(regime_cfg.get("sl_decay_interval", 0))],
-                            "sl_decay_stop_at_pos": [bool(regime_cfg.get("sl_decay_stop_at_pos", True))],
+                            "use_trailing_sl": [bool(regime_cfg.get("use_trailing_sl", False))],
+                            "trailing_sl_pct": [float(regime_cfg.get("trailing_sl_pct", 0.0))],
+                            "trailing_sl_interval": [int(regime_cfg.get("trailing_sl_interval", 0))],
+                            "trailing_sl_stop_at_pos": [bool(regime_cfg.get("trailing_sl_stop_at_pos", True))],
                             "use_limit_entry": [bool(use_limit_entry)],
                             "limit_order_expiry_h": [int(limit_order_expiry_h)],
                             "trade_window_interval": [int(trade_window_interval)],
@@ -1196,10 +1196,10 @@ def process_era_combos(
                             round(float(row["TP"]), 6),
                             int(row["side"]),
                             int(row["exit_window_h"]),
-                            int(bool(row.get("use_sl_decay", False))),
-                            round(float(row.get("sl_decay_pct", 0.0)), 6),
-                            int(row.get("sl_decay_interval", 0)),
-                            int(bool(row.get("sl_decay_stop_at_pos", True))),
+                            int(bool(row.get("use_trailing_sl", False))),
+                            round(float(row.get("trailing_sl_pct", 0.0)), 6),
+                            int(row.get("trailing_sl_interval", 0)),
+                            int(bool(row.get("trailing_sl_stop_at_pos", True))),
                             int(bool(row.get("use_limit_entry", True))),
                             int(row.get("limit_order_expiry_h", 0)),
                             int(row.get("trade_window_interval", 0)),
@@ -1296,10 +1296,10 @@ def process_era_combos(
                     conservative_sl_first=bool(run_cfg.get("conservative_sl_first", True)),
                     side_flag=side_flag,
                     use_limit_entry=use_limit_entry,
-                    use_sl_decay=bool(regime_cfg.get("use_sl_decay", False)),
-                    sl_decay_pct=float(regime_cfg.get("sl_decay_pct", 0.0)),
-                    sl_decay_interval=int(regime_cfg.get("sl_decay_interval", 0)),
-                    sl_decay_stop_at_pos=bool(regime_cfg.get("sl_decay_stop_at_pos", True)),
+                    use_trailing_sl=bool(regime_cfg.get("use_trailing_sl", False)),
+                    trailing_sl_pct=float(regime_cfg.get("trailing_sl_pct", 0.0)),
+                    trailing_sl_interval=int(regime_cfg.get("trailing_sl_interval", 0)),
+                    trailing_sl_stop_at_pos=bool(regime_cfg.get("trailing_sl_stop_at_pos", True)),
                 )
             except Exception as e:
                 logger.error(
@@ -1399,10 +1399,10 @@ def process_era_combos(
                     round(float(tp_val), 6),
                     int(side_flag),
                     int(regime_cfg.get("exit_window_h", 0)),
-                    int(bool(regime_cfg.get("use_sl_decay", False))),
-                    round(float(regime_cfg.get("sl_decay_pct", 0.0)), 6),
-                    int(regime_cfg.get("sl_decay_interval", 0)),
-                    int(bool(regime_cfg.get("sl_decay_stop_at_pos", True))),
+                    int(bool(regime_cfg.get("use_trailing_sl", False))),
+                    round(float(regime_cfg.get("trailing_sl_pct", 0.0)), 6),
+                    int(regime_cfg.get("trailing_sl_interval", 0)),
+                    int(bool(regime_cfg.get("trailing_sl_stop_at_pos", True))),
                     int(use_limit_entry),
                     int(limit_order_expiry_h),
                     int(trade_window_interval),
@@ -1481,10 +1481,10 @@ def process_era_combos(
                                 "side": [int(side_flag)],
                                 "regime_id": [int(regime_id)],
                                 "exit_window_h": [int(regime_cfg.get("exit_window_h", 0))],
-                                "use_sl_decay": [bool(regime_cfg.get("use_sl_decay", False))],
-                                "sl_decay_pct": [float(regime_cfg.get("sl_decay_pct", 0.0))],
-                                "sl_decay_interval": [int(regime_cfg.get("sl_decay_interval", 0))],
-                                "sl_decay_stop_at_pos": [bool(regime_cfg.get("sl_decay_stop_at_pos", True))],
+                                "use_trailing_sl": [bool(regime_cfg.get("use_trailing_sl", False))],
+                                "trailing_sl_pct": [float(regime_cfg.get("trailing_sl_pct", 0.0))],
+                                "trailing_sl_interval": [int(regime_cfg.get("trailing_sl_interval", 0))],
+                                "trailing_sl_stop_at_pos": [bool(regime_cfg.get("trailing_sl_stop_at_pos", True))],
                                 "use_limit_entry": [bool(use_limit_entry)],
                                 "limit_order_expiry_h": [int(limit_order_expiry_h)],
                                 "trade_window_interval": [int(trade_window_interval)],
@@ -1771,10 +1771,10 @@ def compute_config_and_save(batch_path: str, session_dir: str, compute_backtest:
             regime_cfg["use_bbw"] = bool(regime_cfg.get("use_bbw", False))
             regime_cfg["bbw_thresholds"] = int(regime_cfg.get("bbw_thresholds", 0) or 0)
 
-            regime_cfg["use_sl_decay"] = bool(regime_cfg.get("use_sl_decay", False))
-            regime_cfg["sl_decay_pct"] = float(regime_cfg.get("sl_decay_pct", 0.0) or 0.0)
-            regime_cfg["sl_decay_interval"] = int(regime_cfg.get("sl_decay_interval", 0) or 0)
-            regime_cfg["sl_decay_stop_at_pos"] = bool(regime_cfg.get("sl_decay_stop_at_pos", True))
+            regime_cfg["use_trailing_sl"] = bool(regime_cfg.get("use_trailing_sl", False))
+            regime_cfg["trailing_sl_pct"] = float(regime_cfg.get("trailing_sl_pct", 0.0) or 0.0)
+            regime_cfg["trailing_sl_interval"] = int(regime_cfg.get("trailing_sl_interval", 0) or 0)
+            regime_cfg["trailing_sl_stop_at_pos"] = bool(regime_cfg.get("trailing_sl_stop_at_pos", True))
 
             regime_cfg["use_limit_entry"] = bool(regime_cfg.get("use_limit_entry", True))
             regime_cfg["limit_order_expiry_h"] = int(regime_cfg.get("limit_order_expiry_h", 0) or 0)

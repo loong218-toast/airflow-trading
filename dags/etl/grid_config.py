@@ -116,7 +116,7 @@ def generate_configs(session_dir: Path, run_cfg: dict) -> list[Path]:
     cfg_dir = session_dir / "configs"
     cfg_dir.mkdir(parents=True, exist_ok=True)
 
-    exit_windows = _list(run_cfg.get("exit_windows"), [24])
+    exit_windows = _list(run_cfg.get("exit_windows_h"), [24])
     lookbacks = _list(run_cfg.get("entry_lookback_units"), [24])
 
     sl_vals, tp_vals = _expand_sl_tp(run_cfg)
@@ -139,10 +139,10 @@ def generate_configs(session_dir: Path, run_cfg: dict) -> list[Path]:
     stoch_opts = _stoch_opts(run_cfg, use_stoch_list)
     bbw_opts = _bbw_opts(run_cfg, use_bbw_list)
 
-    use_sl_decay_list = _list(run_cfg.get("use_sl_decay"), [False])
-    sl_decay_pct_list = _list(run_cfg.get("sl_decay_pct"), [0.0])
-    sl_decay_interval_list = _list(run_cfg.get("sl_decay_interval"), [12])
-    sl_decay_stop_at_pos_list = _list(run_cfg.get("sl_decay_stop_at_pos"), [True])
+    use_trailing_sl_list = _list(run_cfg.get("use_trailing_sl"), [False])
+    trailing_sl_pct_list = _list(run_cfg.get("trailing_sl_pct"), [0.0])
+    trailing_sl_interval_list = _list(run_cfg.get("trailing_sl_interval"), [12])
+    trailing_sl_stop_at_pos_list = _list(run_cfg.get("trailing_sl_stop_at_pos"), [True])
 
     limit_order_expiry_h_list = _list(run_cfg.get("limit_order_expiry_h"), [24])
 
@@ -157,10 +157,10 @@ def generate_configs(session_dir: Path, run_cfg: dict) -> list[Path]:
                 for bw in bbw_opts:
                     for lb_h in lookbacks:
                         for exit_h in exit_windows:
-                            for use_decay in use_sl_decay_list:
-                                for decay_pct in sl_decay_pct_list:
-                                    for decay_interval in sl_decay_interval_list:
-                                        for decay_stop in sl_decay_stop_at_pos_list:
+                            for use_trailing in use_trailing_sl_list:
+                                for trailing_pct in trailing_sl_pct_list:
+                                    for trailing_interval in trailing_sl_interval_list:
+                                        for trailing_stop in trailing_sl_stop_at_pos_list:
                                             for limit_h in limit_order_expiry_h_list:
                                                 for trade_window_interval in trade_window_interval_list:
                                                     regime = {
@@ -181,10 +181,10 @@ def generate_configs(session_dir: Path, run_cfg: dict) -> list[Path]:
                                                         "bbw_thresholds": float(bw["bbw_thresholds"]),
                                                         "entry_lookback_units": int(lb_h),
                                                         "exit_window_h": int(exit_h),
-                                                        "use_sl_decay": bool(use_decay),
-                                                        "sl_decay_pct": float(decay_pct),
-                                                        "sl_decay_interval": int(decay_interval),
-                                                        "sl_decay_stop_at_pos": bool(decay_stop),
+                                                        "use_trailing_sl": bool(use_trailing),
+                                                        "trailing_sl_pct": float(trailing_pct),
+                                                        "trailing_sl_interval": int(trailing_interval),
+                                                        "trailing_sl_stop_at_pos": bool(trailing_stop),
                                                         "limit_order_expiry_h": int(limit_h),
                                                         "trade_window_interval": int(trade_window_interval),
                                                         "use_limit_entry": bool(run_cfg.get("use_limit_entry", True)),

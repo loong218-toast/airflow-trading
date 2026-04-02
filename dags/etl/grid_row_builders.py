@@ -33,9 +33,9 @@ def _make_master_row(
         "bbw_thresholds": int(regime_cfg.get("bbw_thresholds", 0)),
         "use_stochastic": bool(regime_cfg.get("use_stochastic", False)),
         "stoch_key": str(regime_cfg.get("stoch_key", "OFF")),
-        "use_sl_decay": bool(regime_cfg.get("use_sl_decay", False)),
-        "sl_decay_pct": float(regime_cfg.get("sl_decay_pct", 0.0)),
-        "sl_decay_interval": int(regime_cfg.get("sl_decay_interval", 0)),
-        "sl_decay_stop_at_pos": bool(regime_cfg.get("sl_decay_stop_at_pos", True)),
+        "use_trailing_sl": bool(regime_cfg.get("use_trailing_sl", False)),
+        "trailing_sl_pct": float(regime_cfg.get("trailing_sl_pct", 0.0)),
+        "trailing_sl_interval": int(regime_cfg.get("trailing_sl_interval", 0)),
+        "trailing_sl_stop_at_pos": bool(regime_cfg.get("trailing_sl_stop_at_pos", True)),
         "max_drawdown": float(max_dd),
     }

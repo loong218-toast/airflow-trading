@@ -278,10 +278,10 @@ def _backtest_kernel_limit_ohlc(
     spread_f64,
     conservative_sl_first_bool,
     use_limit_entry_bool,
-    use_sl_decay_bool,
-    sl_decay_pct_f64,
-    sl_decay_interval_i64,
-    sl_decay_stop_at_pos_bool,
+    use_trailing_sl_bool,
+    trailing_sl_pct_f64,
+    trailing_sl_interval_i64,
+    trailing_sl_stop_at_pos_bool,
 ):
     n_rows = close_f64.shape[0]
     n_signals = signal_idx_i64.shape[0]
@@ -388,21 +388,21 @@ def _backtest_kernel_limit_ohlc(
             lo = low_f64[j]
 
             current_sl_price = sl_price_adj
-            if use_sl_decay_bool and sl_decay_interval_i64 > 0 and sl_decay_pct_f64 > 0.0:
+            if use_trailing_sl_bool and trailing_sl_interval_i64 > 0 and trailing_sl_pct_f64 > 0.0:
                 # Only tighten after fully closed candles.
                 # For bar j, the last fully closed candle is j - 1.
                 closed_bars = j - fill_idx - 1
-                if closed_bars >= sl_decay_interval_i64:
-                    steps = closed_bars // sl_decay_interval_i64
-                    move = base_sl_dist * sl_decay_pct_f64 * float(steps)
+                if closed_bars >= trailing_sl_interval_i64:
+                    steps = closed_bars // trailing_sl_interval_i64
+                    move = base_sl_dist * trailing_sl_pct_f64 * float(steps)
 
                     if side == 1:
                         current_sl_price = sl_price_adj + move
-                        if sl_decay_stop_at_pos_bool and current_sl_price > fill_price:
+                        if trailing_sl_stop_at_pos_bool and current_sl_price > fill_price:
                             current_sl_price = fill_price
                     else:
                         current_sl_price = sl_price_adj - move
-                        if sl_decay_stop_at_pos_bool and current_sl_price < fill_price:
+                        if trailing_sl_stop_at_pos_bool and current_sl_price < fill_price:
                             current_sl_price = fill_price
 
             if side == 1:
@@ -673,10 +673,10 @@ def backtest_from_arrays(
     spread: float = 0.0,
     conservative_sl_first: bool = True,
     use_limit_entry: bool = True,
-    use_sl_decay: bool = False,
-    sl_decay_pct: float = 0.0,
-    sl_decay_interval: int = 0,
-    sl_decay_stop_at_pos: bool = True,
+    use_trailing_sl: bool = False,
+    trailing_sl_pct: float = 0.0,
+    trailing_sl_interval: int = 0,
+    trailing_sl_stop_at_pos: bool = True,
 ) -> Dict:
     close = np.asarray(close, dtype=np.float64)
     high = np.asarray(high, dtype=np.float64)
@@ -702,10 +702,10 @@ def backtest_from_arrays(
         float(spread),
         bool(conservative_sl_first),
         bool(use_limit_entry),
-        bool(use_sl_decay),
-        float(sl_decay_pct),
-        int(sl_decay_interval),
-        bool(sl_decay_stop_at_pos),
+        bool(use_trailing_sl),
+        float(trailing_sl_pct),
+        int(trailing_sl_interval),
+        bool(trailing_sl_stop_at_pos),
     )
 
     if trade_window_bars > 0 and signal_idx.size > 0:
@@ -751,10 +751,10 @@ def backtest_signals_sl_tp_rets(
     conservative_sl_first: bool = True,
     side_flag: int = 1,
     use_limit_entry: bool = True,
-    use_sl_decay: bool = False,
-    sl_decay_pct: float = 0.0,
-    sl_decay_interval: int = 0,
-    sl_decay_stop_at_pos: bool = True,
+    use_trailing_sl: bool = False,
+    trailing_sl_pct: float = 0.0,
+    trailing_sl_interval: int = 0,
+    trailing_sl_stop_at_pos: bool = True,
 ) -> Dict:
     if sig_idxs is None or sig_idxs.size == 0:
         return {
@@ -785,8 +785,8 @@ def backtest_signals_sl_tp_rets(
         spread=spread,
         conservative_sl_first=conservative_sl_first,
         use_limit_entry=use_limit_entry,
-        use_sl_decay=use_sl_decay,
-        sl_decay_pct=sl_decay_pct,
-        sl_decay_interval=sl_decay_interval,
-        sl_decay_stop_at_pos=sl_decay_stop_at_pos,
+        use_trailing_sl=use_trailing_sl,
+        trailing_sl_pct=trailing_sl_pct,
+        trailing_sl_interval=trailing_sl_interval,
+        trailing_sl_stop_at_pos=trailing_sl_stop_at_pos,
     )

@@ -497,6 +497,13 @@ def build_universe(cfg: dict, state: dict[str, dict]) -> list[dict]:
     save_state(state)
     return ordered
 
+def count_selected_by_market_type(items: list[dict]) -> dict[str, int]:
+    counts = {"spot": 0, "future": 0, "xstock": 0}
+    for item in items:
+        mt = normalize_market_type(item.get("market_type", "spot"))
+        if mt in counts:
+            counts[mt] += 1
+    return counts
 
 def normalize_to_ns(df):
     if df is None or df.empty or "time_ns" not in df.columns:
@@ -652,11 +659,25 @@ def main() -> None:
                 time.sleep(delay_seconds)
                 continue
 
+    counts = count_selected_by_market_type(universe)
+
     universe_text = "\n".join(
-        f"- {escape_md(item['pair'])} | {escape_md(item['market_type'])} | source: {escape_md(item['source'])}" 
+        f"- {escape_md(item['pair'])} | {escape_md(item['market_type'])} | source: {escape_md(item['source'])}"
         for item in universe
     )
-    send_or_update_instruments(token, chat_id, f"*Current Selected Instruments:*\n{universe_text}")
+
+    summary_line = (
+        f"\n\n*Selected counts:* "
+        f"spot={counts['spot']} | "
+        f"future={counts['future']} | "
+        f"xstock={counts['xstock']}"
+    )
+
+    send_or_update_instruments(
+        token,
+        chat_id,
+        f"*Current Selected Instruments:*\n{universe_text}{summary_line}",
+    )
 
     atomic_write_json(manifest_path, sent_manifest)
 

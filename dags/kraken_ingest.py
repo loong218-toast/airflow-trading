@@ -216,6 +216,8 @@ def kraken_ingest():
                 max_seen_update_id = max(max_seen_update_id, update_id)
                 local_path: Optional[Path] = None
 
+                success = False
+
                 try:
                     post = (
                         update.get("channel_post")
@@ -271,6 +273,7 @@ def kraken_ingest():
                         )
 
                         _telegram_delete_message(token, chat_id, int(post["message_id"]))
+                        success = True
 
                         if interval_minutes == 5:
                             affected_pairs.add(pair)
@@ -307,8 +310,12 @@ def kraken_ingest():
                         )
 
                     finally:
-                        _write_cursor(update_id)
-                        last_update_id = update_id
+                        if success:
+                            _write_cursor(update_id)
+                            last_update_id = update_id
+                        else:
+                            # write to a failed queue / retry list instead of losing it
+                            pass
 
                 finally:
                     if local_path is not None:
