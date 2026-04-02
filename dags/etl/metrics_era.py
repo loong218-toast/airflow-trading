@@ -1,8 +1,10 @@
-# metrics_era.py
+# etl/metrics_era.py
 from __future__ import annotations
 
 import os
-from typing import Sequence, Dict, Any, Optional
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Sequence, Dict, Any, Optional, List, Tuple
 
 import pandas as pd
 import polars as pl
@@ -73,14 +75,13 @@ def calculate_optimal_tp(current_vol_idx, base_tp=1.4):
 # CONFIG
 # =============================
 
-ERA_LIST = [
-    20230901,
-    20240301,
-    20240901,
-    20250301,
-]
+GRID_START_DATE = "2022-09-01T00:00:00Z"
+GRID_END_DATE = "2025-09-15T23:59:59Z"
 
-TIMEFRAME_MONTHS_LIST = [1, 3, 6]
+TIMEFRAME_MONTHS_LIST = [3]
+
+OUTPUT_DIR = Path("/opt/airflow/airflow-trading/data_lake/Saved_results")
+OUTPUT_FILE = OUTPUT_DIR / "amp_data.py"
 
 
 # =============================
@@ -136,6 +137,88 @@ def months_to_ns(months: int) -> int:
     """
     return int(months * 30 * 24 * 60 * 60 * 1_000_000_000)
 
+def _parse_utc_dt(dt_in: Any) -> Optional[datetime]:
+    if dt_in is None:
+        return None
+
+    if isinstance(dt_in, datetime):
+        dt = dt_in
+    elif isinstance(dt_in, str):
+        s = dt_in[:-1] if dt_in.endswith("Z") else dt_in
+        try:
+            dt = datetime.fromisoformat(s)
+        except Exception:
+            try:
+                dt = datetime.strptime(s, "%Y-%m-%dT%H:%M:%S")
+            except Exception:
+                return None
+    else:
+        try:
+            dt = pd.Timestamp(dt_in).to_pydatetime()
+        except Exception:
+            return None
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+
+    return dt
+
+
+def _dt_to_ns(dt_in: Any) -> Optional[int]:
+    dt = _parse_utc_dt(dt_in)
+    if dt is None:
+        return None
+    return int(pd.Timestamp(dt).value)
+
+def split_period_windows_from_ns_df(
+    df: pl.DataFrame,
+    months: int,
+    min_dt: Optional[datetime] = None,
+    max_dt: Optional[datetime] = None,
+    include_partial_tail: bool = False,
+) -> List[Tuple[datetime, datetime]]:
+    if months <= 0:
+        return []
+
+    if (min_dt is None or max_dt is None) and (df is None or df.height == 0):
+        return []
+
+    if min_dt is None or max_dt is None:
+        try:
+            first_ns = int(df[0, "time_ns"])
+            last_ns = int(df[-1, "time_ns"])
+            min_dt = min_dt or pd.to_datetime(first_ns, utc=True).to_pydatetime()
+            max_dt = max_dt or pd.to_datetime(last_ns, utc=True).to_pydatetime()
+        except Exception:
+            return []
+
+    min_dt = _parse_utc_dt(min_dt)
+    max_dt = _parse_utc_dt(max_dt)
+    if min_dt is None or max_dt is None:
+        return []
+
+    start = datetime(min_dt.year, min_dt.month, 1, tzinfo=timezone.utc)
+    windows: List[Tuple[datetime, datetime]] = []
+    cur = start
+
+    while True:
+        m = cur.month - 1 + int(months)
+        y = cur.year + (m // 12)
+        mm = (m % 12) + 1
+        end = datetime(year=y, month=mm, day=1, tzinfo=timezone.utc)
+
+        if end > max_dt:
+            if include_partial_tail and cur < max_dt:
+                windows.append((cur, max_dt))
+            break
+
+        windows.append((cur, end))
+        cur = end
+
+    return windows
+
 
 def estimate_5m_rows(months: int) -> int:
     """
@@ -144,6 +227,30 @@ def estimate_5m_rows(months: int) -> int:
     """
     return months * 30 * 24 * 12
 
+def _to_python_literal_value(v: Any) -> Any:
+    if v is None:
+        return None
+    if isinstance(v, pd.Timestamp):
+        if pd.isna(v):
+            return None
+        return v.to_pydatetime().isoformat(sep=" ")
+    if isinstance(v, datetime):
+        return v.isoformat(sep=" ")
+    if pd.isna(v) if hasattr(pd, "isna") else False:
+        return None
+    return v
+
+
+def write_amp_data_py(rows: List[Dict[str, Any]], out_file: Path) -> None:
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+
+    cleaned_rows: List[Dict[str, Any]] = []
+    for row in rows:
+        cleaned = {k: _to_python_literal_value(v) for k, v in row.items()}
+        cleaned_rows.append(cleaned)
+
+    content = "amp_data = " + repr(cleaned_rows) + "\n"
+    out_file.write_text(content, encoding="utf-8")
 
 # =============================
 # REGIME AMPLITUDE
@@ -164,25 +271,18 @@ def regime_amp_index_from_min_max(
 # DATA LOAD
 # =============================
 
-def load_df_main_for_eras(
+def load_df_main_for_grid(
     engine: Engine,
     pair: str,
     market_type: str,
-    eras: Sequence[int],
-    forward_months_list: Sequence[int],
+    grid_start_date: str,
+    grid_end_date: str,
 ) -> pl.DataFrame:
-    if not eras:
+    start_ns = _dt_to_ns(grid_start_date)
+    end_ns = _dt_to_ns(grid_end_date)
+
+    if start_ns is None or end_ns is None:
         return pl.DataFrame()
-
-    era_dates = pd.to_datetime([str(e) for e in eras], utc=True)
-    min_era = era_dates.min()
-    max_era = era_dates.max()
-    max_forward_months = max(forward_months_list) if forward_months_list else 0
-
-    start_ns = int(min_era.value)
-    end_ns = int(
-        (max_era + pd.DateOffset(months=max_forward_months) + pd.Timedelta(days=1)).value
-    )
 
     query = text("""
         SELECT
@@ -192,7 +292,7 @@ def load_df_main_for_eras(
         WHERE pair = :pair
           AND market_type = :market_type
           AND time_ns >= :start_ns
-          AND time_ns <  :end_ns
+          AND time_ns <= :end_ns
         ORDER BY time_ns ASC
     """)
 
@@ -222,19 +322,24 @@ def load_df_main_for_eras(
 
 
 # =============================
-# ERA CALC
+# WINDOW CALC
 # =============================
 
-def calc_era_regime_amp(
+def calc_window_regime_amp(
     df: pl.DataFrame,
-    era_int: int,
-    forward_months: int,
+    window_start: datetime,
+    window_end: datetime,
+    timeframe_months: int,
 ) -> Dict[str, Any]:
+    period_id = int(window_start.strftime("%Y%m%d"))
 
     empty_row = {
-        "era_int": era_int,
-        "era_close_time": None,
-        "timeframe_months": forward_months,
+        "era_int": period_id,
+        "era_close_time": window_end,
+        "window_start_time": window_start,
+        "window_end_time": window_end,
+        "timeframe_months": timeframe_months,
+        "window_rows": 0,
         "window_min_close": None,
         "window_max_close": None,
         "regime_amp_index": None,
@@ -243,41 +348,77 @@ def calc_era_regime_amp(
     if df.is_empty():
         return empty_row
 
-    era_start_ns, era_end_ns = era_int_to_ns_bounds(era_int)
-
-    era_df = df.filter(
-        (pl.col("time_ns") >= era_start_ns)
-        & (pl.col("time_ns") <= era_end_ns)
-    )
-
-    if era_df.is_empty():
-        return empty_row
-
-    era_close_ns = era_df.select(pl.col("time_ns").max()).item()
-
-    window_end_ns = era_close_ns + months_to_ns(forward_months)
+    start_ns = int(pd.Timestamp(window_start).value)
+    end_ns = int(pd.Timestamp(window_end).value)
 
     window_df = df.filter(
-        (pl.col("time_ns") >= era_close_ns)
-        & (pl.col("time_ns") < window_end_ns)
+        (pl.col("time_ns") >= start_ns) &
+        (pl.col("time_ns") < end_ns)
     )
 
     if window_df.is_empty():
-        return empty_row | {
-            "era_close_time": pd.to_datetime(era_close_ns, utc=True),
-        }
+        return empty_row
 
     min_close = float(window_df.select(pl.col("close").min()).item())
     max_close = float(window_df.select(pl.col("close").max()).item())
     amp = regime_amp_index_from_min_max(min_close, max_close)
 
     return {
-        "era_int": era_int,
-        "era_close_time": pd.to_datetime(era_close_ns, utc=True),
-        "timeframe_months": forward_months,
+        "era_int": period_id,
+        "era_close_time": window_end,
+        "window_start_time": window_start,
+        "window_end_time": window_end,
+        "timeframe_months": timeframe_months,
+        "window_rows": window_df.height,
         "window_min_close": min_close,
         "window_max_close": max_close,
         "regime_amp_index": amp,
+    }
+
+
+def calc_window_atr(
+    df: pl.DataFrame,
+    window_start: datetime,
+    window_end: datetime,
+    timeframe_months: int,
+    atr_period: int = 14,
+) -> Dict[str, Any]:
+    period_id = int(window_start.strftime("%Y%m%d"))
+
+    empty_row = {
+        "era_int": period_id,
+        "era_close_time": window_end,
+        "window_start_time": window_start,
+        "window_end_time": window_end,
+        "timeframe_months": timeframe_months,
+        "atr_period": atr_period,
+        "atr": None,
+    }
+
+    if df.is_empty():
+        return empty_row
+
+    start_ns = int(pd.Timestamp(window_start).value)
+    end_ns = int(pd.Timestamp(window_end).value)
+
+    window_df = df.filter(
+        (pl.col("time_ns") >= start_ns) &
+        (pl.col("time_ns") < end_ns)
+    )
+
+    if window_df.is_empty():
+        return empty_row
+
+    atr = calc_atr_from_df(window_df, period=atr_period)
+
+    return {
+        "era_int": period_id,
+        "era_close_time": window_end,
+        "window_start_time": window_start,
+        "window_end_time": window_end,
+        "timeframe_months": timeframe_months,
+        "atr_period": atr_period,
+        "atr": atr,
     }
 
 
@@ -289,10 +430,6 @@ def calc_atr_from_df(
     df: pl.DataFrame,
     period: int = 14,
 ) -> Optional[float]:
-    """
-    Close-only ATR proxy.
-    TR = abs(close_t - close_{t-1})
-    """
     if df.height <= period:
         return None
 
@@ -310,111 +447,84 @@ def calc_atr_from_df(
     return float(tr.select(pl.col("tr").mean()).item())
 
 
-def calc_era_atr(
-    df: pl.DataFrame,
-    era_int: int,
-    forward_months: int,
-    atr_period: int = 14,
-) -> Dict[str, Any]:
-
-    empty_row = {
-        "era_int": era_int,
-        "era_close_time": None,
-        "timeframe_months": forward_months,
-        "atr_period": atr_period,
-        "atr": None,
-    }
-
-    if df.is_empty():
-        return empty_row
-
-    era_start_ns, era_end_ns = era_int_to_ns_bounds(era_int)
-
-    era_df = df.filter(
-        (pl.col("time_ns") >= era_start_ns)
-        & (pl.col("time_ns") <= era_end_ns)
-    )
-
-    if era_df.is_empty():
-        return empty_row
-
-    era_close_ns = era_df.select(pl.col("time_ns").max()).item()
-
-    window_end_ns = era_close_ns + months_to_ns(forward_months)
-
-    window_df = df.filter(
-        (pl.col("time_ns") >= era_close_ns)
-        & (pl.col("time_ns") < window_end_ns)
-    )
-
-    if window_df.is_empty():
-        return empty_row | {
-            "era_close_time": pd.to_datetime(era_close_ns, utc=True),
-        }
-
-    atr = calc_atr_from_df(window_df, period=atr_period)
-
-    return {
-        "era_int": era_int,
-        "era_close_time": pd.to_datetime(era_close_ns, utc=True),
-        "timeframe_months": forward_months,
-        "atr_period": atr_period,
-        "atr": atr,
-    }
-
-
 # =============================
 # TABLE BUILD
 # =============================
 
-def build_regime_amp_era_table(
+def build_regime_amp_grid_table(
     engine: Engine,
     pair: str,
     market_type: str,
-    eras: Sequence[int],
+    grid_start_date: str,
+    grid_end_date: str,
     forward_months_list: Sequence[int],
 ) -> pd.DataFrame:
-
-    df = load_df_main_for_eras(
+    df = load_df_main_for_grid(
         engine=engine,
         pair=pair,
         market_type=market_type,
-        eras=eras,
-        forward_months_list=forward_months_list,
+        grid_start_date=grid_start_date,
+        grid_end_date=grid_end_date,
     )
 
+    grid_start_dt = _parse_utc_dt(grid_start_date)
+    grid_end_dt = _parse_utc_dt(grid_end_date)
+
     rows = []
-    for era in eras:
-        for months in forward_months_list:
-            rows.append(calc_era_regime_amp(df, era, months))
+    for months in forward_months_list:
+        windows = split_period_windows_from_ns_df(
+            df=df,
+            months=months,
+            min_dt=grid_start_dt,
+            max_dt=grid_end_dt,
+            include_partial_tail=True,
+        )
+        for window_start, window_end in windows:
+            rows.append(calc_window_regime_amp(df, window_start, window_end, months))
 
     out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+
     return out.sort_values(["era_int", "timeframe_months"]).reset_index(drop=True)
 
 
-def build_atr_era_table(
+def build_atr_grid_table(
     engine: Engine,
     pair: str,
     market_type: str,
-    eras: Sequence[int],
+    grid_start_date: str,
+    grid_end_date: str,
     forward_months_list: Sequence[int],
     atr_period: int = 14,
 ) -> pd.DataFrame:
-
-    df = load_df_main_for_eras(
+    df = load_df_main_for_grid(
         engine=engine,
         pair=pair,
         market_type=market_type,
-        eras=eras,
-        forward_months_list=forward_months_list,
+        grid_start_date=grid_start_date,
+        grid_end_date=grid_end_date,
     )
 
+    grid_start_dt = _parse_utc_dt(grid_start_date)
+    grid_end_dt = _parse_utc_dt(grid_end_date)
+
     rows = []
-    for era in eras:
-        for months in forward_months_list:
-            rows.append(calc_era_atr(df, era, months, atr_period))
+    for months in forward_months_list:
+        windows = split_period_windows_from_ns_df(
+            df=df,
+            months=months,
+            min_dt=grid_start_dt,
+            max_dt=grid_end_dt,
+            include_partial_tail=True,
+        )
+        for window_start, window_end in windows:
+            rows.append(calc_window_atr(df, window_start, window_end, months, atr_period))
 
     out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+
     return out.sort_values(["era_int", "timeframe_months"]).reset_index(drop=True)
 
 
@@ -428,26 +538,28 @@ def main():
     pair = os.getenv("PAIR", "XXBTZUSD")
     market_type = os.getenv("MARKET_TYPE", "spot")
 
-    regime_table = build_regime_amp_era_table(
+    regime_table = build_regime_amp_grid_table(
         engine=engine,
         pair=pair,
         market_type=market_type,
-        eras=ERA_LIST,
+        grid_start_date=GRID_START_DATE,
+        grid_end_date=GRID_END_DATE,
         forward_months_list=TIMEFRAME_MONTHS_LIST,
     )
 
-    atr_table = build_atr_era_table(
+    atr_table = build_atr_grid_table(
         engine=engine,
         pair=pair,
         market_type=market_type,
-        eras=ERA_LIST,
+        grid_start_date=GRID_START_DATE,
+        grid_end_date=GRID_END_DATE,
         forward_months_list=TIMEFRAME_MONTHS_LIST,
         atr_period=14,
     )
 
-    print("\n" + "=" * 110)
-    print(f" REGIME AMP + ATR ERA CHECK | pair={pair} | market_type={market_type} ")
-    print("=" * 110)
+    print("\n" + "=" * 130)
+    print(f" GRID REGIME AMP + ATR CHECK | pair={pair} | market_type={market_type} ")
+    print("=" * 130)
     print(
         " Forward window hint (5m bars): "
         + " | ".join(f"{m}mo≈{estimate_5m_rows(m)} rows" for m in TIMEFRAME_MONTHS_LIST)
@@ -457,9 +569,25 @@ def main():
         print("No data.")
         return
 
-    print("\n" + "-" * 110)
+    if not regime_table.empty:
+        write_amp_data_py(
+            regime_table[
+                [
+                    "era_int",
+                    "era_close_time",
+                    "window_rows",
+                    "window_min_close",
+                    "window_max_close",
+                    "regime_amp_index",
+                ]
+            ].to_dict(orient="records"),
+            OUTPUT_FILE,
+        )
+        print(f"\nSaved amp_data file to: {OUTPUT_FILE}")
+
+    print("\n" + "-" * 130)
     print(" REGIME AMPLITUDE ")
-    print("-" * 110)
+    print("-" * 130)
 
     if regime_table.empty:
         print("No regime amp data.")
@@ -468,8 +596,10 @@ def main():
             regime_table[
                 [
                     "era_int",
-                    "era_close_time",
+                    "window_start_time",
+                    "window_end_time",
                     "timeframe_months",
+                    "window_rows",
                     "window_min_close",
                     "window_max_close",
                     "regime_amp_index",
@@ -477,9 +607,9 @@ def main():
             ].to_string(index=False)
         )
 
-    print("\n" + "-" * 110)
+    print("\n" + "-" * 130)
     print(" ATR ")
-    print("-" * 110)
+    print("-" * 130)
 
     if atr_table.empty:
         print("No ATR data.")
@@ -488,14 +618,14 @@ def main():
             atr_table[
                 [
                     "era_int",
-                    "era_close_time",
+                    "window_start_time",
+                    "window_end_time",
                     "timeframe_months",
                     "atr_period",
                     "atr",
                 ]
             ].to_string(index=False)
         )
-
 
 if __name__ == "__main__":
     main()

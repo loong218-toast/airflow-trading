@@ -11,120 +11,25 @@ import polars as pl
 
 from etl.schema import enforce_schema
 
+from etl.feature_helpers import (
+    _unwrap_singleton,
+    _as_list,
+    _as_bool,
+    _as_int,
+    _as_float,
+    _as_str,
+    _as_int_list,
+    _as_float_list,
+    _as_threshold_pairs,
+    _as_ma_type_list,
+)
+
 FEATURE_CACHE_DIR = Path(os.getenv(
     "FEATURE_CACHE_DIR",
     "/opt/airflow/airflow-trading/data_lake/cache",
 ))
 
 FEATURE_CACHE_VERSION = 1
-
-
-def _unwrap_singleton(value: Any) -> Any:
-    if isinstance(value, (list, tuple)) and len(value) == 1:
-        return value[0]
-    return value
-
-
-def _as_list(value: Any) -> list:
-    if value is None:
-        return []
-    if isinstance(value, list):
-        return value
-    if isinstance(value, tuple):
-        return list(value)
-    return [value]
-
-
-def _as_bool(value: Any, default: bool = False) -> bool:
-    value = _unwrap_singleton(value)
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float, np.integer, np.floating)):
-        return bool(value)
-    if isinstance(value, str):
-        v = value.strip().lower()
-        if v in {"true", "1", "yes", "y", "on"}:
-            return True
-        if v in {"false", "0", "no", "n", "off"}:
-            return False
-    return default
-
-
-def _as_int(value: Any, default: int = 0) -> int:
-    value = _unwrap_singleton(value)
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return int(value)
-    if isinstance(value, (int, np.integer)):
-        return int(value)
-    if isinstance(value, (float, np.floating)):
-        return int(value)
-    if isinstance(value, str):
-        s = value.strip()
-        if not s:
-            return default
-        return int(float(s))
-    return default
-
-
-def _as_float(value: Any, default: float = 0.0) -> float:
-    value = _unwrap_singleton(value)
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return float(int(value))
-    if isinstance(value, (int, float, np.integer, np.floating)):
-        return float(value)
-    if isinstance(value, str):
-        s = value.strip()
-        if not s:
-            return default
-        return float(s)
-    return default
-
-
-def _as_str(value: Any, default: str = "") -> str:
-    value = _unwrap_singleton(value)
-    if value is None:
-        return default
-    return str(value)
-
-
-def _as_int_list(value: Any) -> list[int]:
-    return [_as_int(x) for x in _as_list(value)]
-
-
-def _as_float_list(value: Any) -> list[float]:
-    return [_as_float(x) for x in _as_list(value)]
-
-
-def _as_ma_type_list(value: Any, count: int) -> list[str]:
-    if count <= 0:
-        return []
-
-    if value is None:
-        return ["sma"] * count
-
-    if isinstance(value, str):
-        v = value.strip().lower() or "sma"
-        return [v] * count
-
-    items = _as_list(value)
-    if not items:
-        return ["sma"] * count
-
-    if len(items) == 1:
-        v = _as_str(items[0], "sma").strip().lower() or "sma"
-        return [v] * count
-
-    out = [_as_str(x, "sma").strip().lower() or "sma" for x in items]
-    if len(out) < count:
-        out.extend(["sma"] * (count - len(out)))
-    return out[:count]
-
 
 def _ordered_unique_ints(values: Any) -> list[int]:
     out: list[int] = []

@@ -100,7 +100,6 @@ x-airflow-common:
     - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
     - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config
     - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
-    - ${AIRFLOW_PROJ_DIR:-.}/profiles:/opt/airflow/profiles
     - ${AIRFLOW_PROJ_DIR:-.}:/opt/airflow/airflow-trading
     - ${AIRFLOW_PROJ_DIR:-.}/analysis:/opt/airflow/analysis
     - ${AIRFLOW_PROJ_DIR:-.}/data_lake:/opt/airflow/airflow-trading/data_lake

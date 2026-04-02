@@ -14,15 +14,20 @@ from airflow.sdk import dag, task, Variable
 from etl.db import get_engine
 
 from etl.feature_helpers import (
-    _as_int,
-    _as_int_list,
+    _unwrap_singleton,
+    _as_list,
     _as_bool,
+    _as_int,
     _as_float,
     _as_str,
+    _as_int_list,
+    _as_float_list,
     _as_threshold_pairs,
+    _as_ma_type_list,
+    generate_filtered_signals
 )
 
-from etl.feature_helpers import precompute_all_possible_features, generate_filtered_signals
+from etl.feature_prep import precompute_all_possible_features
 
 from etl.schema import enforce_schema
 
@@ -202,8 +207,13 @@ def _combo_name(cfg: dict) -> str:
 
 
 def _signal_key(row: dict) -> str:
-    return f"{row.get('pair')}|{row.get('time_ns')}|{row.get('side')}|{row.get('regime_id')}"
-
+    return (
+        f"{row.get('pair', '')}|"
+        f"{row.get('market_type', '')}|"
+        f"{row.get('time_ns', '')}|"
+        f"{row.get('side', '')}|"
+        f"{row.get('regime_id', '')}"
+    )
 
 def _read_last_state() -> dict:
     if not STATE_PATH.exists():
@@ -311,6 +321,11 @@ def kraken_signal_ingest():
                 "has_signal": False,
                 "reason": "no signal",
             }
+            
+        df_signals = df_signals.with_columns([
+            pl.lit(pair).alias("pair"),
+            pl.lit(market_type).alias("market_type")
+        ])
 
         df_signals = df_signals.sort("time_ns")
         latest_ts = df_signals["time_ns"].max()

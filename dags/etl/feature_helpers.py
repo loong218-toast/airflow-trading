@@ -104,6 +104,29 @@ def _as_threshold_pairs(value: Any) -> list[list[float]]:
         return [vals] if vals else []
     return [[_as_float(value)]]
 
+def _as_ma_type_list(value: Any, count: int) -> list[str]:
+    if count <= 0:
+        return []
+
+    if value is None:
+        return ["sma"] * count
+
+    if isinstance(value, str):
+        v = value.strip().lower() or "sma"
+        return [v] * count
+
+    items = _as_list(value)
+    if not items:
+        return ["sma"] * count
+
+    if len(items) == 1:
+        v = _as_str(items[0], "sma").strip().lower() or "sma"
+        return [v] * count
+
+    out = [_as_str(x, "sma").strip().lower() or "sma" for x in items]
+    if len(out) < count:
+        out.extend(["sma"] * (count - len(out)))
+    return out[:count]
 
 # -----------------------------
 # time / index helpers
@@ -305,11 +328,6 @@ def get_regime_amp_index_for_indices(
         out.append(vals)
 
     return tuple(out)
-
-
-# Backward-compatible alias.
-get_regime_amp_for_indices = get_regime_amp_index_for_indices
-
 
 # -----------------------------
 # stochastic helpers
@@ -536,33 +554,10 @@ def selected_gap_col_for_ma_int(ma_int: int) -> str:
     return "ma_price_gap_a"
 
 
-# -----------------------------
-# compatibility shims
-# -----------------------------
-def add_regime_amp_index_features(df: pl.DataFrame, run_cfg: dict) -> pl.DataFrame:
-    """
-    Compatibility shim.
-    Regime amplitude columns are now precomputed in feature_prep.py.
-    """
-    return df
-
-
-def precompute_all_possible_features(df: pl.DataFrame, run_cfg: dict):
-    """
-    Compatibility wrapper.
-    The real implementation now lives in etl.feature_prep.
-    """
-    from etl.feature_prep import precompute_all_possible_features as _precompute
-    return _precompute(df, run_cfg)
-
-
 __all__ = [
     "normalize_signals_times",
     "get_ma_price_gaps_for_indices",
     "get_regime_amp_index_for_indices",
-    "get_regime_amp_for_indices",
     "generate_filtered_signals",
-    "selected_gap_col_for_ma_int",
-    "add_regime_amp_index_features",
-    "precompute_all_possible_features",
+    "selected_gap_col_for_ma_int"
 ]

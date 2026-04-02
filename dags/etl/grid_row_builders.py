@@ -1,3 +1,4 @@
+# etl/grid_row_builders.py
 def _make_master_row(
     regime_id: int,
     era_int: int,
@@ -18,6 +19,9 @@ def _make_master_row(
         "total_pos": int(total_pos),
         "side": int(side_flag),
         "exit_window_h": int(regime_cfg.get("exit_window_h", 0)),
+        "limit_order_expiry_h": int(regime_cfg.get("limit_order_expiry_h", 0)),
+        "use_limit_entry": bool(regime_cfg.get("use_limit_entry", False)),
+        "trade_window_interval": int(regime_cfg.get("trade_window_interval", 0)),
         "era_int": int(era_int),
         "regime_id": int(regime_id),
         "ma_int": int(regime_cfg.get("ma_int", 0)),

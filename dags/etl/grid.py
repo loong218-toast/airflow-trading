@@ -18,6 +18,7 @@ import secrets
 from itertools import product
 
 import numba as _numba
+from numba import njit
 _numba_threads = int(os.getenv("NUMBA_NUM_THREADS", os.getenv("NUMBA_NUM_THREADS_OVERRIDE", "1")))
 try:
     _numba.set_num_threads(_numba_threads)
@@ -31,18 +32,22 @@ import psutil
 from airflow.exceptions import AirflowFailException
 
 from etl.transform import build_df_main_from_5m_polars, load_candles_from_db_polars
+
+from etl.feature_prep import (
+    load_prepared_feature_ref, 
+    precompute_all_possible_features, 
+    prepare_feature_cache
+    )
 from etl.feature_helpers import (
-    normalize_signals_times,
-    generate_filtered_signals,
-    get_ma_price_gaps_for_indices,
-    add_regime_amp_index_features,
-    get_regime_amp_index_for_indices,
-)
+    generate_filtered_signals, 
+    get_ma_price_gaps_for_indices, 
+    get_regime_amp_index_for_indices
+    )
+
 from etl.db import get_engine
 
 from etl.backtest import (
     backtest_signals_sl_tp_rets,
-    fast_compound_equity,
     fast_compound_equity_gate,
     compute_pnl_pct_vectorized
 )
@@ -79,6 +84,45 @@ def heartbeat_log(tag: str, extra: dict | None = None):
     cpu = psutil.cpu_percent(interval=None)
     extra = extra or {}
     logger.info(f"💓 {tag} | cpu={cpu:.1f}% mem={mem//1024//1024}MB {extra}")
+
+from pathlib import Path
+
+def _get_cgroup_memory_limit_bytes() -> int | None:
+    paths = [
+        Path("/sys/fs/cgroup/memory.max"),                 # cgroup v2
+        Path("/sys/fs/cgroup/memory/memory.limit_in_bytes") # cgroup v1
+    ]
+
+    for p in paths:
+        try:
+            if p.exists():
+                txt = p.read_text().strip()
+                if txt == "max":
+                    return None
+                val = int(txt)
+                if val > 0 and val < 1 << 60:
+                    return val
+        except Exception:
+            pass
+
+    return None
+
+
+def _get_process_rss_mb() -> float:
+    try:
+        return float(psutil.Process().memory_info().rss) / (1024.0 * 1024.0)
+    except Exception:
+        return 0.0
+
+
+def _get_memory_guard_mb() -> float:
+    limit_bytes = _get_cgroup_memory_limit_bytes()
+    if limit_bytes is not None:
+        return float(limit_bytes) / (1024.0 * 1024.0)
+    try:
+        return float(psutil.virtual_memory().total) / (1024.0 * 1024.0)
+    except Exception:
+        return 0.0
 
 def _split_period_windows_from_pl(
     df: pl.DataFrame,
@@ -230,13 +274,9 @@ class EquityStager:
         if df_chunk is None or df_chunk.height == 0:
             return
 
-        # Enforce canonical equity schema once before writing
-        df_chunk = enforce_schema(df_chunk, "equity", strict=True)
-        if df_chunk.height == 0:
-            return
-
         writer = self._ensure_writer(part_key, df_chunk)
         writer.write_table(df_chunk.to_arrow())
+
 
     def stage(self, part_key: str, df_small: pl.DataFrame):
         """
@@ -254,7 +294,6 @@ class EquityStager:
         if df_canonical.height == 0:
             return
 
-        # Write in smaller chunks if the input batch is large
         n = int(df_canonical.height)
         step = max(1, int(self.flush_rows))
 
@@ -265,13 +304,6 @@ class EquityStager:
             except Exception:
                 logger.exception("EquityStager.stage: write failed for part %s", part_key)
                 raise
-
-        # free temporary objects quickly
-        try:
-            del df_canonical
-            gc.collect()
-        except Exception:
-            pass
 
     def flush(self, part_key: str):
         """
@@ -500,8 +532,65 @@ def _build_era_registry(
 
     return out
 
+@njit(cache=True)
+def _numba_pnl_from_actual_exits(
+    entry_prices,
+    exit_prices,
+    spread_arr,
+    funding_raw,
+    entry_idxs,
+    exit_idxs,
+    main_time_ns,
+    side_flag,
+    risk_pct,
+    sl_val,
+    sl_tp_in_pct,
+    spread_is_percent,
+    funding_period_hours,
+):
+    n = entry_prices.shape[0]
+    pnl_out = np.empty(n, dtype=np.float64)
+
+    risk = float(risk_pct)
+    ns_to_hours = 1.0 / (1e9 * 3600.0)
+    f_period = float(max(1, funding_period_hours))
+    side = 1 if int(side_flag) >= 0 else -1
+
+    for i in range(n):
+        ep = float(entry_prices[i])
+        xp = float(exit_prices[i])
+        ep_safe = ep if ep != 0.0 else 1.0
+
+        h_hours = (main_time_ns[exit_idxs[i]] - main_time_ns[entry_idxs[i]]) * ns_to_hours
+        f_fee = (funding_raw[i] / f_period) * h_hours
+
+        spread = float(spread_arr[i])
+        if spread_is_percent:
+            spr_pct = spread
+        else:
+            spr_pct = (spread / ep_safe) * 100.0
+
+        if sl_tp_in_pct:
+            raw_sl = float(sl_val)
+        else:
+            raw_sl = (float(sl_val) / ep_safe) * 100.0
+
+        eff_sl = max(raw_sl + spr_pct, 0.01)
+        pos_size = min(risk / (eff_sl / 100.0), 100.0)
+
+        if side == 1:
+            trade_ret = (xp - ep) / ep_safe
+        else:
+            trade_ret = (ep - xp) / ep_safe
+
+        pnl_out[i] = max(min((pos_size * trade_ret) - f_fee, 1e10), -1.0)
+
+    return pnl_out
+
+
 def compute_equity_preview(
-    closed_rets: np.ndarray,
+    closed_entry_prices_arr: np.ndarray,
+    closed_exit_prices_arr: np.ndarray,
     closed_entry_idxs: np.ndarray,
     closed_exit_idxs: np.ndarray,
     main_close_arr: np.ndarray,
@@ -510,24 +599,25 @@ def compute_equity_preview(
     main_funding_arr: np.ndarray,
     sl_val: float,
     tp_val: float,
+    side_flag: int,
     run_cfg: dict,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]:
-    pnl_pct_arr, exit_times_ns = compute_pnl_pct_vectorized(
-        closed_masked_rets=closed_rets,
-        closed_entry_idxs=closed_entry_idxs,
-        closed_exit_idxs=closed_exit_idxs,
-        main_close_arr=main_close_arr,
-        main_time_ns_arr=main_time_ns_arr,
-        entry_prices_arr=None,
-        spread_arr=main_spread_arr,
-        funding_arr=main_funding_arr,
-        sl_val=sl_val,
-        tp_val=tp_val,
+    pnl_pct_arr = _numba_pnl_from_actual_exits(
+        entry_prices=np.asarray(closed_entry_prices_arr, dtype=np.float64),
+        exit_prices=np.asarray(closed_exit_prices_arr, dtype=np.float64),
+        spread_arr=np.asarray(main_spread_arr[closed_entry_idxs], dtype=np.float64)
+        if main_spread_arr is not None else np.zeros(closed_entry_idxs.shape[0], dtype=np.float64),
+        funding_raw=np.asarray(main_funding_arr[closed_entry_idxs], dtype=np.float64)
+        if main_funding_arr is not None else np.zeros(closed_entry_idxs.shape[0], dtype=np.float64),
+        entry_idxs=np.asarray(closed_entry_idxs, dtype=np.int64),
+        exit_idxs=np.asarray(closed_exit_idxs, dtype=np.int64),
+        main_time_ns=np.asarray(main_time_ns_arr, dtype=np.int64),
+        side_flag=int(side_flag),
         risk_pct=float(run_cfg.get("risk_pct", 0.005)),
+        sl_val=float(sl_val),
         sl_tp_in_pct=bool(run_cfg.get("sl_tp_in_pct", True)),
-        funding_period_hours=int(run_cfg.get("funding_period_hours", 8)),
-        funding_rate_unit=str(run_cfg.get("funding_rate_unit", "per_period")),
         spread_is_percent=bool(run_cfg.get("spread_is_percent", True)),
+        funding_period_hours=int(run_cfg.get("funding_period_hours", 8)),
     )
 
     if pnl_pct_arr is None or pnl_pct_arr.size == 0:
@@ -544,6 +634,7 @@ def compute_equity_preview(
     equity_arr, max_dd, breached = fast_compound_equity_gate(pnl_pct_arr, 100.0, max_dd_threshold)
     equity_arr = np.nan_to_num(equity_arr, nan=0.0, posinf=1e37, neginf=-1e37)
 
+    exit_times_ns = np.asarray(main_time_ns_arr[closed_exit_idxs], dtype=np.int64)
     return pnl_pct_arr, exit_times_ns, equity_arr, float(max_dd), bool(breached)
 
 def stage_equity_from_preview(
@@ -667,7 +758,6 @@ def _run_backtest_grid(
     total_in_batch: int,
     combos: List[Tuple[float, float]],
 ):
-
     df_main = data_ctx["df_main"]
     main_close_arr = data_ctx["main_close_arr"]
     main_high_arr = data_ctx["main_high_arr"]
@@ -675,6 +765,10 @@ def _run_backtest_grid(
     main_time_ns_arr = data_ctx["main_time_ns_arr"]
     main_spread_arr = data_ctx["main_spread_arr"]
     main_funding_arr = data_ctx["main_funding_arr"]
+
+    use_limit_entry = bool(regime_cfg.get("use_limit_entry", True))
+    limit_order_expiry_h = int(regime_cfg.get("limit_order_expiry_h", 0) or 0)
+    trade_window_interval = int(regime_cfg.get("trade_window_interval", 0) or 0)
 
     if df_signals is not None and not df_signals.is_empty():
         buys = df_signals.filter(pl.col("side") == 1)
@@ -697,13 +791,25 @@ def _run_backtest_grid(
                         round(float(row["TP"]), 6),
                         int(row["side"]),
                         int(row["exit_window_h"]),
+                        int(bool(row.get("use_sl_decay", False))),
+                        round(float(row.get("sl_decay_pct", 0.0)), 6),
+                        int(row.get("sl_decay_interval", 0)),
+                        int(bool(row.get("sl_decay_stop_at_pos", True))),
+                        int(bool(row.get("use_limit_entry", True))),
+                        int(row.get("limit_order_expiry_h", 0)),
+                        int(row.get("trade_window_interval", 0)),
                     )
                     bucket_map[key] = row
         except Exception as e:
             logger.debug("load_backtest_cached failed for cfg=%s era=%s: %s", regime_id, era_label, e)
             bucket_map = {}
 
-    logger.info("DEBUG: era=%s regime=%s total_signals=%d", era_label, regime_id, int(df_signals.height))
+    logger.info(
+        "DEBUG: era=%s regime=%s total_signals=%d",
+        era_label,
+        regime_id,
+        int(df_signals.height) if df_signals is not None else 0,
+    )
 
     dd_pass = 0
     dd_fail = 0
@@ -742,31 +848,58 @@ def _run_backtest_grid(
             sig_max_ns = int(sig_times_ns.max()) if sig_n > 0 else -1
 
             entry_idx = None
+            entry_price_arr = None
             exit_idx = None
             rets = None
 
-            if bucket_map:
-                key = (
-                    sig_n,
-                    sig_min_ns,
-                    sig_max_ns,
-                    round(float(sl_val), 6),
-                    round(float(tp_val), 6),
-                    int(side_flag),
-                    int(regime_cfg.get("exit_window_h", 0)),
-                    int(bool(regime_cfg.get("use_sl_decay", False))),
-                    round(float(regime_cfg.get("sl_decay_pct", 0.0)), 6),
-                    int(regime_cfg.get("sl_decay_interval", 0)),
-                    int(bool(regime_cfg.get("sl_decay_stop_at_pos", True))),
-                )
-                hit = bucket_map.get(key)
-                if hit is not None:
-                    cache_hit += 1
-                    entry_idx = np.asarray(hit["entry_idx"], dtype=np.int64)
-                    exit_idx = np.asarray(hit["exit_idx"], dtype=np.int64)
-                    rets = np.asarray(hit["ret"], dtype=np.float64)
-                else:
+            key = (
+                sig_n,
+                sig_min_ns,
+                sig_max_ns,
+                round(float(sl_val), 6),
+                round(float(tp_val), 6),
+                int(side_flag),
+                int(regime_cfg.get("exit_window_h", 0)),
+                int(bool(regime_cfg.get("use_sl_decay", False))),
+                round(float(regime_cfg.get("sl_decay_pct", 0.0)), 6),
+                int(regime_cfg.get("sl_decay_interval", 0)),
+                int(bool(regime_cfg.get("sl_decay_stop_at_pos", True))),
+                int(use_limit_entry),
+                int(limit_order_expiry_h),
+                int(trade_window_interval),
+            )
+
+            hit = bucket_map.get(key)
+            if hit is not None:
+                entry_idx = np.asarray(hit.get("entry_idx", []), dtype=np.int64)
+                entry_price_arr = np.asarray(hit.get("entry_price", []), dtype=np.float64)
+                exit_idx = np.asarray(hit.get("exit_idx", []), dtype=np.int64)
+                exit_price_arr = np.asarray(hit.get("exit_price", []), dtype=np.float64)
+                rets = np.asarray(hit.get("ret", []), dtype=np.float64)
+                exit_reason_arr = np.asarray(hit.get("exit_reason", []), dtype=np.int8)
+
+                if use_limit_entry and entry_price_arr.size != entry_idx.size:
+                    hit = None
+                    entry_idx = None
+                    entry_price_arr = None
+                    exit_idx = None
+                    exit_price_arr = None
+                    rets = None
+                    exit_reason_arr = None
                     cache_miss += 1
+                else:
+                    if exit_price_arr.size != entry_price_arr.size:
+                        if side_flag == 1:
+                            exit_price_arr = entry_price_arr * (1.0 + rets)
+                        else:
+                            exit_price_arr = entry_price_arr * (1.0 - rets)
+
+                    if exit_reason_arr.size != entry_idx.size:
+                        exit_reason_arr = np.zeros(entry_idx.size, dtype=np.int8)
+
+                    cache_hit += 1
+            else:
+                cache_miss += 1
 
             if (sig_idxs < 0).any() or (sig_idxs >= len(main_close_arr)).any():
                 logger.error("OOB Index: cfg=%s era=%s sig_idxs out of range", regime_id, era_label)
@@ -784,18 +917,27 @@ def _run_backtest_grid(
                         tp=float(tp_val),
                         sl_tp_in_pct=bool(run_cfg.get("sl_tp_in_pct", True)),
                         exit_window_h=int(regime_cfg.get("exit_window_h", 0)),
+                        limit_order_expiry_h=limit_order_expiry_h,
+                        trade_window_interval=trade_window_interval,
                         base_minutes=int(run_cfg.get("BASE_MINUTES", 5)),
                         spread=float(run_cfg.get("BTC_SETTINGS", {}).get("spread", 0.0)),
                         conservative_sl_first=bool(run_cfg.get("conservative_sl_first", True)),
                         side_flag=side_flag,
+                        use_limit_entry=use_limit_entry,
                         use_sl_decay=bool(regime_cfg.get("use_sl_decay", False)),
                         sl_decay_pct=float(regime_cfg.get("sl_decay_pct", 0.0)),
                         sl_decay_interval=int(regime_cfg.get("sl_decay_interval", 0)),
                         sl_decay_stop_at_pos=bool(regime_cfg.get("sl_decay_stop_at_pos", True)),
                     )
+
                     entry_idx = np.asarray(res.get("entry_idx", []), dtype=np.int64)
+                    entry_price_arr = np.asarray(res.get("entry_price", []), dtype=np.float64)
                     exit_idx = np.asarray(res.get("exit_idx", []), dtype=np.int64)
-                    rets = np.asarray(res.get("rets", res.get("ret", [])), dtype=np.float64)
+                    exit_price_arr = np.asarray(res.get("exit_price", []), dtype=np.float64)
+                    rets = np.asarray(res.get("rets", []), dtype=np.float64)
+                    exit_reason_arr = np.asarray(res.get("exit_reason", []), dtype=np.int8)
+
+                    filled_pos = int(entry_idx.size)
 
                     res_df = pl.DataFrame(
                         {
@@ -811,9 +953,15 @@ def _run_backtest_grid(
                             "sl_decay_pct": [float(regime_cfg.get("sl_decay_pct", 0.0))],
                             "sl_decay_interval": [int(regime_cfg.get("sl_decay_interval", 0))],
                             "sl_decay_stop_at_pos": [bool(regime_cfg.get("sl_decay_stop_at_pos", True))],
+                            "use_limit_entry": [bool(use_limit_entry)],
+                            "limit_order_expiry_h": [int(limit_order_expiry_h)],
+                            "trade_window_interval": [int(trade_window_interval)],
                             "entry_idx": pl.Series([entry_idx], dtype=pl.List(pl.Int64)),
+                            "entry_price": pl.Series([entry_price_arr], dtype=pl.List(pl.Float32)),
                             "exit_idx": pl.Series([exit_idx], dtype=pl.List(pl.Int64)),
                             "ret": pl.Series([rets], dtype=pl.List(pl.Float32)),
+                            "exit_price": pl.Series([exit_price_arr], dtype=pl.List(pl.Float32)),
+                            "exit_reason": pl.Series([exit_reason_arr], dtype=pl.List(pl.Int8)),
                         }
                     ).pipe(enforce_schema, "backtest", strict=True)
 
@@ -821,23 +969,41 @@ def _run_backtest_grid(
                 except Exception as e:
                     logger.error("Backtest kernel error cfg=%s era=%s: %s", regime_id, era_label, e)
                     continue
+            else:
+                filled_pos = int(entry_idx.size)
 
-            mask_closed = np.asarray([]) if exit_idx is None else (exit_idx >= 0)
-
-            if not (mask_closed.size and mask_closed.any()):
+            if entry_idx.size == 0:
                 master_row_raw = _make_master_row(
                     regime_id=regime_id,
                     era_int=era_int,
                     side_flag=side_flag,
                     sl_val=sl_val,
                     tp_val=tp_val,
-                    total_pos=total_pos,
+                    total_pos=0,
                     win_pos=0,
                     balance=100.0,
                     max_dd=0.0,
                     regime_cfg=regime_cfg,
                 )
-                
+                buffer_master_row(results_dir, batch_id, master_row_raw)
+                empty_rows_written += 1
+                master_rows_written += 1
+                continue
+
+            mask_closed = exit_idx >= 0
+            if not mask_closed.any():
+                master_row_raw = _make_master_row(
+                    regime_id=regime_id,
+                    era_int=era_int,
+                    side_flag=side_flag,
+                    sl_val=sl_val,
+                    tp_val=tp_val,
+                    total_pos=filled_pos,
+                    win_pos=0,
+                    balance=100.0,
+                    max_dd=0.0,
+                    regime_cfg=regime_cfg,
+                )
                 buffer_master_row(results_dir, batch_id, master_row_raw)
                 master_rows_written += 1
                 continue
@@ -845,8 +1011,10 @@ def _run_backtest_grid(
             closed_rets = rets[mask_closed]
             closed_entry_idxs = entry_idx[mask_closed].astype(np.int64)
             closed_exit_idxs = exit_idx[mask_closed].astype(np.int64)
+            closed_entry_prices = entry_price_arr[mask_closed].astype(np.float64)
+            closed_exit_prices = exit_price_arr[mask_closed].astype(np.float64)
 
-            rng_24h_entry, rng_72h_entry, rng_1w_entry, rng_1m_entry = get_regime_amp_for_indices(
+            rng_24h_entry, rng_72h_entry, rng_1w_entry, rng_1m_entry = get_regime_amp_index_for_indices(
                 df_main=df_main,
                 entry_idxs=closed_entry_idxs,
             )
@@ -855,6 +1023,7 @@ def _run_backtest_grid(
                 closed_rets=closed_rets,
                 closed_entry_idxs=closed_entry_idxs,
                 closed_exit_idxs=closed_exit_idxs,
+                entry_prices_arr=closed_entry_prices,
                 main_close_arr=main_close_arr,
                 main_time_ns_arr=main_time_ns_arr,
                 main_spread_arr=main_spread_arr,
@@ -866,11 +1035,6 @@ def _run_backtest_grid(
 
             if breached:
                 dd_fail += 1
-                logger.debug(
-                    "DD FAIL era=%s regime=%s side=%s SL=%.4f TP=%.4f max_dd=%.4f threshold=%.4f -> skip equity only",
-                    era_label, regime_id, int(side_flag), float(sl_val), float(tp_val), float(current_max_dd), float(max_dd_threshold),
-                )
-
                 final_balance = float(equity_arr[-1]) if equity_arr.size else 100.0
                 win_pos = int(np.count_nonzero(closed_rets > 0.0)) if closed_rets.size else 0
 
@@ -880,13 +1044,12 @@ def _run_backtest_grid(
                     side_flag=side_flag,
                     sl_val=sl_val,
                     tp_val=tp_val,
-                    total_pos=total_pos,
+                    total_pos=filled_pos,
                     win_pos=win_pos,
                     balance=final_balance,
                     max_dd=current_max_dd,
                     regime_cfg=regime_cfg,
                 )
-                
                 buffer_master_row(results_dir, batch_id, master_row_raw)
                 master_rows_written += 1
                 continue
@@ -931,15 +1094,13 @@ def _run_backtest_grid(
                 side_flag=side_flag,
                 sl_val=sl_val,
                 tp_val=tp_val,
-                total_pos=total_pos,
+                total_pos=filled_pos,
                 win_pos=win_pos,
                 balance=final_balance,
                 max_dd=max_dd,
                 regime_cfg=regime_cfg,
             )
-            
             buffer_master_row(results_dir, batch_id, master_row_raw)
-            master_rows_written += 1
 
     return {
         "dd_pass": dd_pass,
@@ -961,17 +1122,13 @@ def process_era_combos(
     stager,
     max_dd_threshold: float,
     current_idx: int,
-    total_in_batch: int
+    total_in_batch: int,
 ) -> Tuple[int, int]:
     """
     Global signals once, global trade simulation once per combo/side,
     then slice the global trade arrays by era.
-
-    Keeps your streaming writes:
-      - signal cache is written once under era_label='GLOBAL'
-      - backtest cache is still written per era/regime/combo
-      - equity/master rows are still staged incrementally
     """
+
     required_keys = (
         "df_main",
         "main_time_ns_arr",
@@ -1012,7 +1169,6 @@ def process_era_combos(
 
     logger.debug("process_era_combos: regime=%s windows=%d", regime_id, len(windows))
 
-    # one global signal set for this regime
     global_signals = _get_or_generate_global_signals(
         regime_id=regime_id,
         regime_cfg=regime_cfg,
@@ -1023,7 +1179,6 @@ def process_era_combos(
 
     era_registry = _build_era_registry(windows, global_signals)
 
-    # pre-load era backtest caches once
     bucket_maps_by_era = {}
     if not bool(run_cfg.get("force_rebuild_cache", False)):
         for era in era_registry:
@@ -1045,13 +1200,15 @@ def process_era_combos(
                             round(float(row.get("sl_decay_pct", 0.0)), 6),
                             int(row.get("sl_decay_interval", 0)),
                             int(bool(row.get("sl_decay_stop_at_pos", True))),
+                            int(bool(row.get("use_limit_entry", True))),
+                            int(row.get("limit_order_expiry_h", 0)),
+                            int(row.get("trade_window_interval", 0)),
                         )
                         bucket_map[key] = row
             except Exception as e:
                 logger.debug("load_backtest_cached failed cfg=%s era=%s: %s", regime_id, era_label, e)
             bucket_maps_by_era[era_label] = bucket_map
 
-    # global signal arrays by side
     if global_signals is not None and not global_signals.is_empty():
         global_buys = global_signals.filter(pl.col("side") == 1)
         global_sells = global_signals.filter(pl.col("side") == -1)
@@ -1059,13 +1216,28 @@ def process_era_combos(
         global_buys = pl.DataFrame([], schema=get_schema("signals"))
         global_sells = pl.DataFrame([], schema=get_schema("signals"))
 
-    buy_sig_idxs_all = global_buys["idx"].to_numpy(allow_copy=True).astype(np.int64) if not global_buys.is_empty() else np.asarray([], dtype=np.int64)
-    buy_sig_times_all = global_buys["time_ns"].to_numpy(allow_copy=True).astype(np.int64) if not global_buys.is_empty() else np.asarray([], dtype=np.int64)
+    buy_sig_idxs_all = (
+        global_buys["idx"].to_numpy(allow_copy=True).astype(np.int64)
+        if not global_buys.is_empty()
+        else np.asarray([], dtype=np.int64)
+    )
+    buy_sig_times_all = (
+        global_buys["time_ns"].to_numpy(allow_copy=True).astype(np.int64)
+        if not global_buys.is_empty()
+        else np.asarray([], dtype=np.int64)
+    )
 
-    sell_sig_idxs_all = global_sells["idx"].to_numpy(allow_copy=True).astype(np.int64) if not global_sells.is_empty() else np.asarray([], dtype=np.int64)
-    sell_sig_times_all = global_sells["time_ns"].to_numpy(allow_copy=True).astype(np.int64) if not global_sells.is_empty() else np.asarray([], dtype=np.int64)
+    sell_sig_idxs_all = (
+        global_sells["idx"].to_numpy(allow_copy=True).astype(np.int64)
+        if not global_sells.is_empty()
+        else np.asarray([], dtype=np.int64)
+    )
+    sell_sig_times_all = (
+        global_sells["time_ns"].to_numpy(allow_copy=True).astype(np.int64)
+        if not global_sells.is_empty()
+        else np.asarray([], dtype=np.int64)
+    )
 
-    # track how many master rows each era gets
     era_master_rows_written = {era["era_label"]: 0 for era in era_registry}
 
     dd_pass = 0
@@ -1076,14 +1248,16 @@ def process_era_combos(
     master_rows_written = 0
     empty_rows_written = 0
 
-    # global simulation once per combo/side
+    use_limit_entry = bool(regime_cfg.get("use_limit_entry", True))
+    limit_order_expiry_h = int(regime_cfg.get("limit_order_expiry_h", 0) or 0)
+    trade_window_interval = int(regime_cfg.get("trade_window_interval", 0) or 0)
+
     for sl_val, tp_val in combos:
         for side_flag, side_sig_idxs_all, side_sig_times_all in (
             (1, buy_sig_idxs_all, buy_sig_times_all),
             (-1, sell_sig_idxs_all, sell_sig_times_all),
         ):
             if side_sig_idxs_all.size == 0:
-                # no signals at all for this side; write zero rows for every era
                 for era in era_registry:
                     era_label = era["era_label"]
                     master_row_raw = _make_master_row(
@@ -1098,14 +1272,12 @@ def process_era_combos(
                         max_dd=0.0,
                         regime_cfg=regime_cfg,
                     )
-                    
                     buffer_master_row(results_dir, batch_id, master_row_raw)
                     era_master_rows_written[era_label] += 1
                     empty_rows_written += 1
                     master_rows_written += 1
                 continue
 
-            # one global backtest for the whole regime/side/combo
             try:
                 res = backtest_signals_sl_tp_rets(
                     main_close_arr=main_close_arr,
@@ -1117,25 +1289,46 @@ def process_era_combos(
                     tp=float(tp_val),
                     sl_tp_in_pct=bool(run_cfg.get("sl_tp_in_pct", True)),
                     exit_window_h=int(regime_cfg.get("exit_window_h", 0)),
+                    limit_order_expiry_h=limit_order_expiry_h,
+                    trade_window_interval=trade_window_interval,
                     base_minutes=int(run_cfg.get("BASE_MINUTES", 5)),
                     spread=float(run_cfg.get("BTC_SETTINGS", {}).get("spread", 0.0)),
                     conservative_sl_first=bool(run_cfg.get("conservative_sl_first", True)),
                     side_flag=side_flag,
+                    use_limit_entry=use_limit_entry,
                     use_sl_decay=bool(regime_cfg.get("use_sl_decay", False)),
                     sl_decay_pct=float(regime_cfg.get("sl_decay_pct", 0.0)),
                     sl_decay_interval=int(regime_cfg.get("sl_decay_interval", 0)),
                     sl_decay_stop_at_pos=bool(regime_cfg.get("sl_decay_stop_at_pos", True)),
                 )
             except Exception as e:
-                logger.error("Global backtest kernel error cfg=%s side=%s SL=%.4f TP=%.4f: %s", regime_id, side_flag, float(sl_val), float(tp_val), e)
+                logger.error(
+                    "Global backtest kernel error cfg=%s side=%s SL=%.4f TP=%.4f: %s",
+                    regime_id,
+                    side_flag,
+                    float(sl_val),
+                    float(tp_val),
+                    e,
+                )
                 continue
 
             entry_idx_all = np.asarray(res.get("entry_idx", []), dtype=np.int64)
+            entry_price_all = np.asarray(res.get("entry_price", []), dtype=np.float64)
             exit_idx_all = np.asarray(res.get("exit_idx", []), dtype=np.int64)
-            rets_all = np.asarray(res.get("rets", res.get("ret", [])), dtype=np.float64)
+            exit_price_all = np.asarray(res.get("exit_price", []), dtype=np.float64)
+            rets_all = np.asarray(res.get("rets", []), dtype=np.float64)
+            exit_reason_all = np.asarray(res.get("exit_reason", []), dtype=np.int8)
+
+            if exit_price_all.size != entry_price_all.size:
+                if side_flag == 1:
+                    exit_price_all = entry_price_all * (1.0 + rets_all)
+                else:
+                    exit_price_all = entry_price_all * (1.0 - rets_all)
+
+            if exit_reason_all.size != entry_idx_all.size:
+                exit_reason_all = np.zeros(entry_idx_all.size, dtype=np.int8)
 
             if entry_idx_all.size == 0:
-                # no trades generated at all; still write zero rows for every era
                 for era in era_registry:
                     era_label = era["era_label"]
                     master_row_raw = _make_master_row(
@@ -1150,15 +1343,14 @@ def process_era_combos(
                         max_dd=0.0,
                         regime_cfg=regime_cfg,
                     )
-                    
                     buffer_master_row(results_dir, batch_id, master_row_raw)
                     era_master_rows_written[era_label] += 1
                     empty_rows_written += 1
                     master_rows_written += 1
                 continue
 
-            closed_mask_all = exit_idx_all >= 0
             entry_time_ns_all = main_time_ns_arr[entry_idx_all]
+            closed_mask_all = exit_idx_all >= 0
 
             for era in era_registry:
                 era_label = era["era_label"]
@@ -1166,14 +1358,11 @@ def process_era_combos(
                 end_ns = era["end_ns"]
                 bucket_map = bucket_maps_by_era.get(era_label, {})
 
-                # era-side signal stats
                 if side_flag == 1:
-                    era_sig_mask = era["buy_sig_mask"]
                     sig_n = era["buy_sig_n"]
                     sig_min_ns = era["buy_sig_min_ns"]
                     sig_max_ns = era["buy_sig_max_ns"]
                 else:
-                    era_sig_mask = era["sell_sig_mask"]
                     sig_n = era["sell_sig_n"]
                     sig_min_ns = era["sell_sig_min_ns"]
                     sig_max_ns = era["sell_sig_max_ns"]
@@ -1191,15 +1380,14 @@ def process_era_combos(
                         max_dd=0.0,
                         regime_cfg=regime_cfg,
                     )
-                    
                     buffer_master_row(results_dir, batch_id, master_row_raw)
                     era_master_rows_written[era_label] += 1
                     empty_rows_written += 1
                     master_rows_written += 1
                     continue
 
-                # reuse era cache if present
                 entry_idx = None
+                entry_price_arr = None
                 exit_idx = None
                 rets = None
 
@@ -1215,17 +1403,45 @@ def process_era_combos(
                     round(float(regime_cfg.get("sl_decay_pct", 0.0)), 6),
                     int(regime_cfg.get("sl_decay_interval", 0)),
                     int(bool(regime_cfg.get("sl_decay_stop_at_pos", True))),
+                    int(use_limit_entry),
+                    int(limit_order_expiry_h),
+                    int(trade_window_interval),
                 )
 
                 hit = bucket_map.get(key)
                 if hit is not None:
-                    cache_hit += 1
-                    entry_idx = np.asarray(hit["entry_idx"], dtype=np.int64)
-                    exit_idx = np.asarray(hit["exit_idx"], dtype=np.int64)
-                    rets = np.asarray(hit["ret"], dtype=np.float64)
+                    entry_idx = np.asarray(hit.get("entry_idx", []), dtype=np.int64)
+                    entry_price_arr = np.asarray(hit.get("entry_price", []), dtype=np.float64)
+                    exit_idx = np.asarray(hit.get("exit_idx", []), dtype=np.int64)
+                    exit_price_arr = np.asarray(hit.get("exit_price", []), dtype=np.float64)
+                    rets = np.asarray(hit.get("ret", []), dtype=np.float64)
+                    exit_reason_arr = np.asarray(hit.get("exit_reason", []), dtype=np.int8)
+
+                    if use_limit_entry and entry_price_arr.size != entry_idx.size:
+                        hit = None
+                        entry_idx = None
+                        entry_price_arr = None
+                        exit_idx = None
+                        exit_price_arr = None
+                        rets = None
+                        exit_reason_arr = None
+                        cache_miss += 1
+                    else:
+                        if exit_price_arr.size != entry_price_arr.size:
+                            if side_flag == 1:
+                                exit_price_arr = entry_price_arr * (1.0 + rets)
+                            else:
+                                exit_price_arr = entry_price_arr * (1.0 - rets)
+
+                        if exit_reason_arr.size != entry_idx.size:
+                            exit_reason_arr = np.zeros(entry_idx.size, dtype=np.int8)
+
+                        cache_hit += 1
                 else:
                     cache_miss += 1
 
+                if hit is None:
+                    cache_miss += 1
                     trade_mask = closed_mask_all & (entry_time_ns_all >= start_ns) & (entry_time_ns_all < end_ns)
 
                     if not trade_mask.any():
@@ -1241,7 +1457,6 @@ def process_era_combos(
                             max_dd=0.0,
                             regime_cfg=regime_cfg,
                         )
-                        
                         buffer_master_row(results_dir, batch_id, master_row_raw)
                         era_master_rows_written[era_label] += 1
                         empty_rows_written += 1
@@ -1249,10 +1464,12 @@ def process_era_combos(
                         continue
 
                     entry_idx = entry_idx_all[trade_mask].astype(np.int64)
+                    entry_price_arr = entry_price_all[trade_mask].astype(np.float64)
                     exit_idx = exit_idx_all[trade_mask].astype(np.int64)
+                    exit_price_arr = exit_price_all[trade_mask].astype(np.float64)
                     rets = rets_all[trade_mask].astype(np.float64)
+                    exit_reason_arr = exit_reason_all[trade_mask].astype(np.int8)
 
-                    # write the era-combo backtest cache in the same structure you already use
                     try:
                         res_df = pl.DataFrame(
                             {
@@ -1268,9 +1485,15 @@ def process_era_combos(
                                 "sl_decay_pct": [float(regime_cfg.get("sl_decay_pct", 0.0))],
                                 "sl_decay_interval": [int(regime_cfg.get("sl_decay_interval", 0))],
                                 "sl_decay_stop_at_pos": [bool(regime_cfg.get("sl_decay_stop_at_pos", True))],
+                                "use_limit_entry": [bool(use_limit_entry)],
+                                "limit_order_expiry_h": [int(limit_order_expiry_h)],
+                                "trade_window_interval": [int(trade_window_interval)],
                                 "entry_idx": pl.Series([entry_idx], dtype=pl.List(pl.Int64)),
+                                "entry_price": pl.Series([entry_price_arr], dtype=pl.List(pl.Float32)),
                                 "exit_idx": pl.Series([exit_idx], dtype=pl.List(pl.Int64)),
                                 "ret": pl.Series([rets], dtype=pl.List(pl.Float32)),
+                                "exit_price": pl.Series([exit_price_arr], dtype=pl.List(pl.Float32)),
+                                "exit_reason": pl.Series([exit_reason_arr], dtype=pl.List(pl.Int8)),
                             }
                         ).pipe(enforce_schema, "backtest", strict=True)
 
@@ -1278,21 +1501,39 @@ def process_era_combos(
                     except Exception as e:
                         logger.error("Backtest cache write failed cfg=%s era=%s: %s", regime_id, era_label, e)
 
-                mask_closed = np.asarray([]) if exit_idx is None else (exit_idx >= 0)
-                if not (mask_closed.size and mask_closed.any()):
+                if entry_idx is None or entry_idx.size == 0:
                     master_row_raw = _make_master_row(
                         regime_id=regime_id,
                         era_int=era["era_int"],
                         side_flag=side_flag,
                         sl_val=sl_val,
                         tp_val=tp_val,
-                        total_pos=int(sig_n),
+                        total_pos=0,
                         win_pos=0,
                         balance=100.0,
                         max_dd=0.0,
                         regime_cfg=regime_cfg,
                     )
-                    
+                    buffer_master_row(results_dir, batch_id, master_row_raw)
+                    era_master_rows_written[era_label] += 1
+                    empty_rows_written += 1
+                    master_rows_written += 1
+                    continue
+
+                mask_closed = exit_idx >= 0
+                if not mask_closed.any():
+                    master_row_raw = _make_master_row(
+                        regime_id=regime_id,
+                        era_int=era["era_int"],
+                        side_flag=side_flag,
+                        sl_val=sl_val,
+                        tp_val=tp_val,
+                        total_pos=int(entry_idx.size),
+                        win_pos=0,
+                        balance=100.0,
+                        max_dd=0.0,
+                        regime_cfg=regime_cfg,
+                    )
                     buffer_master_row(results_dir, batch_id, master_row_raw)
                     era_master_rows_written[era_label] += 1
                     empty_rows_written += 1
@@ -1302,6 +1543,8 @@ def process_era_combos(
                 closed_rets = rets[mask_closed]
                 closed_entry_idxs = entry_idx[mask_closed].astype(np.int64)
                 closed_exit_idxs = exit_idx[mask_closed].astype(np.int64)
+                closed_entry_prices = entry_price_arr[mask_closed].astype(np.float64)
+                closed_exit_prices = exit_price_arr[mask_closed].astype(np.float64)
 
                 rng_24h_entry, rng_72h_entry, rng_1w_entry, rng_1m_entry = get_regime_amp_index_for_indices(
                     df_main=df_main,
@@ -1309,7 +1552,8 @@ def process_era_combos(
                 )
 
                 pnl_pct_arr, exit_times_ns, equity_arr, current_max_dd, breached = compute_equity_preview(
-                    closed_rets=closed_rets,
+                    closed_entry_prices_arr=closed_entry_prices,
+                    closed_exit_prices_arr=closed_exit_prices,
                     closed_entry_idxs=closed_entry_idxs,
                     closed_exit_idxs=closed_exit_idxs,
                     main_close_arr=main_close_arr,
@@ -1318,6 +1562,7 @@ def process_era_combos(
                     main_funding_arr=main_funding_arr,
                     sl_val=float(sl_val),
                     tp_val=float(tp_val),
+                    side_flag=side_flag,
                     run_cfg=run_cfg,
                 )
 
@@ -1332,13 +1577,12 @@ def process_era_combos(
                         side_flag=side_flag,
                         sl_val=sl_val,
                         tp_val=tp_val,
-                        total_pos=int(sig_n),
+                        total_pos=int(entry_idx.size),
                         win_pos=win_pos,
                         balance=final_balance,
                         max_dd=current_max_dd,
                         regime_cfg=regime_cfg,
                     )
-                    
                     buffer_master_row(results_dir, batch_id, master_row_raw)
                     era_master_rows_written[era_label] += 1
                     master_rows_written += 1
@@ -1384,18 +1628,14 @@ def process_era_combos(
                     side_flag=side_flag,
                     sl_val=sl_val,
                     tp_val=tp_val,
-                    total_pos=int(sig_n),
+                    total_pos=int(entry_idx.size),
                     win_pos=win_pos,
                     balance=final_balance,
                     max_dd=max_dd,
                     regime_cfg=regime_cfg,
                 )
-                
                 buffer_master_row(results_dir, batch_id, master_row_raw)
-                era_master_rows_written[era_label] += 1
-                master_rows_written += 1
 
-    # final streak check over eras, after all combo/side work
     empty_era_streak = 0
     max_empty_era_streak = int(run_cfg.get("MAX_EMPTY_ERA_STREAK", 2))
     for era in era_registry:
@@ -1431,13 +1671,6 @@ def compute_config_and_save(batch_path: str, session_dir: str, compute_backtest:
     except Exception:
         _HAS_PSUTIL = False
         _PROC = None
-
-    # try:
-    #     logger.info("🔥 Worker-local Numba warmup starting...")
-    #     warmup_numba_kernels()
-    #     logger.info("🔥 Worker-local Numba warmup complete.")
-    # except Exception as e:
-    #     logger.warning("Numba warmup failed: %s", e)
 
     batch_path = Path(batch_path)
     session_dir = Path(session_dir)
@@ -1487,6 +1720,18 @@ def compute_config_and_save(batch_path: str, session_dir: str, compute_backtest:
     processed_count = 0
     skipped_count = 0
 
+    container_limit_mb = _get_memory_guard_mb()
+    rss_mb = _get_process_rss_mb()
+
+    if container_limit_mb > 0:
+        # keep some headroom for Polars / PyArrow / Python allocator spikes
+        soft_cap_mb = container_limit_mb * 0.80
+        if rss_mb >= soft_cap_mb:
+            logger.error("OOM RISK: process RSS %.1f MB is near container limit %.1f MB", rss_mb, container_limit_mb)
+            raise AirflowFailException(
+                f"Process memory exceeded safe threshold: {rss_mb:.1f} MB / {container_limit_mb:.1f} MB"
+            )
+
     try:
         total_in_batch = len(regimes)
         for idx, regime_cfg in enumerate(regimes):
@@ -1496,7 +1741,16 @@ def compute_config_and_save(batch_path: str, session_dir: str, compute_backtest:
                     logger.error("OOM RISK: System Memory at %s%%", mem_info.percent)
                     raise AirflowFailException(f"System memory threshold exceeded ({mem_info.percent}%).")
 
-            gc.collect()
+            gc_every_n = int(run_cfg.get("GC_EVERY_N_REGIMES", 0) or 0)
+            gc_rss_limit_mb = int(run_cfg.get("GC_RSS_LIMIT_MB", 0) or 0)
+
+            if gc_every_n > 0 and idx % gc_every_n == 0:
+                try:
+                    rss_mb = _get_process_rss_mb()
+                    if gc_rss_limit_mb > 0 and rss_mb >= gc_rss_limit_mb:
+                        gc.collect()
+                except Exception:
+                    gc.collect()
 
             if idx % 10 == 0:
                 heartbeat_log(f"batch{batch_id}_progress", {"idx": idx, "regime_id": str(regime_cfg.get("regime_id"))})
@@ -1521,6 +1775,11 @@ def compute_config_and_save(batch_path: str, session_dir: str, compute_backtest:
             regime_cfg["sl_decay_pct"] = float(regime_cfg.get("sl_decay_pct", 0.0) or 0.0)
             regime_cfg["sl_decay_interval"] = int(regime_cfg.get("sl_decay_interval", 0) or 0)
             regime_cfg["sl_decay_stop_at_pos"] = bool(regime_cfg.get("sl_decay_stop_at_pos", True))
+
+            regime_cfg["use_limit_entry"] = bool(regime_cfg.get("use_limit_entry", True))
+            regime_cfg["limit_order_expiry_h"] = int(regime_cfg.get("limit_order_expiry_h", 0) or 0)
+
+            regime_cfg["trade_window_interval"] = int(regime_cfg.get("trade_window_interval", 0) or 0)
 
             regime_id = regime_cfg.get("regime_id")
             summary_path = results_dir / f"cfg_{regime_id}_summary.json"

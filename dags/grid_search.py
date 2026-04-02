@@ -31,7 +31,7 @@ default_args = {
     schedule=None,  # run manually or trigger from UI / another DAG
     start_date=pendulum.datetime(2026, 1, 1, tz="UTC"),
     fail_fast=True,
-    max_active_tasks=4,  # <--- CPU CORES (e.g., 4 or 8)
+    max_active_tasks=2,  # <--- CPU CORES (e.g., 4 or 8)
     max_active_runs=1,   # <--- DON'T ALLOW TWO GRID SEARCHES AT ONCE
     catchup=False,
     default_args=default_args,

@@ -144,6 +144,10 @@ def generate_configs(session_dir: Path, run_cfg: dict) -> list[Path]:
     sl_decay_interval_list = _list(run_cfg.get("sl_decay_interval"), [12])
     sl_decay_stop_at_pos_list = _list(run_cfg.get("sl_decay_stop_at_pos"), [True])
 
+    limit_order_expiry_h_list = _list(run_cfg.get("limit_order_expiry_h"), [24])
+
+    trade_window_interval_list = _list(run_cfg.get("trade_window_interval"), [0])
+
     all_regime_configs = []
     idx = 0
 
@@ -157,31 +161,36 @@ def generate_configs(session_dir: Path, run_cfg: dict) -> list[Path]:
                                 for decay_pct in sl_decay_pct_list:
                                     for decay_interval in sl_decay_interval_list:
                                         for decay_stop in sl_decay_stop_at_pos_list:
-                                            regime = {
-                                                "regime_id": f"{idx:05d}",
-                                                "ma_int": int(ma_int),
-                                                "ma_reversion": bool(ma_rev),
-                                                "ma_periods": ma_periods_sorted,
-                                                "ma_types": ma_types_sorted,
-                                                "use_stochastic": bool(st["use_stochastic"]),
-                                                "stoch_key": st["stoch_key"],
-                                                "stoch_col": st["col"],
-                                                "stoch_lower": st["low"],
-                                                "stoch_upper": st["high"],
-                                                "stoch_threshold_tolerance": float(run_cfg.get("stoch_threshold_tolerance", 50)),
-                                                "use_bbw": bool(bw["use_bbw"]),
-                                                "bbw_periods": int(bw["bbw_periods"]),
-                                                "bbw_std": float(bw["bbw_std"]),
-                                                "bbw_thresholds": float(bw["bbw_thresholds"]),
-                                                "entry_lookback_units": int(lb_h),
-                                                "exit_window_h": int(exit_h),
-                                                "use_sl_decay": bool(use_decay),
-                                                "sl_decay_pct": float(decay_pct),
-                                                "sl_decay_interval": int(decay_interval),
-                                                "sl_decay_stop_at_pos": bool(decay_stop),
-                                            }
-                                            all_regime_configs.append(regime)
-                                            idx += 1
+                                            for limit_h in limit_order_expiry_h_list:
+                                                for trade_window_interval in trade_window_interval_list:
+                                                    regime = {
+                                                        "regime_id": f"{idx:05d}",
+                                                        "ma_int": int(ma_int),
+                                                        "ma_reversion": bool(ma_rev),
+                                                        "ma_periods": ma_periods_sorted,
+                                                        "ma_types": ma_types_sorted,
+                                                        "use_stochastic": bool(st["use_stochastic"]),
+                                                        "stoch_key": st["stoch_key"],
+                                                        "stoch_col": st["col"],
+                                                        "stoch_lower": st["low"],
+                                                        "stoch_upper": st["high"],
+                                                        "stoch_threshold_tolerance": float(run_cfg.get("stoch_threshold_tolerance", 50)),
+                                                        "use_bbw": bool(bw["use_bbw"]),
+                                                        "bbw_periods": int(bw["bbw_periods"]),
+                                                        "bbw_std": float(bw["bbw_std"]),
+                                                        "bbw_thresholds": float(bw["bbw_thresholds"]),
+                                                        "entry_lookback_units": int(lb_h),
+                                                        "exit_window_h": int(exit_h),
+                                                        "use_sl_decay": bool(use_decay),
+                                                        "sl_decay_pct": float(decay_pct),
+                                                        "sl_decay_interval": int(decay_interval),
+                                                        "sl_decay_stop_at_pos": bool(decay_stop),
+                                                        "limit_order_expiry_h": int(limit_h),
+                                                        "trade_window_interval": int(trade_window_interval),
+                                                        "use_limit_entry": bool(run_cfg.get("use_limit_entry", True)),
+                                                    }
+                                                    all_regime_configs.append(regime)
+                                                    idx += 1
 
     total_regimes = len(all_regime_configs)
     batch_size = int(run_cfg.get("BATCH_SIZE", 150))

@@ -45,6 +45,11 @@ MASTER_SCHEMA: Dict[str, pl.DataType] = {
     "sl_decay_interval": pl.Int32,
     "sl_decay_stop_at_pos": pl.Boolean,
 
+    "use_limit_entry": pl.Boolean,
+    "limit_window_h": pl.Int32,
+
+    "trade_window_interval": pl.Int32,
+
     # 4. Performance Metrics
     "total_pos": pl.Int32,
     "win_pos": pl.Int32,
@@ -82,21 +87,26 @@ CACHE_SIGNAL_SCHEMA: Dict[str, pl.DataType] = {
 }
 
 CACHE_BACKTEST_SCHEMA: Dict[str, pl.DataType] = {
-    "sig_n": pl.Int64,        # Number of signals in this batch
-    "sig_min_ns": pl.Int64,   # Hash/Signature of the signal batch
-    "sig_max_ns": pl.Int64,   # Hash/Signature of the signal batch
-    "SL": pl.Float32,         # The risk parameter used
-    "TP": pl.Float32,         # The risk parameter used
-    "side": pl.Int8,          # 1 for Buy, -1 for Sell
-    "exit_window_h": pl.Int32,# The exit time parameter used
-    "entry_idx": pl.List(pl.Int64),  # Array of actual trade entries
-    "exit_idx": pl.List(pl.Int64),   # Array of actual trade exits
-    "ret": pl.List(pl.Float32),      # Array of trade returns (use Float32 for RAM savings)
-    "regime_id": pl.Int32,           # Link back to regime
+    "sig_n": pl.Int64,
+    "sig_min_ns": pl.Int64,
+    "sig_max_ns": pl.Int64,
+    "SL": pl.Float32,
+    "TP": pl.Float32,
+    "side": pl.Int8,
+    "exit_window_h": pl.Int32,
+    "entry_idx": pl.List(pl.Int64),
+    "exit_idx": pl.List(pl.Int64),
+    "entry_price": pl.List(pl.Float32),
+    "exit_price": pl.List(pl.Float32),
+    "ret": pl.List(pl.Float32),
+    "exit_reason": pl.List(pl.Int8),
+    "regime_id": pl.Int32,
     "use_sl_decay": pl.Boolean,
     "sl_decay_pct": pl.Float32,
     "sl_decay_interval": pl.Int32,
     "sl_decay_stop_at_pos": pl.Boolean,
+    "use_limit_entry": pl.Boolean,
+    "limit_window_h": pl.Int32,
 }
 
 DF_MAIN_SCHEMA: Dict[str, pl.DataType] = {
