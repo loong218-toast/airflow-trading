@@ -1,0 +1,15 @@
+{
+  "pair": "XXBTZUSD",
+  "market_type": "spot",
+  "grid_start_date": "2022-09-01T00:00:00Z",
+  "grid_end_date": "2025-09-15T23:59:59Z",
+
+  "garch_timeframes": [5, 15],
+  "garch_train_window_days": 30,
+  "garch_refit_every_days": 2,
+  "garch_horizons_hours": [24],
+
+  "garch_chunk_origins": 8000,
+  "garch_progress_every": 500,
+  "garch_force_rebuild_cache": false
+}

@@ -86,31 +86,41 @@ def _write_batch(path: Path, batch_id: int, rows: list[dict]) -> None:
     with open(path, "w", encoding="utf8") as f:
         json.dump({"batch_id": batch_id, "regimes": rows}, f, indent=2)
 
-def _ma_types_for_periods(run_cfg: dict, count: int) -> list[str]:
-    if count <= 0:
+def _ma_specs_for_grid(run_cfg: dict, modifier: int) -> list[dict]:
+    periods = [int(x) for x in _list(run_cfg.get("ma_periods", []), []) if int(x) > 0]
+    if not periods:
         return []
 
-    raw = run_cfg.get("ma_types", None)
+    raw_types = run_cfg.get("ma_types", None)
+    if raw_types is None:
+        types = ["sma"] * len(periods)
+    elif isinstance(raw_types, str):
+        v = raw_types.strip().lower() or "sma"
+        types = [v] * len(periods)
+    else:
+        vals = _list(raw_types, [])
+        if not vals:
+            types = ["sma"] * len(periods)
+        elif len(vals) == 1:
+            v = str(vals[0]).strip().lower() or "sma"
+            types = [v] * len(periods)
+        else:
+            types = [str(x).strip().lower() or "sma" for x in vals]
+            if len(types) < len(periods):
+                types.extend(["sma"] * (len(periods) - len(types)))
+            types = types[:len(periods)]
 
-    if raw is None:
-        return ["sma"] * count
-
-    if isinstance(raw, str):
-        v = raw.strip().lower() or "sma"
-        return [v] * count
-
-    vals = _list(raw, [])
-    if not vals:
-        return ["sma"] * count
-
-    if len(vals) == 1:
-        v = str(vals[0]).strip().lower() or "sma"
-        return [v] * count
-
-    out = [str(x).strip().lower() or "sma" for x in vals]
-    if len(out) < count:
-        out.extend(["sma"] * (count - len(out)))
-    return out[:count]
+    specs = []
+    for idx, (period, ma_type) in enumerate(zip(periods, types)):
+        eff = max(1, int(period) * int(modifier))
+        specs.append({
+            "slot": int(idx),
+            "type": ma_type,
+            "period": int(period),
+            "effective_window": int(eff),
+            "col": f"ma_{idx:02d}_{ma_type}_{eff}",
+        })
+    return specs
 
 def generate_configs(session_dir: Path, run_cfg: dict) -> list[Path]:
     cfg_dir = session_dir / "configs"
@@ -122,14 +132,10 @@ def generate_configs(session_dir: Path, run_cfg: dict) -> list[Path]:
     sl_vals, tp_vals = _expand_sl_tp(run_cfg)
     combos = _prune_by_min_rr(sl_vals, tp_vals, float(run_cfg.get("min_rr", 3.0)))
 
-    ma_periods = run_cfg.get("ma_periods", []) or []
-    if not isinstance(ma_periods, list):
-        ma_periods = list(ma_periods)
+    modifier = max(1, int(run_cfg.get("signal_timeframe_modifier", 3) or 3))
+    ma_specs = _ma_specs_for_grid(run_cfg, modifier)
 
-    ma_periods_sorted = sorted({int(x) for x in ma_periods if int(x) > 0})
-    ma_types_sorted = _ma_types_for_periods(run_cfg, len(ma_periods_sorted))
-
-    n_bits = len(ma_periods_sorted)
+    n_bits = len(ma_specs)
     max_ma_int = (1 << n_bits) if n_bits > 0 else 1
 
     ma_reversion_list = _list(run_cfg.get("ma_reversion"), [False])
@@ -167,8 +173,8 @@ def generate_configs(session_dir: Path, run_cfg: dict) -> list[Path]:
                                                         "regime_id": f"{idx:05d}",
                                                         "ma_int": int(ma_int),
                                                         "ma_reversion": bool(ma_rev),
-                                                        "ma_periods": ma_periods_sorted,
-                                                        "ma_types": ma_types_sorted,
+                                                        "ma_periods": [x["period"] for x in ma_specs],
+                                                        "ma_types": [x["type"] for x in ma_specs],
                                                         "use_stochastic": bool(st["use_stochastic"]),
                                                         "stoch_key": st["stoch_key"],
                                                         "stoch_col": st["col"],

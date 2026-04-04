@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict, Optional, Tuple
+import re
 
 import numpy as np
 import polars as pl
@@ -8,9 +9,6 @@ import polars as pl
 from etl.schema import get_schema
 
 
-# -----------------------------
-# generic coercion helpers
-# -----------------------------
 def _unwrap_singleton(value: Any) -> Any:
     if isinstance(value, (list, tuple)) and len(value) == 1:
         return value[0]
@@ -104,6 +102,7 @@ def _as_threshold_pairs(value: Any) -> list[list[float]]:
         return [vals] if vals else []
     return [[_as_float(value)]]
 
+
 def _as_ma_type_list(value: Any, count: int) -> list[str]:
     if count <= 0:
         return []
@@ -127,6 +126,43 @@ def _as_ma_type_list(value: Any, count: int) -> list[str]:
     if len(out) < count:
         out.extend(["sma"] * (count - len(out)))
     return out[:count]
+
+
+def _ma_sort_key(col: str) -> tuple:
+    m = re.match(r"^ma_(\d+)_", col)
+    if m:
+        return (0, int(m.group(1)), col)
+
+    m = re.search(r"(\d+)$", col)
+    if m:
+        return (1, int(m.group(1)), col)
+
+    return (2, 10**9, col)
+
+
+def _resolve_ma_cols(cfg: dict, df: pl.DataFrame) -> list[str]:
+    ma_cols = cfg.get("ma_cols", None)
+    if isinstance(ma_cols, list) and ma_cols:
+        return [c for c in ma_cols if c in df.columns]
+
+    return sorted(
+        [c for c in df.columns if c.startswith(("ma_", "sma_", "ema_", "kama_"))],
+        key=_ma_sort_key,
+    )
+
+
+def _selected_ma_pair(cfg: dict, df: pl.DataFrame) -> list[str]:
+    ma_cols = _resolve_ma_cols(cfg, df)
+    if len(ma_cols) < 2:
+        return []
+
+    ma_int = _as_int(cfg.get("ma_int", 0), 0)
+    active = [c for i, c in enumerate(ma_cols) if (ma_int >> i) & 1]
+
+    if len(active) >= 2:
+        return active[:2]
+
+    return ma_cols[:2]
 
 # -----------------------------
 # time / index helpers
@@ -206,30 +242,12 @@ def get_ma_price_gaps_for_indices(
         return gap_a_entry, gap_b_entry, gap_a_exit, gap_b_exit
 
     cfg = {**run_cfg, **regime_cfg}
-    ma_cols = _resolve_ma_cols(cfg, df_main)
+    pair = _selected_ma_pair(cfg, df_main)
 
-    ma_int = _as_int(cfg.get("ma_int", 0), 0)
-
-    active_ma_cols: list[str] = []
-    if ma_cols:
-        for i, col in enumerate(ma_cols):
-            if (ma_int >> i) & 1 and col in df_main.columns:
-                active_ma_cols.append(col)
-
-    if len(active_ma_cols) < 2:
-        candidates = [
-            c for c in df_main.columns
-            if c.startswith("ma_") or c.startswith("kama_") or c.startswith("ema_") or c.startswith("sma_")
-        ]
-        candidates = sorted(candidates)
-        if len(candidates) >= 2:
-            active_ma_cols = candidates[:2]
-
-    if len(active_ma_cols) < 2:
+    if len(pair) < 2:
         return gap_a_entry, gap_b_entry, gap_a_exit, gap_b_exit
 
-    fast_col = active_ma_cols[0]
-    slow_col = active_ma_cols[1]
+    fast_col, slow_col = pair[0], pair[1]
 
     fast_arr = (
         df_main[fast_col]
@@ -482,19 +500,31 @@ def generate_filtered_signals(df_slice: pl.DataFrame, cfg: dict, df_main: Option
             final_sell &= stoch_sell
 
     # --- 3. Lookback filter ---
-    lb_units = _as_int(cfg.get("entry_lookback_units", 0), 0)
-    if lb_units > 0:
-        brk_col = f"breakout_{lb_units}u"
-        if brk_col in df_slice.columns:
-            breakout_arr = (
-                df_slice[brk_col]
-                .fill_nan(0.0)
-                .fill_null(0.0)
-                .to_numpy()
-                .astype(np.float64, copy=False)
-            )
-            final_buy &= breakout_arr >= 0.9
-            final_sell &= breakout_arr <= 0.1
+    lb_units_list = _as_int_list(cfg.get("entry_lookback_units", []))
+    
+    if lb_units_list:
+        # Initialize masks as False (zeros) so we can bitwise-OR multiple lookbacks
+        any_breakout_buy = np.zeros(n, dtype=bool)
+        any_breakout_sell = np.zeros(n, dtype=bool)
+        found_any = False
+        
+        for lb in lb_units_list:
+            if lb <= 0: continue
+            brk_col = f"breakout_{lb}u"
+            
+            if brk_col in df_slice.columns:
+                found_any = True
+                # Access the precomputed feature column directly.
+                # Assumes column is normalized (0.0 to 1.0) where 1.0 is the high.
+                vals = df_slice[brk_col].to_numpy()
+                
+                any_breakout_buy |= (vals >= 0.9)
+                any_breakout_sell |= (vals <= 0.1)
+        
+        # Only apply the gate if at least one breakout column was found
+        if found_any:
+            final_buy &= any_breakout_buy
+            final_sell &= any_breakout_sell
 
     # --- 4. BBW / regime amplitude filter ---
     if _as_bool(cfg.get("use_bbw", False), False):
@@ -538,21 +568,20 @@ def generate_filtered_signals(df_slice: pl.DataFrame, cfg: dict, df_main: Option
 # -----------------------------
 # small util: compute selected ma_price_gap series name
 # -----------------------------
-def selected_gap_col_for_ma_int(ma_int: int) -> str:
-    """
-    Pick the first set bit (LSB = first MA column).
-    If none set, fall back to 'ma_price_gap_a'.
-    """
+def selected_gap_cols_for_ma_int(ma_int: int, ma_cols: list[str]) -> tuple[str, str]:
     try:
         mi = int(ma_int or 0)
     except Exception:
         mi = 0
 
-    for i in range(4):
-        if (mi >> i) & 1:
-            return f"ma_price_gap_{chr(97 + i)}"
-    return "ma_price_gap_a"
+    active = [c for i, c in enumerate(ma_cols) if (mi >> i) & 1]
+    if len(active) >= 2:
+        return active[0], active[1]
 
+    if len(ma_cols) >= 2:
+        return ma_cols[0], ma_cols[1]
+
+    return "", ""
 
 __all__ = [
     "normalize_signals_times",

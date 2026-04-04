@@ -70,7 +70,7 @@ from etl.master_io_utils import (
 
 from etl.profiling import maybe_profile
 
-from etl.grid_row_builders import _make_master_row
+from etl.grid_row_builders import _make_master_row, build_trade_ml_rows_from_backtest
 
 from etl.schema import enforce_schema, get_schema, cast_to_schema, classify_fragment
 
@@ -636,7 +636,6 @@ def compute_equity_preview(
 
     exit_times_ns = np.asarray(main_time_ns_arr[closed_exit_idxs], dtype=np.int64)
     return pnl_pct_arr, exit_times_ns, equity_arr, float(max_dd), bool(breached)
-
 def stage_equity_from_preview(
     pnl_pct_arr: np.ndarray,
     exit_times_ns: np.ndarray,
@@ -650,14 +649,6 @@ def stage_equity_from_preview(
     side_flag: int,
     stager,
     max_dd: float,
-    ma_p_gap_a_entry: Optional[np.ndarray] = None,
-    ma_p_gap_b_entry: Optional[np.ndarray] = None,
-    ma_p_gap_a_exit: Optional[np.ndarray] = None,
-    ma_p_gap_b_exit: Optional[np.ndarray] = None,
-    rng_24h_entry: Optional[np.ndarray] = None,
-    rng_72h_entry: Optional[np.ndarray] = None,
-    rng_1w_entry: Optional[np.ndarray] = None,
-    rng_1m_entry: Optional[np.ndarray] = None,
 ) -> Tuple[float, int, float]:
     """
     Stage equity rows only after the DD gate already passed.
@@ -672,30 +663,6 @@ def stage_equity_from_preview(
     win_pos = int(np.count_nonzero(pnl_pct_arr > 0.0))
     final_balance = float(equity_arr[-1]) if equity_arr.size else 100.0
 
-    def _prepare_gap(arr, target_len):
-        if arr is None or arr.size == 0:
-            return np.zeros(target_len, dtype=np.float32)
-        a = np.asarray(arr, dtype=np.float32)
-        a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
-        if a.shape[0] != target_len:
-            if a.shape[0] > target_len:
-                a = a[:target_len]
-            else:
-                pad = np.zeros(target_len - a.shape[0], dtype=np.float32)
-                a = np.concatenate([a, pad])
-        return a
-
-    gap_len = equity_arr.shape[0]
-    gap_a_entry = _prepare_gap(ma_p_gap_a_entry, gap_len)
-    gap_b_entry = _prepare_gap(ma_p_gap_b_entry, gap_len)
-    gap_a_exit = _prepare_gap(ma_p_gap_a_exit, gap_len)
-    gap_b_exit = _prepare_gap(ma_p_gap_b_exit, gap_len)
-
-    rng_24h_entry = _prepare_gap(rng_24h_entry, gap_len)
-    rng_72h_entry = _prepare_gap(rng_72h_entry, gap_len)
-    rng_1w_entry = _prepare_gap(rng_1w_entry, gap_len)
-    rng_1m_entry = _prepare_gap(rng_1m_entry, gap_len)
-
     equity_data = {
         "regime_id": int(regime_id),
         "era_int": int(era_int),
@@ -707,15 +674,6 @@ def stage_equity_from_preview(
         "exit_idx": closed_exit_idxs.astype(np.int64),
         "pnl_pct": pnl_pct_arr.astype(np.float32),
         "equity": equity_arr.astype(np.float32),
-        "ma_p_gap_a_entry": gap_a_entry,
-        "ma_p_gap_b_entry": gap_b_entry,
-        "ma_p_gap_a_exit": gap_a_exit,
-        "ma_p_gap_b_exit": gap_b_exit,
-
-        "rng_24h_entry": rng_24h_entry,
-        "rng_72h_entry": rng_72h_entry,
-        "rng_1w_entry": rng_1w_entry,
-        "rng_1m_entry": rng_1m_entry,
     }
 
     try:
@@ -1014,11 +972,6 @@ def _run_backtest_grid(
             closed_entry_prices = entry_price_arr[mask_closed].astype(np.float64)
             closed_exit_prices = exit_price_arr[mask_closed].astype(np.float64)
 
-            rng_24h_entry, rng_72h_entry, rng_1w_entry, rng_1m_entry = get_regime_amp_index_for_indices(
-                df_main=df_main,
-                entry_idxs=closed_entry_idxs,
-            )
-
             pnl_pct_arr, exit_times_ns, equity_arr, current_max_dd, breached = compute_equity_preview(
                 closed_rets=closed_rets,
                 closed_entry_idxs=closed_entry_idxs,
@@ -1056,14 +1009,6 @@ def _run_backtest_grid(
 
             dd_pass += 1
 
-            gap_entry_a, gap_entry_b, gap_exit_a, gap_exit_b = get_ma_price_gaps_for_indices(
-                df_main=df_main,
-                entry_idxs=closed_entry_idxs,
-                exit_idxs=closed_exit_idxs,
-                regime_cfg=regime_cfg,
-                run_cfg=run_cfg,
-            )
-
             final_balance, win_pos, max_dd = stage_equity_from_preview(
                 pnl_pct_arr=pnl_pct_arr,
                 exit_times_ns=exit_times_ns,
@@ -1077,14 +1022,6 @@ def _run_backtest_grid(
                 side_flag=side_flag,
                 stager=stager,
                 max_dd=current_max_dd,
-                ma_p_gap_a_entry=gap_entry_a,
-                ma_p_gap_b_entry=gap_entry_b,
-                ma_p_gap_a_exit=gap_exit_a,
-                ma_p_gap_b_exit=gap_exit_b,
-                rng_24h_entry=rng_24h_entry,
-                rng_72h_entry=rng_72h_entry,
-                rng_1w_entry=rng_1w_entry,
-                rng_1m_entry=rng_1m_entry,
             )
             staged_equity += 1
 
@@ -1546,11 +1483,6 @@ def process_era_combos(
                 closed_entry_prices = entry_price_arr[mask_closed].astype(np.float64)
                 closed_exit_prices = exit_price_arr[mask_closed].astype(np.float64)
 
-                rng_24h_entry, rng_72h_entry, rng_1w_entry, rng_1m_entry = get_regime_amp_index_for_indices(
-                    df_main=df_main,
-                    entry_idxs=closed_entry_idxs,
-                )
-
                 pnl_pct_arr, exit_times_ns, equity_arr, current_max_dd, breached = compute_equity_preview(
                     closed_entry_prices_arr=closed_entry_prices,
                     closed_exit_prices_arr=closed_exit_prices,
@@ -1590,14 +1522,6 @@ def process_era_combos(
 
                 dd_pass += 1
 
-                gap_entry_a, gap_entry_b, gap_exit_a, gap_exit_b = get_ma_price_gaps_for_indices(
-                    df_main=df_main,
-                    entry_idxs=closed_entry_idxs,
-                    exit_idxs=closed_exit_idxs,
-                    regime_cfg=regime_cfg,
-                    run_cfg=run_cfg,
-                )
-
                 final_balance, win_pos, max_dd = stage_equity_from_preview(
                     pnl_pct_arr=pnl_pct_arr,
                     exit_times_ns=exit_times_ns,
@@ -1611,14 +1535,6 @@ def process_era_combos(
                     side_flag=side_flag,
                     stager=stager,
                     max_dd=current_max_dd,
-                    ma_p_gap_a_entry=gap_entry_a,
-                    ma_p_gap_b_entry=gap_entry_b,
-                    ma_p_gap_a_exit=gap_exit_a,
-                    ma_p_gap_b_exit=gap_exit_b,
-                    rng_24h_entry=rng_24h_entry,
-                    rng_72h_entry=rng_72h_entry,
-                    rng_1w_entry=rng_1w_entry,
-                    rng_1m_entry=rng_1m_entry,
                 )
                 staged_equity += 1
 
@@ -1762,7 +1678,8 @@ def compute_config_and_save(batch_path: str, session_dir: str, compute_backtest:
                 logger.debug("regime_id not int-convertible: %s", regime_cfg.get("regime_id"))
             regime_cfg["ma_int"] = int(regime_cfg.get("ma_int", 0) or 0)
             regime_cfg["ma_reversion"] = bool(regime_cfg.get("ma_reversion", False))
-            regime_cfg["entry_lookback_units"] = int(regime_cfg.get("entry_lookback_units", 0) or 0)
+            lb_val = regime_cfg.get("entry_lookback_units", 0)
+            regime_cfg["entry_lookback_units"] = lb_val if isinstance(lb_val, list) else int(lb_val or 0)
             regime_cfg["exit_window_h"] = int(regime_cfg.get("exit_window_h", 0) or 0)
             regime_cfg["use_stochastic"] = bool(regime_cfg.get("use_stochastic", False))
 

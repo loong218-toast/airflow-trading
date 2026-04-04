@@ -145,33 +145,68 @@ def _load_recent_df_main(pair: str, market_type: str, limit_rows: int) -> pl.Dat
         pl.col("funding_rate").cast(pl.Float32),
     ]).sort("time").with_row_index("idx")
 
+def _as_single_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        if len(value) != 1:
+            return None
+        value = value[0]
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _resolve_live_stoch_col(cfg: dict, df: Optional[pl.DataFrame] = None) -> Optional[str]:
+    explicit = str(cfg.get("stoch_col", "") or "").strip()
+    if explicit:
+        if df is not None and explicit not in df.columns:
+            raise ValueError(f"stoch_col='{explicit}' not found in dataframe columns")
+        return explicit
+
+    k = _as_single_int(cfg.get("stoch_k"))
+    d = _as_single_int(cfg.get("stoch_d"))
+    s = _as_single_int(cfg.get("stoch_s"))
+
+    if k and d and s:
+        col = f"stoch_k{k}_d{d}_s{s}"
+        if df is not None and col not in df.columns:
+            raise ValueError(f"Resolved stochastic column '{col}' not found in dataframe columns")
+        return col
+
+    stoch_cols = cfg.get("stoch_cols", [])
+    if isinstance(stoch_cols, list):
+        stoch_cols = [str(x).strip() for x in stoch_cols if str(x).strip()]
+
+        if len(stoch_cols) == 1:
+            col = stoch_cols[0]
+            if df is not None and col not in df.columns:
+                raise ValueError(f"Resolved stochastic column '{col}' not found in dataframe columns")
+            return col
+
+        if df is not None:
+            available = [c for c in stoch_cols if c in df.columns]
+            if len(available) == 1:
+                return available[0]
+
+    return None
+
 def _build_live_signal_frame(
     df_main: pl.DataFrame,
     pair_params: dict,
     pair: str,
     market_type: str,
 ) -> pl.DataFrame:
-    # Build runtime config for the existing signal function
     live = dict(pair_params)
-
     live["pair"] = pair
     live["market_type"] = market_type
 
-    # Keep ma_periods as the source of truth
     ma_periods = live.get("ma_periods", []) or []
     if isinstance(ma_periods, (int, float)):
         ma_periods = [int(ma_periods)]
-
-    ma_periods = [int(x) for x in ma_periods]
-    live["ma_periods"] = _as_int_list(live.get("ma_periods", []))
+    live["ma_periods"] = [int(x) for x in ma_periods]
     live["ma_int"] = (1 << len(live["ma_periods"])) - 1 if live["ma_periods"] else 0
-
-    if "stoch_col" not in live and _as_bool(live.get("use_stochastic", False), False):
-        k = _as_int(live.get("stoch_k", 0), 0)
-        d = _as_int(live.get("stoch_d", 0), 0)
-        s = _as_int(live.get("stoch_s", 0), 0)
-        if k and d and s:
-            live["stoch_col"] = f"stoch_k{k}_d{d}_s{s}"
 
     thr = live.get("stoch_thresholds", [[20, 80]])
     thr = _as_threshold_pairs(thr)
@@ -179,10 +214,16 @@ def _build_live_signal_frame(
         live["stoch_lower"] = thr[0][0]
         live["stoch_upper"] = thr[0][1]
 
-    # Precompute features on the recent slice
     df_feat, live = precompute_all_possible_features(df_main, live)
 
-    # Keep the exact same downstream signal generator
+    if _as_bool(live.get("use_stochastic", False), False):
+        live["stoch_col"] = _resolve_live_stoch_col(live, df_feat)
+        if not live.get("stoch_col"):
+            raise ValueError(
+                "use_stochastic=true but no unambiguous stoch_col could be resolved. "
+                "Set stoch_col explicitly in live config."
+            )
+
     return generate_filtered_signals(df_feat, live, df_main=df_feat)
 
 
@@ -242,7 +283,7 @@ def _build_message(rows: List[dict]) -> str:
 
 @dag(
     dag_id="kraken_signal_ingest",
-    schedule="*/30 * * * *",
+    schedule="*/15 * * * *",
     start_date=pendulum.datetime(2026, 1, 1, tz="UTC"),
     catchup=False,
     max_active_runs=1,
@@ -332,6 +373,21 @@ def kraken_signal_ingest():
         prev_ts_df = df_signals.filter(pl.col("time_ns") < latest_ts)
 
         latest_rows = df_signals.filter(pl.col("time_ns") == latest_ts)
+
+        sides = set(latest_rows["side"].to_list())
+        if 1 in sides and -1 in sides:
+            logger.warning(
+                "Conflicting BUY and SELL signals on the latest bar for %s %s. Skipping alert.",
+                pair,
+                market_type,
+            )
+            return {
+                "pair": pair,
+                "market_type": market_type,
+                "has_signal": False,
+                "reason": "conflicting latest-bar signals",
+            }
+            
         prev_rows = (
             df_signals.filter(pl.col("time_ns") == prev_ts_df["time_ns"].max())
             if not prev_ts_df.is_empty()

@@ -1,3 +1,4 @@
+# feature_prep.py
 from __future__ import annotations
 
 import hashlib
@@ -125,23 +126,32 @@ def _compute_ma_np(values: np.ndarray, ma_type: str, period: int) -> np.ndarray:
     out[period - 1:] = rolling
     return out
 
+def _build_ma_specs(run_cfg: dict, modifier: int) -> list[dict]:
+    periods = [int(x) for x in _as_int_list(run_cfg.get("ma_periods", [])) if int(x) > 0]
+    if not periods:
+        return []
+
+    types = _as_ma_type_list(run_cfg.get("ma_types", None), len(periods))
+    specs: list[dict] = []
+
+    for idx, (period, ma_type) in enumerate(zip(periods, types)):
+        ma_type = (ma_type or "sma").strip().lower()
+        eff = max(1, int(period) * int(modifier))
+        specs.append({
+            "slot": int(idx),
+            "type": ma_type,
+            "period": int(period),
+            "effective_window": int(eff),
+            "col": f"ma_{idx:02d}_{ma_type}_{eff}",
+        })
+
+    return specs
 
 def build_feature_manifest(run_cfg: dict) -> dict:
     base_min = _as_int(run_cfg.get("BASE_MINUTES", 5), 5)
     modifier = max(1, _as_int(run_cfg.get("signal_timeframe_modifier", 3), 3))
 
-    ma_periods = _ordered_unique_ints(run_cfg.get("ma_periods", []))
-    ma_types = _as_ma_type_list(run_cfg.get("ma_types", None), len(ma_periods))
-
-    ma_specs = []
-    for period, ma_type in zip(ma_periods, ma_types):
-        eff = max(1, int(period) * modifier)
-        ma_specs.append({
-            "type": ma_type,
-            "period": int(period),
-            "effective_window": int(eff),
-            "col": f"{ma_type}_{eff}",
-        })
+    ma_specs = _build_ma_specs(run_cfg, modifier)
 
     stoch_specs = []
     if _as_bool(run_cfg.get("use_stochastic", False), False):
@@ -251,33 +261,37 @@ def precompute_all_possible_features(
     for spec in manifest["ma_specs"]:
         arr = _compute_ma_np(close_arr, spec["type"], spec["effective_window"])
         df = df.with_columns(pl.Series(spec["col"], arr.astype(np.float32, copy=False)))
-
-    # 2) Stochastic
+        
+# 2) Stochastic (Exponential Version)
     if manifest["stoch_specs"]:
-        kset = sorted({x["k"] for x in manifest["stoch_specs"]})
-        dset = sorted({x["d"] for x in manifest["stoch_specs"]})
-        sset = sorted({x["s"] for x in manifest["stoch_specs"]})
+        for spec in manifest["stoch_specs"]:
+            k = spec["k"]
+            d = spec["d"]
+            s = spec["s"]
+            col_name = spec["col"]
+            
+            # Apply timeframe modifier
+            modifier = manifest["signal_timeframe_modifier"]
+            k_mod = max(1, int(k) * modifier)
+            s_mod = max(1, int(s) * modifier)
+            d_mod = max(1, int(d) * modifier)
 
-        for k in kset:
-            for d in dset:
-                for s in sset:
-                    col_name = f"stoch_k{k}_d{d}_s{s}"
-                    k_window = max(1, int(k) * manifest["signal_timeframe_modifier"])
-                    d_window = max(1, int(d) * manifest["signal_timeframe_modifier"])
+            s_min = pl.col("close").rolling_min(k_mod, min_periods=1)
+            s_max = pl.col("close").rolling_max(k_mod, min_periods=1)
 
-                    s_min = pl.col("close").rolling_min(k_window, min_periods=1)
-                    s_max = pl.col("close").rolling_max(k_window, min_periods=1)
-
-                    df = df.with_columns([
-                        (
-                            100.0 * (pl.col("close") - s_min) / (s_max - s_min)
-                        )
-                        .fill_nan(50.0)
-                        .fill_null(50.0)
-                        .alias("_k")
-                    ]).with_columns([
-                        pl.col("_k").ewm_mean(span=d_window, adjust=False).alias(col_name)
-                    ]).drop(["_k"])
+            df = df.with_columns([
+                # Step 1 & 2: Calculate Raw %K and smooth it by 'S'
+                (100.0 * (pl.col("close") - s_min) / (s_max - s_min))
+                .fill_nan(50.0)
+                .fill_null(50.0)
+                .ewm_mean(span=s_mod, adjust=False) 
+                .alias("_smoothed_k")
+            ]).with_columns([
+                # Step 3: Smooth the 'Smoothed K' by 'D' to get the final %D line
+                pl.col("_smoothed_k")
+                .ewm_mean(span=d_mod, adjust=False)
+                .alias(col_name)
+            ]).drop(["_smoothed_k"])
 
     # 3) Lookback breakout columns
     for lb_units in manifest["lookback_units"]:

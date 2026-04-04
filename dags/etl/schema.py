@@ -40,13 +40,13 @@ MASTER_SCHEMA: Dict[str, pl.DataType] = {
     "SL": pl.Float32,
     "TP": pl.Float32,
 
-    "use_sl_decay": pl.Boolean,
-    "sl_decay_pct": pl.Float32,
-    "sl_decay_interval": pl.Int32,
-    "sl_decay_stop_at_pos": pl.Boolean,
+    "use_trailing_sl": pl.Boolean,
+    "trailing_sl_pct": pl.Float32,
+    "trailing_sl_interval": pl.Int32,
+    "trailing_sl_stop_at_pos": pl.Boolean,
 
     "use_limit_entry": pl.Boolean,
-    "limit_window_h": pl.Int32,
+    "limit_order_expiry_h": pl.Int32,
 
     "trade_window_interval": pl.Int32,
 
@@ -64,19 +64,49 @@ EQUITY_SCHEMA: Dict[str, pl.DataType] = {
     "SL": pl.Float32,
     "TP": pl.Float32,
     "time_ns": pl.Int64,
-    "entry_idx": pl.Int64,       # Individual Trade Detail
-    "exit_idx": pl.Int64,        # Individual Trade Detail
+    "entry_idx": pl.Int64,
+    "exit_idx": pl.Int64,
     "pnl_pct": pl.Float32,
     "equity": pl.Float32,
-    "ma_p_gap_a_entry": pl.Float32,
-    "ma_p_gap_b_entry": pl.Float32,
-    "ma_p_gap_a_exit":  pl.Float32,
-    "ma_p_gap_b_exit": pl.Float32,
+}
+
+TRADE_ML_SCHEMA: Dict[str, pl.DataType] = {
+    "regime_id": pl.Int32,
+    "era_int": pl.Int64,
+    "side": pl.Int8,
+    "SL": pl.Float32,
+    "TP": pl.Float32,
+
+    "use_limit_entry": pl.Boolean,
+    "limit_order_expiry_h": pl.Int32,
+    "trade_window_interval": pl.Int32,
+
+    "signal_idx": pl.Int64,
+    "signal_time_ns": pl.Int64,
+    "signal_price": pl.Float32,
+
+    "order_idx": pl.Int64,
+    "order_time_ns": pl.Int64,
+    "order_price": pl.Float32,
+    "order_mode": pl.Int8,
+
+    "fill_status": pl.Int8,
+    "entry_idx": pl.Int64,
+    "entry_time_ns": pl.Int64,
+    "entry_price": pl.Float32,
+
+    "exit_idx": pl.Int64,
+    "exit_time_ns": pl.Int64,
+    "exit_price": pl.Float32,
+    "exit_reason": pl.Int8,
+
+    "fill_delay_bars": pl.Int32,
+    "pnl_pct": pl.Float32,
 
     "rng_24h_entry": pl.Float32,
     "rng_72h_entry": pl.Float32,
     "rng_1w_entry": pl.Float32,
-    "rng_1m_entry": pl.Float32
+    "rng_1m_entry": pl.Float32,
 }
 
 CACHE_SIGNAL_SCHEMA: Dict[str, pl.DataType] = {
@@ -101,12 +131,12 @@ CACHE_BACKTEST_SCHEMA: Dict[str, pl.DataType] = {
     "ret": pl.List(pl.Float32),
     "exit_reason": pl.List(pl.Int8),
     "regime_id": pl.Int32,
-    "use_sl_decay": pl.Boolean,
-    "sl_decay_pct": pl.Float32,
-    "sl_decay_interval": pl.Int32,
-    "sl_decay_stop_at_pos": pl.Boolean,
+    "use_trailing_sl": pl.Boolean,
+    "trailing_sl_pct": pl.Float32,
+    "trailing_sl_interval": pl.Int32,
+    "trailing_sl_stop_at_pos": pl.Boolean,
     "use_limit_entry": pl.Boolean,
-    "limit_window_h": pl.Int32,
+    "limit_order_expiry_h": pl.Int32,
 }
 
 DF_MAIN_SCHEMA: Dict[str, pl.DataType] = {
