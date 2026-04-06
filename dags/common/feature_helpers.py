@@ -1,12 +1,15 @@
+# research/feature_helpers.py
+# Keep the above .py filename for reference, but this is not a standalone script. It's meant to be imported and used by other code in the research pipeline for backtesting trading signals.
+
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Optional, Tuple
 import re
 
 import numpy as np
 import polars as pl
 
-from etl.schema import get_schema
+from common.schema import get_schema
 
 
 def _unwrap_singleton(value: Any) -> Any:
@@ -128,6 +131,15 @@ def _as_ma_type_list(value: Any, count: int) -> list[str]:
     return out[:count]
 
 
+def _float_token(value: Any) -> str:
+    s = f"{float(value):.10g}"
+    if "e" in s or "E" in s:
+        return s.replace("+", "")
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s or "0"
+
+
 def _ma_sort_key(col: str) -> tuple:
     m = re.match(r"^ma_(\d+)_", col)
     if m:
@@ -143,7 +155,17 @@ def _ma_sort_key(col: str) -> tuple:
 def _resolve_ma_cols(cfg: dict, df: pl.DataFrame) -> list[str]:
     ma_cols = cfg.get("ma_cols", None)
     if isinstance(ma_cols, list) and ma_cols:
-        return [c for c in ma_cols if c in df.columns]
+        out = [c for c in ma_cols if c in df.columns]
+        if out:
+            return out
+
+    manifest = cfg.get("feature_manifest", None)
+    if isinstance(manifest, dict):
+        mf_cols = manifest.get("ma_cols", None)
+        if isinstance(mf_cols, list) and mf_cols:
+            out = [c for c in mf_cols if c in df.columns]
+            if out:
+                return out
 
     return sorted(
         [c for c in df.columns if c.startswith(("ma_", "sma_", "ema_", "kama_"))],
@@ -163,6 +185,7 @@ def _selected_ma_pair(cfg: dict, df: pl.DataFrame) -> list[str]:
         return active[:2]
 
     return ma_cols[:2]
+
 
 # -----------------------------
 # time / index helpers
@@ -195,20 +218,9 @@ def normalize_signals_times(df_signals: pl.DataFrame, df_main: Optional[pl.DataF
 # -----------------------------
 # MA helpers
 # -----------------------------
-def _resolve_ma_cols(cfg: dict, df: pl.DataFrame) -> list[str]:
-    ma_cols = cfg.get("ma_cols", None)
-    if isinstance(ma_cols, list) and ma_cols:
-        return [c for c in ma_cols if c in df.columns]
-
-    # fallback for older caches
-    return [
-        c for c in df.columns
-        if c.startswith("sma_") or c.startswith("ema_") or c.startswith("kama_")
-    ]
-
-
 def _resolve_ma_col_name(df: pl.DataFrame, idx: int) -> Optional[str]:
     candidates = [
+        f"ma_{idx:02d}",
         f"ma_{chr(97 + idx)}",
         f"kama_{chr(97 + idx)}",
         f"ema_{chr(97 + idx)}",
@@ -347,6 +359,7 @@ def get_regime_amp_index_for_indices(
 
     return tuple(out)
 
+
 # -----------------------------
 # stochastic helpers
 # -----------------------------
@@ -370,10 +383,62 @@ def _resolve_stoch_col(cfg: dict) -> Optional[str]:
     if stoch_col:
         return stoch_col
 
+    stoch_cols = cfg.get("stoch_cols", None)
+    if isinstance(stoch_cols, list):
+        stoch_cols = [str(x).strip() for x in stoch_cols if str(x).strip()]
+        if len(stoch_cols) == 1:
+            return stoch_cols[0]
+
+    manifest = cfg.get("feature_manifest", None)
+    if isinstance(manifest, dict):
+        mf_cols = manifest.get("stoch_cols", None)
+        if isinstance(mf_cols, list):
+            mf_cols = [str(x).strip() for x in mf_cols if str(x).strip()]
+            if len(mf_cols) == 1:
+                return mf_cols[0]
+
     k = _as_int(cfg.get("stoch_k", 12), 12)
     d = _as_int(cfg.get("stoch_d", 3), 3)
     s = _as_int(cfg.get("stoch_s", 3), 3)
     return f"stoch_k{k}_d{d}_s{s}"
+
+
+def _resolve_bbw_col(cfg: dict) -> Optional[str]:
+    bbw_col = _as_str(cfg.get("bbw_col", ""), "").strip()
+    if bbw_col:
+        return bbw_col
+
+    bbw_cols = cfg.get("bbw_cols", None)
+    if isinstance(bbw_cols, list):
+        bbw_cols = [str(x).strip() for x in bbw_cols if str(x).strip()]
+        if len(bbw_cols) == 1:
+            return bbw_cols[0]
+
+    manifest = cfg.get("feature_manifest", None)
+    if isinstance(manifest, dict):
+        mf_cols = manifest.get("bbw_cols", None)
+        if isinstance(mf_cols, list):
+            mf_cols = [str(x).strip() for x in mf_cols if str(x).strip()]
+            if len(mf_cols) == 1:
+                return mf_cols[0]
+
+    p = cfg.get("bbw_periods", None)
+    s = cfg.get("bbw_std", None)
+
+    if isinstance(p, list):
+        p_val = _as_int(p[0], 0) if p else 0
+    else:
+        p_val = _as_int(p, 0)
+
+    if isinstance(s, list):
+        s_val = _as_float(s[0], 0.0) if s else 0.0
+    else:
+        s_val = _as_float(s, 0.0)
+
+    if p_val <= 0:
+        return None
+
+    return f"bbw_p{p_val}_s{_float_token(s_val)}"
 
 
 def _stoch_state_masks(
@@ -501,39 +566,33 @@ def generate_filtered_signals(df_slice: pl.DataFrame, cfg: dict, df_main: Option
 
     # --- 3. Lookback filter ---
     lb_units_list = _as_int_list(cfg.get("entry_lookback_units", []))
-    
+
     if lb_units_list:
-        # Initialize masks as False (zeros) so we can bitwise-OR multiple lookbacks
         any_breakout_buy = np.zeros(n, dtype=bool)
         any_breakout_sell = np.zeros(n, dtype=bool)
         found_any = False
-        
+
         for lb in lb_units_list:
-            if lb <= 0: continue
+            if lb <= 0:
+                continue
             brk_col = f"breakout_{lb}u"
-            
+
             if brk_col in df_slice.columns:
                 found_any = True
-                # Access the precomputed feature column directly.
-                # Assumes column is normalized (0.0 to 1.0) where 1.0 is the high.
                 vals = df_slice[brk_col].to_numpy()
-                
                 any_breakout_buy |= (vals >= 0.9)
                 any_breakout_sell |= (vals <= 0.1)
-        
-        # Only apply the gate if at least one breakout column was found
+
         if found_any:
             final_buy &= any_breakout_buy
             final_sell &= any_breakout_sell
 
-    # --- 4. BBW / regime amplitude filter ---
+    # --- 4. BBW filter ---
     if _as_bool(cfg.get("use_bbw", False), False):
-        p = _as_int(cfg.get("bbw_periods", 0), 0)
-        s = _as_float(cfg.get("bbw_std", 0), 0.0)
+        bbw_col = _resolve_bbw_col(cfg)
         threshold = _as_float(cfg.get("bbw_thresholds", 50), 50.0)
-        bbw_col = f"bbw_p{p}_s{s}"
 
-        if bbw_col in df_slice.columns:
+        if bbw_col and bbw_col in df_slice.columns:
             bbw_arr = (
                 df_slice[bbw_col]
                 .fill_nan(0.0)
@@ -583,10 +642,11 @@ def selected_gap_cols_for_ma_int(ma_int: int, ma_cols: list[str]) -> tuple[str, 
 
     return "", ""
 
+
 __all__ = [
     "normalize_signals_times",
     "get_ma_price_gaps_for_indices",
     "get_regime_amp_index_for_indices",
     "generate_filtered_signals",
-    "selected_gap_col_for_ma_int"
+    "selected_gap_cols_for_ma_int",
 ]

@@ -32,6 +32,8 @@ default_args = {
     "retry_delay": timedelta(minutes=10),
 }
 
+MAX_ACTIVE_TASKS = 2
+
 
 def _load_json_file_strict(path: Path) -> dict:
     if not path.exists():
@@ -48,7 +50,7 @@ def _load_json_file_strict(path: Path) -> dict:
     schedule=None,
     start_date=pendulum.datetime(2026, 1, 1, tz="UTC"),
     fail_fast=True,
-    max_active_tasks=2,
+    max_active_tasks=MAX_ACTIVE_TASKS,
     max_active_runs=2,
     catchup=False,
     default_args=default_args,
@@ -81,7 +83,7 @@ def garch_qlike_scan_pipeline():
 
     @task()
     def prepare_cache_task(session_dir: str):
-        from etl.run_garch_scan import prepare_timeframe_cache
+        from research.run_garch_scan import prepare_timeframe_cache
 
         session_dir = Path(session_dir)
         run_cfg = _load_json_file_strict(session_dir / "run_config.json")
@@ -97,7 +99,7 @@ def garch_qlike_scan_pipeline():
 
     @task()
     def build_jobs_task(session_dir: str):
-        from etl.run_garch_scan import build_scan_jobs
+        from research.run_garch_scan import build_scan_jobs
 
         jobs = build_scan_jobs(session_dir=str(session_dir))
         logger.info("📋 Built %d jobs", len(jobs))
@@ -105,7 +107,7 @@ def garch_qlike_scan_pipeline():
 
     @task(pool=GARCH_POOL_NAME, priority_weight=3)
     def worker_scan_task(job: dict, session_dir: str):
-        from etl.run_garch_scan import run_scan_job
+        from research.run_garch_scan import run_scan_job
         from airflow.sdk import get_current_context
 
         context = get_current_context()
@@ -119,7 +121,7 @@ def garch_qlike_scan_pipeline():
 
     @task()
     def combine_results_task(session_dir: str):
-        from etl.run_garch_scan import combine_scan_outputs
+        from research.run_garch_scan import combine_scan_outputs
 
         logger.info("🧹 Combining GARCH scan outputs for %s", session_dir)
         return combine_scan_outputs(session_dir=session_dir)

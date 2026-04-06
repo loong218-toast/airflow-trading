@@ -1,4 +1,4 @@
-# etl/schema.py
+# common/schema.py
 """
 Centralized Polars schema registry and helpers.
 
@@ -55,6 +55,7 @@ MASTER_SCHEMA: Dict[str, pl.DataType] = {
     "win_pos": pl.Int32,
     "balance": pl.Float32,
     "max_drawdown": pl.Float32,
+    "max_consecutive_losses": pl.Int32,
 }
 
 EQUITY_SCHEMA: Dict[str, pl.DataType] = {
@@ -272,10 +273,6 @@ def classify_fragment(df: Optional[pl.DataFrame], schema_type: str, min_non_null
         "other_schema_columns": other_cols,
     }
 
-
-def is_fragment_like_schema(df: Optional[pl.DataFrame], schema_type: str, min_non_null_fraction: Optional[float] = None) -> bool:
-    return bool(classify_fragment(df, schema_type, min_non_null_fraction)["is_like"])
-
 # -------------------------
 # Helpers
 # -------------------------
@@ -283,13 +280,6 @@ def get_schema(schema_type: str) -> Dict[str, pl.DataType]:
     if schema_type not in SCHEMA_REGISTRY:
         raise ValueError(f"Unknown schema_type {schema_type}")
     return SCHEMA_REGISTRY[schema_type]
-
-def _is_int_dtype(dt: pl.DataType) -> bool:
-    # simple containment check against known int dtypes
-    return dt in (pl.Int8, pl.Int16, pl.Int32, pl.Int64)
-
-def _is_float_dtype(dt: pl.DataType) -> bool:
-    return dt in (pl.Float32, pl.Float64)
 
 def enforce_schema(df: Optional[pl.DataFrame], schema_type: str, strict: bool = False) -> pl.DataFrame:
     target_schema = get_schema(schema_type)
@@ -358,31 +348,3 @@ def cast_to_schema(data: Any, schema_type: str) -> pl.DataFrame:
         _LOG.exception("cast_to_schema: failed to build DataFrame from data: %s", e)
         raise
     return enforce_schema(df, schema_type)
-
-def cast_to_master(data: Any) -> pl.DataFrame:
-    """Convenience wrapper for the master schema."""
-    return cast_to_schema(data, "master")
-
-def validate_dataframe(df: pl.DataFrame, schema_type: str) -> List[Tuple[str, Optional[pl.DataType], Optional[pl.DataType]]]:
-    """
-    Non-destructive validation helper.
-    Returns a list of mismatches as tuples: (column, expected_dtype, actual_dtype)
-    If a column is missing it's reported with actual_dtype=None.
-    If there are no mismatches an empty list is returned.
-    """
-    schema = get_schema(schema_type)
-    mismatches: List[Tuple[str, Optional[pl.DataType], Optional[pl.DataType]]] = []
-    if df is None:
-        for col, dtype in schema.items():
-            mismatches.append((col, dtype, None))
-        return mismatches
-
-    for col, dtype in schema.items():
-        if col not in df.columns:
-            mismatches.append((col, dtype, None))
-        else:
-            actual = df.schema.get(col)
-            # Compare canonical repr where possible
-            if actual != dtype:
-                mismatches.append((col, dtype, actual))
-    return mismatches

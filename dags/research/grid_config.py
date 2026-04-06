@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import List
 from itertools import product
 
-from etl.grid import _expand_sl_tp, _prune_by_min_rr
+from research.grid import _expand_sl_tp, _prune_by_min_rr
 
 # Assuming logger is initialized globally in your project
 logger = logging.getLogger(__name__)

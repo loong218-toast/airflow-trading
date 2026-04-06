@@ -82,8 +82,8 @@ def grid_search_pipeline():
     def init_session_task():
         """Creates the session folder and generates batch configs, with resume safety checks."""
 
-        from etl.session import resolve_or_create_session
-        from etl.grid_config import generate_configs
+        from common.session import resolve_or_create_session
+        from research.grid_config import generate_configs
 
         # parse current run config  
         current_cfg = apply_performance_and_run_config()
@@ -149,11 +149,11 @@ def grid_search_pipeline():
     @task()
     def prepare_task(session_dir: str):
         """
-        Prepare session-local base_data.parquet by calling etl.session.prepare_base_data.
+        Prepare session-local base_data.parquet by calling common.session.prepare_base_data.
         This wrapper builds DB URI from env and passes run_cfg loaded from RUN_CONFIG_PATH.
         """
 
-        from etl.session import prepare_base_data as _prepare_base_data
+        from common.session import prepare_base_data as _prepare_base_data
 
         session_dir = Path(session_dir)
         # build DB URI
@@ -175,7 +175,7 @@ def grid_search_pipeline():
 
     @task()
     def prepare_features_task(session_dir: str):
-        from etl.feature_prep import prepare_feature_cache
+        from common.feature_prep import prepare_feature_cache
         
         session_dir = Path(session_dir)
         session_snapshot = session_dir / "run_config.json"
@@ -217,7 +217,7 @@ def grid_search_pipeline():
     @task()
     def list_pending_task(session_dir: str):
         """Finds only the BATCH files that haven't been completed yet."""
-        from etl.grid_config import list_pending_config_paths
+        from research.grid_config import list_pending_config_paths
         # This now looks for batch_*.json instead of cfg_*.json
         pending_batches = list_pending_config_paths(Path(session_dir))
         logger.info(f"📋 Found {len(pending_batches)} batches to process.")
@@ -229,7 +229,7 @@ def grid_search_pipeline():
 
     @task(pool="heavy_compute_pool", priority_weight=3)
     def worker_compute_task(cfg_path: str, session_dir: str, total_count: int):
-        from etl.grid import compute_config_and_save
+        from research.grid import compute_config_and_save
         from airflow.sdk import get_current_context
 
         # --- GET WORKER IDENTITY ---
@@ -243,19 +243,19 @@ def grid_search_pipeline():
         
         logger.info(f"🧵 Worker {worker_id}/{total_count} processing {cfg_path}")
         
-        # This calls the actual logic in etl/grid.py
+        # This calls the actual logic in research/grid.py
         # Ensure compute_config_and_save uses the unique-part logic we discussed
         return compute_config_and_save(cfg_path, session_dir)
 
     @task()
     def combine_results_task(session_dir: str, dependencies):
-        from etl.merge_utils import combine_results_to_master
+        from research.merge_utils import combine_results_to_master
         logger.info(f"🧹 Combining results for {session_dir}...")
         return combine_results_to_master(session_dir)
 
     @task()
     def combine_equity_task(session_dir: str, dependencies):
-        from etl.merge_utils import combine_all_equity_parts
+        from research.merge_utils import combine_all_equity_parts
         logger.info(f"🧹 Combining equity parts for {session_dir}...")
         outputs = combine_all_equity_parts(session_dir)
         logger.info("✅ Equity merge complete: %d era files", len(outputs))

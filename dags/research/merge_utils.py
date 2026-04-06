@@ -12,8 +12,8 @@ import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from etl.cache import _get_cache_root as _io_get_cache_root
-from etl.schema import enforce_schema, get_schema
+from common.cache import _get_cache_root as _io_get_cache_root
+from common.schema import enforce_schema, get_schema
 
 _LOG = logging.getLogger(__name__)
 

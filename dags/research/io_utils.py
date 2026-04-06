@@ -1,4 +1,4 @@
-# etl/io_utils.py
+# research/io_utils.py
 import os
 import time
 import tempfile
@@ -14,7 +14,7 @@ import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from etl.schema import DF_MAIN_SCHEMA, MASTER_SCHEMA, enforce_schema
+from common.schema import DF_MAIN_SCHEMA, MASTER_SCHEMA, enforce_schema
 
 logger = logging.getLogger(__name__)
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-from etl.merge_utils import combine_equity_parts as _combine_equity_parts
+from research.merge_utils import combine_equity_parts as _combine_equity_parts
 
 
 def combine_equity_parts(session_dir: Path, partition_key: str, batch_id: Optional[int] = None):

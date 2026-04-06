@@ -1,15 +1,36 @@
-# etl/grid_row_builders.py
+# research/grid_row_builders.py
 
 import polars as pl
 import numpy as np
 from typing import Dict
 
 # Local imports inferred from function calls in the script
-from etl.feature_helpers import (
+from common.feature_helpers import (
     get_regime_amp_index_for_indices,
-    get_ma_price_gaps_for_indices
 )
 
+def _make_empty_master_row(
+    regime_id: int,
+    era_int: int,
+    side_flag: int,
+    sl_val: float,
+    tp_val: float,
+    regime_cfg: dict,
+) -> dict:
+    return _make_master_row(
+        regime_id=regime_id,
+        era_int=era_int,
+        side_flag=side_flag,
+        sl_val=sl_val,
+        tp_val=tp_val,
+        total_pos=0,
+        win_pos=0,
+        balance=100.0,
+        max_dd=0.0,
+        max_consecutive_losses=0,
+        regime_cfg=regime_cfg,
+    )
+    
 def _make_master_row(
     regime_id: int,
     era_int: int,
@@ -20,6 +41,7 @@ def _make_master_row(
     win_pos: int,
     balance: float,
     max_dd: float,
+    max_consecutive_losses: int,
     regime_cfg: dict,
 ) -> dict:
     return {
@@ -48,6 +70,7 @@ def _make_master_row(
         "trailing_sl_pct": float(regime_cfg.get("trailing_sl_pct", 0.0)),
         "trailing_sl_interval": int(regime_cfg.get("trailing_sl_interval", 0)),
         "trailing_sl_stop_at_pos": bool(regime_cfg.get("trailing_sl_stop_at_pos", True)),
+        "max_consecutive_losses": int(max_consecutive_losses),
         "max_drawdown": float(max_dd),
     }
 
@@ -180,14 +203,6 @@ def build_trade_ml_rows_from_backtest(
     )
 
     filled_mask = fill_status == 1
-    if np.any(filled_mask):
-        gap_a_e, gap_b_e, gap_a_x, gap_b_x = get_ma_price_gaps_for_indices(
-            df_main=df_main,
-            entry_idxs=feature_entry_idxs[filled_mask].astype(np.int64),
-            exit_idxs=exit_idx[filled_mask].astype(np.int64),
-            regime_cfg=regime_cfg,
-            run_cfg=run_cfg,
-        )
 
     df = pl.DataFrame(
         {

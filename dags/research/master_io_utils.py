@@ -1,4 +1,4 @@
-# etl/master_io_utils.py
+# research/master_io_utils.py
 from __future__ import annotations
 
 import logging
@@ -12,7 +12,7 @@ from typing import Any, Dict, List
 
 import polars as pl
 
-from etl.schema import MASTER_SCHEMA, enforce_schema, get_schema
+from common.schema import MASTER_SCHEMA, enforce_schema, get_schema
 
 logger = logging.getLogger(__name__)
 

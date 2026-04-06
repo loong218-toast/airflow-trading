@@ -1,4 +1,4 @@
-# etl/run_garch_scan.py
+# research/run_garch_scan.py
 from __future__ import annotations
 
 import json
@@ -687,8 +687,7 @@ def run_scan_job(
                 {
                     "job_id": job_id,
                     "timeframe_min": int(timeframe_min),
-                    "origin_time_ns": origin_time_ns,
-                    "origin_time": pd.to_datetime(origin_time_ns, utc=True),
+                    "time_ns": origin_time_ns,
                     "train_window_days": int(train_window_days),
                     "refit_every_days": int(refit_every_days),
                     "horizon_hours": int(h_hours),

@@ -33,26 +33,24 @@ from airflow.exceptions import AirflowFailException
 
 from etl.transform import build_df_main_from_5m_polars, load_candles_from_db_polars
 
-from etl.feature_prep import (
+from common.feature_prep import (
     load_prepared_feature_ref, 
     precompute_all_possible_features, 
     prepare_feature_cache
     )
-from etl.feature_helpers import (
+from common.feature_helpers import (
     generate_filtered_signals, 
-    get_ma_price_gaps_for_indices, 
     get_regime_amp_index_for_indices
     )
 
-from etl.db import get_engine
-
-from etl.backtest import (
+from research.backtest import (
     backtest_signals_sl_tp_rets,
     fast_compound_equity_gate,
-    compute_pnl_pct_vectorized
+    compute_pnl_pct_vectorized,
+    compute_max_consecutive_losses
 )
 
-from etl.cache import (
+from common.cache import (
     load_signals_cached,
     stage_for_flush,
     load_backtest_cached,
@@ -61,18 +59,18 @@ from etl.cache import (
     stage_global_signals
 )
 
-from etl.io_utils import FULL_LAKE_DIR
-from etl.merge_utils import combine_cache, merge_batch_master_parts, combine_results_to_master
-from etl.master_io_utils import (
+from research.io_utils import FULL_LAKE_DIR
+from research.merge_utils import combine_cache, merge_batch_master_parts, combine_results_to_master
+from research.master_io_utils import (
     buffer_master_row,
     _flush_master_rows_buffer,
 )
 
-from etl.profiling import maybe_profile
+from common.profiling import maybe_profile
 
-from etl.grid_row_builders import _make_master_row, build_trade_ml_rows_from_backtest
+from research.grid_row_builders import _make_master_row, build_trade_ml_rows_from_backtest
 
-from etl.schema import enforce_schema, get_schema, cast_to_schema, classify_fragment
+from common.schema import enforce_schema, get_schema, cast_to_schema, classify_fragment
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -405,7 +403,7 @@ def _to_numpy_ensure(arr_series: pl.Series, dtype):
     return a
 
 def prepare_worker_data(session_dir: Path, run_cfg: dict):
-    from etl.feature_prep import load_prepared_feature_ref
+    from common.feature_prep import load_prepared_feature_ref
 
     session_dir = Path(session_dir)
 
@@ -636,6 +634,7 @@ def compute_equity_preview(
 
     exit_times_ns = np.asarray(main_time_ns_arr[closed_exit_idxs], dtype=np.int64)
     return pnl_pct_arr, exit_times_ns, equity_arr, float(max_dd), bool(breached)
+    
 def stage_equity_from_preview(
     pnl_pct_arr: np.ndarray,
     exit_times_ns: np.ndarray,
@@ -782,16 +781,12 @@ def _run_backtest_grid(
             total_pos = int(side_df_pl.height) if side_df_pl is not None and not side_df_pl.is_empty() else 0
 
             if total_pos == 0:
-                master_row_raw = _make_master_row(
+                master_row_raw = _make_empty_master_row(
                     regime_id=regime_id,
                     era_int=era_int,
                     side_flag=side_flag,
                     sl_val=sl_val,
                     tp_val=tp_val,
-                    total_pos=0,
-                    win_pos=0,
-                    balance=100.0,
-                    max_dd=0.0,
                     regime_cfg=regime_cfg,
                 )
                 buffer_master_row(results_dir, batch_id, master_row_raw)
@@ -931,16 +926,12 @@ def _run_backtest_grid(
                 filled_pos = int(entry_idx.size)
 
             if entry_idx.size == 0:
-                master_row_raw = _make_master_row(
+                master_row_raw = _make_empty_master_row(
                     regime_id=regime_id,
                     era_int=era_int,
                     side_flag=side_flag,
                     sl_val=sl_val,
                     tp_val=tp_val,
-                    total_pos=0,
-                    win_pos=0,
-                    balance=100.0,
-                    max_dd=0.0,
                     regime_cfg=regime_cfg,
                 )
                 buffer_master_row(results_dir, batch_id, master_row_raw)
@@ -950,16 +941,12 @@ def _run_backtest_grid(
 
             mask_closed = exit_idx >= 0
             if not mask_closed.any():
-                master_row_raw = _make_master_row(
+                master_row_raw = _make_empty_master_row(
                     regime_id=regime_id,
                     era_int=era_int,
                     side_flag=side_flag,
                     sl_val=sl_val,
                     tp_val=tp_val,
-                    total_pos=filled_pos,
-                    win_pos=0,
-                    balance=100.0,
-                    max_dd=0.0,
                     regime_cfg=regime_cfg,
                 )
                 buffer_master_row(results_dir, batch_id, master_row_raw)
@@ -967,6 +954,7 @@ def _run_backtest_grid(
                 continue
 
             closed_rets = rets[mask_closed]
+            max_consecutive_losses = compute_max_consecutive_losses(closed_rets)
             closed_entry_idxs = entry_idx[mask_closed].astype(np.int64)
             closed_exit_idxs = exit_idx[mask_closed].astype(np.int64)
             closed_entry_prices = entry_price_arr[mask_closed].astype(np.float64)
@@ -1001,6 +989,7 @@ def _run_backtest_grid(
                     win_pos=win_pos,
                     balance=final_balance,
                     max_dd=current_max_dd,
+                    max_consecutive_losses=max_consecutive_losses,
                     regime_cfg=regime_cfg,
                 )
                 buffer_master_row(results_dir, batch_id, master_row_raw)
@@ -1035,6 +1024,7 @@ def _run_backtest_grid(
                 win_pos=win_pos,
                 balance=final_balance,
                 max_dd=max_dd,
+                max_consecutive_losses=max_consecutive_losses,
                 regime_cfg=regime_cfg,
             )
             buffer_master_row(results_dir, batch_id, master_row_raw)
@@ -1197,16 +1187,12 @@ def process_era_combos(
             if side_sig_idxs_all.size == 0:
                 for era in era_registry:
                     era_label = era["era_label"]
-                    master_row_raw = _make_master_row(
+                    master_row_raw = _make_empty_master_row(
                         regime_id=regime_id,
                         era_int=era["era_int"],
                         side_flag=side_flag,
                         sl_val=sl_val,
                         tp_val=tp_val,
-                        total_pos=0,
-                        win_pos=0,
-                        balance=100.0,
-                        max_dd=0.0,
                         regime_cfg=regime_cfg,
                     )
                     buffer_master_row(results_dir, batch_id, master_row_raw)
@@ -1268,16 +1254,12 @@ def process_era_combos(
             if entry_idx_all.size == 0:
                 for era in era_registry:
                     era_label = era["era_label"]
-                    master_row_raw = _make_master_row(
+                    master_row_raw = _make_empty_master_row(
                         regime_id=regime_id,
                         era_int=era["era_int"],
                         side_flag=side_flag,
                         sl_val=sl_val,
                         tp_val=tp_val,
-                        total_pos=0,
-                        win_pos=0,
-                        balance=100.0,
-                        max_dd=0.0,
                         regime_cfg=regime_cfg,
                     )
                     buffer_master_row(results_dir, batch_id, master_row_raw)
@@ -1305,16 +1287,12 @@ def process_era_combos(
                     sig_max_ns = era["sell_sig_max_ns"]
 
                 if sig_n == 0:
-                    master_row_raw = _make_master_row(
+                    master_row_raw = _make_empty_master_row(
                         regime_id=regime_id,
-                        era_int=era["era_int"],
+                        era_int=era_int,
                         side_flag=side_flag,
                         sl_val=sl_val,
                         tp_val=tp_val,
-                        total_pos=0,
-                        win_pos=0,
-                        balance=100.0,
-                        max_dd=0.0,
                         regime_cfg=regime_cfg,
                     )
                     buffer_master_row(results_dir, batch_id, master_row_raw)
@@ -1382,16 +1360,12 @@ def process_era_combos(
                     trade_mask = closed_mask_all & (entry_time_ns_all >= start_ns) & (entry_time_ns_all < end_ns)
 
                     if not trade_mask.any():
-                        master_row_raw = _make_master_row(
+                        master_row_raw = _make_empty_master_row(
                             regime_id=regime_id,
-                            era_int=era["era_int"],
+                            era_int=era_int,
                             side_flag=side_flag,
                             sl_val=sl_val,
                             tp_val=tp_val,
-                            total_pos=int(sig_n),
-                            win_pos=0,
-                            balance=100.0,
-                            max_dd=0.0,
                             regime_cfg=regime_cfg,
                         )
                         buffer_master_row(results_dir, batch_id, master_row_raw)
@@ -1439,16 +1413,12 @@ def process_era_combos(
                         logger.error("Backtest cache write failed cfg=%s era=%s: %s", regime_id, era_label, e)
 
                 if entry_idx is None or entry_idx.size == 0:
-                    master_row_raw = _make_master_row(
+                    master_row_raw = _make_empty_master_row(
                         regime_id=regime_id,
                         era_int=era["era_int"],
                         side_flag=side_flag,
                         sl_val=sl_val,
                         tp_val=tp_val,
-                        total_pos=0,
-                        win_pos=0,
-                        balance=100.0,
-                        max_dd=0.0,
                         regime_cfg=regime_cfg,
                     )
                     buffer_master_row(results_dir, batch_id, master_row_raw)
@@ -1459,16 +1429,12 @@ def process_era_combos(
 
                 mask_closed = exit_idx >= 0
                 if not mask_closed.any():
-                    master_row_raw = _make_master_row(
+                    master_row_raw = _make_empty_master_row(
                         regime_id=regime_id,
                         era_int=era["era_int"],
                         side_flag=side_flag,
                         sl_val=sl_val,
                         tp_val=tp_val,
-                        total_pos=int(entry_idx.size),
-                        win_pos=0,
-                        balance=100.0,
-                        max_dd=0.0,
                         regime_cfg=regime_cfg,
                     )
                     buffer_master_row(results_dir, batch_id, master_row_raw)
@@ -1513,6 +1479,7 @@ def process_era_combos(
                         win_pos=win_pos,
                         balance=final_balance,
                         max_dd=current_max_dd,
+                        max_consecutive_losses=compute_max_consecutive_losses(closed_rets),
                         regime_cfg=regime_cfg,
                     )
                     buffer_master_row(results_dir, batch_id, master_row_raw)
@@ -1548,6 +1515,7 @@ def process_era_combos(
                     win_pos=win_pos,
                     balance=final_balance,
                     max_dd=max_dd,
+                    max_consecutive_losses=compute_max_consecutive_losses(closed_rets),
                     regime_cfg=regime_cfg,
                 )
                 buffer_master_row(results_dir, batch_id, master_row_raw)

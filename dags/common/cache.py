@@ -1,4 +1,4 @@
-# etl/cache.py
+# research/cache.py
 from __future__ import annotations
 
 import os
@@ -10,7 +10,7 @@ from functools import lru_cache
 
 import polars as pl
 
-from etl.schema import get_schema, enforce_schema
+from research.schema import get_schema, enforce_schema
 
 _LOG = logging.getLogger(__name__)
 

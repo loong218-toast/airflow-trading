@@ -1,35 +1,31 @@
+# kraken_signal_ingest.py
+
 from __future__ import annotations
 
 import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-from sqlalchemy import text
+from typing import Any, Dict, List, Optional
+
 import pendulum
 import polars as pl
 import requests
-from airflow.sdk import dag, task, Variable
+from airflow.sdk import dag, task
 
 from etl.db import get_engine
-
-from etl.feature_helpers import (
-    _unwrap_singleton,
-    _as_list,
+from common.feature_helpers import (
     _as_bool,
-    _as_int,
     _as_float,
-    _as_str,
+    _as_int,
     _as_int_list,
-    _as_float_list,
     _as_threshold_pairs,
-    _as_ma_type_list,
-    generate_filtered_signals
+    _as_list,
+    _as_str,
+    generate_filtered_signals,
 )
-
-from etl.feature_prep import precompute_all_possible_features
-
-from etl.schema import enforce_schema
+from common.feature_prep import precompute_all_possible_features
+from common.schema import enforce_schema
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +33,7 @@ CONFIG_PATH = Path("/opt/airflow/airflow-trading/signal_config.json")
 STATE_PATH = Path("/opt/airflow/airflow-trading/last_signal_state.json")
 
 LIVE_MAX_ROWS = 500
+LOCAL_TZ = "Asia/Kuala_Lumpur"
 
 
 def _load_json_file(path: Path) -> dict:
@@ -57,6 +54,7 @@ def _db_uri() -> str:
         raise RuntimeError("POSTGRES_USER / POSTGRES_PASSWORD are required")
     return f"postgresql+psycopg2://{db_user}:{db_pass}@{db_host}/{db_name}"
 
+
 def _normalize_live_item(item: Any) -> Dict[str, str]:
     if isinstance(item, str):
         return {"pair": item, "market_type": "spot"}
@@ -73,6 +71,41 @@ def _normalize_live_item(item: Any) -> Dict[str, str]:
         "market_type": market_type,
     }
 
+
+def _normalize_positive_int_list(value: Any) -> list[int]:
+    out: list[int] = []
+    seen: set[int] = set()
+    for x in _as_list(value):
+        v = _as_int(x, 0)
+        if v > 0 and v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+def _normalize_int_or_list(value: Any) -> list[int]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return _normalize_positive_int_list(value)
+    v = _as_int(value, 0)
+    return [v] if v > 0 else []
+
+
+def _fmt_price(value: Any) -> str:
+    try:
+        v = float(value)
+    except Exception:
+        return "n/a"
+    s = f"{v:.10f}".rstrip("0").rstrip(".")
+    return s if s else "0"
+
+
+def _format_local_time_ns(time_ns: int) -> str:
+    dt = pendulum.from_timestamp(int(time_ns) / 1_000_000_000.0, tz="UTC").in_timezone(LOCAL_TZ)
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
 def _estimate_needed_bars(pair_cfg: dict) -> int:
     base_min = _as_int(pair_cfg.get("BASE_MINUTES", 5), 5)
     modifier = _as_int(pair_cfg.get("signal_timeframe_modifier", 3), 3)
@@ -80,15 +113,22 @@ def _estimate_needed_bars(pair_cfg: dict) -> int:
     ma_periods = _as_int_list(pair_cfg.get("ma_periods", []))
     entry_lookback = _as_int(pair_cfg.get("entry_lookback_units", 0), 0)
     stoch_k = _as_int_list(pair_cfg.get("stoch_k", []))
+    stoch_d = _as_int_list(pair_cfg.get("stoch_d", []))
+    stoch_s = _as_int_list(pair_cfg.get("stoch_s", []))
     bbw_periods = _as_int_list(pair_cfg.get("bbw_periods", []))
 
     max_units = 0
     for x in ma_periods:
         max_units = max(max_units, x)
 
-    max_units = max(max_units, entry_lookback)
+    if isinstance(entry_lookback, int):
+        max_units = max(max_units, entry_lookback)
 
     for x in stoch_k:
+        max_units = max(max_units, x)
+    for x in stoch_d:
+        max_units = max(max_units, x)
+    for x in stoch_s:
         max_units = max(max_units, x)
 
     for x in bbw_periods:
@@ -100,13 +140,11 @@ def _estimate_needed_bars(pair_cfg: dict) -> int:
     bars = int(max_units * modifier + 20)
     return max(bars, int((120 / max(base_min, 1))))
 
+
 def _load_recent_df_main(pair: str, market_type: str, limit_rows: int) -> pl.DataFrame:
-    # 1. Get engine and strip the +psycopg2 to make it ADBC-compatible
-    # This matches your working etl/transform.py logic
     uri_obj = get_engine(_db_uri()).url
     uri = f"postgresql://{uri_obj.username}:{uri_obj.password}@{uri_obj.host}:{uri_obj.port or 5432}/{uri_obj.database}"
-    
-    # 2. Use positional '$' placeholders for ADBC/Postgres
+
     query = """
         SELECT
             pair, market_type, time, time_ns, open, high, low, close,
@@ -118,32 +156,37 @@ def _load_recent_df_main(pair: str, market_type: str, limit_rows: int) -> pl.Dat
     """
 
     try:
-        # 3. Use positional parameters in a LIST (not dict) via execute_options
         df = pl.read_database_uri(
             query=query,
             uri=uri,
             engine="adbc",
-            execute_options={"parameters": [pair, market_type, int(limit_rows)]}
+            execute_options={"parameters": [pair, market_type, int(limit_rows)]},
         )
     except Exception as e:
-        logger.error(f"ADBC Signal Load failed for {pair}: {e}")
+        logger.error("ADBC Signal Load failed for %s: %s", pair, e)
         raise RuntimeError(f"Polars ADBC failed: {e}")
 
     if df.is_empty():
         return pl.DataFrame()
 
-    # 4. Enforce schema
-    return df.with_columns([
-        pl.col("time").cast(pl.Datetime("ns", "UTC")),
-        pl.col("time_ns").cast(pl.Int64),
-        pl.col("open").cast(pl.Float32),
-        pl.col("high").cast(pl.Float32),
-        pl.col("low").cast(pl.Float32),
-        pl.col("close").cast(pl.Float32),
-        pl.col("volume").cast(pl.Float32),
-        pl.col("spread").cast(pl.Float32),
-        pl.col("funding_rate").cast(pl.Float32),
-    ]).sort("time").with_row_index("idx")
+    return (
+        df.with_columns(
+            [
+                pl.col("time").cast(pl.Datetime("ns", "UTC")),
+                pl.col("time_ns").cast(pl.Int64),
+                pl.col("open").cast(pl.Float32),
+                pl.col("high").cast(pl.Float32),
+                pl.col("low").cast(pl.Float32),
+                pl.col("close").cast(pl.Float32),
+                pl.col("volume").cast(pl.Float32),
+                pl.col("spread").cast(pl.Float32),
+                pl.col("funding_rate").cast(pl.Float32),
+            ]
+        )
+        .sort("time")
+        .with_row_index("idx")
+    )
+
 
 def _as_single_int(value: Any) -> Optional[int]:
     if value is None:
@@ -192,6 +235,114 @@ def _resolve_live_stoch_col(cfg: dict, df: Optional[pl.DataFrame] = None) -> Opt
 
     return None
 
+
+def _resolve_trade_window_intervals(cfg: dict) -> list[int]:
+    raw = cfg.get("trade_window_interval", [])
+    return _normalize_positive_int_list(raw)
+
+
+def _resolve_prices_for_row(row: dict, cfg: dict) -> tuple[float, float, float]:
+    side = int(row["side"])
+    close = float(row["close"])
+    high = float(row["high"])
+    low = float(row["low"])
+
+    if side == 1:
+        limit_price = 0.5 * (close + low)
+    else:
+        limit_price = 0.5 * (close + high)
+
+    sl_pct = _as_float(cfg.get("SL", cfg.get("sl", 0.0)), 0.0)
+    tp_pct = _as_float(cfg.get("TP", cfg.get("tp", 0.0)), 0.0)
+
+    if side == 1:
+        sl_price = limit_price * (1.0 - sl_pct / 100.0)
+        tp_price = limit_price * (1.0 + tp_pct / 100.0)
+    else:
+        sl_price = limit_price * (1.0 + sl_pct / 100.0)
+        tp_price = limit_price * (1.0 - tp_pct / 100.0)
+
+    return limit_price, sl_price, tp_price
+
+
+def _cooldown_key(row: dict) -> str:
+    return (
+        f"{row.get('pair', '')}|"
+        f"{row.get('market_type', '')}|"
+        f"{row.get('side', '')}|"
+        f"{row.get('regime_id', '')}"
+    )
+
+
+def _signal_key(row: dict) -> str:
+    return (
+        f"{row.get('pair', '')}|"
+        f"{row.get('market_type', '')}|"
+        f"{row.get('time_ns', '')}|"
+        f"{row.get('side', '')}|"
+        f"{row.get('regime_id', '')}"
+    )
+
+
+def _read_last_state() -> dict:
+    if not STATE_PATH.exists():
+        return {}
+    try:
+        return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _write_last_state(state: dict) -> None:
+    tmp = STATE_PATH.with_suffix(STATE_PATH.suffix + ".tmp")
+    tmp.write_text(json.dumps(state, indent=2, default=str), encoding="utf-8")
+    os.replace(tmp, STATE_PATH)
+
+
+def _last_sent_time_ns(state: dict, cooldown_key: str) -> Optional[int]:
+    prev = state.get(cooldown_key)
+    if isinstance(prev, dict):
+        for k in ("time_ns", "last_time_ns", "sent_time_ns"):
+            if k in prev:
+                try:
+                    return int(prev[k])
+                except Exception:
+                    return None
+    if isinstance(prev, (int, float, str)):
+        try:
+            return int(prev)
+        except Exception:
+            return None
+    return None
+
+
+def _within_trade_window(signal_time_ns: int, state: dict, cooldown_key: str, trade_window_intervals: list[int]) -> bool:
+    if not trade_window_intervals:
+        return True
+
+    prev_time_ns = _last_sent_time_ns(state, cooldown_key)
+    if prev_time_ns is None:
+        return True
+
+    elapsed_hours = (int(signal_time_ns) - int(prev_time_ns)) / 3_600_000_000_000.0
+    return any(elapsed_hours >= float(x) for x in trade_window_intervals)
+
+
+def _build_message(rows: List[dict]) -> str:
+    lines = ["Trading signal alert"]
+    for r in rows:
+        side = "BUY" if int(r["side"]) == 1 else "SELL"
+        lines.append(
+            f"{side} | {r['pair']} | {r.get('market_type')} | "
+            f"time={r.get('time_local')} | "
+            f"limit={_fmt_price(r.get('limit_price'))} | "
+            f"SL={_fmt_price(r.get('sl_price'))} | "
+            f"TP={_fmt_price(r.get('tp_price'))} | "
+            f"within_trade_window={bool(r.get('within_trade_window', False))}"
+        )
+    return "\n".join(lines)
+
+
 def _build_live_signal_frame(
     df_main: pl.DataFrame,
     pair_params: dict,
@@ -225,60 +376,6 @@ def _build_live_signal_frame(
             )
 
     return generate_filtered_signals(df_feat, live, df_main=df_feat)
-
-
-def _pick_latest_signal(df_signals: pl.DataFrame) -> pl.DataFrame:
-    if df_signals is None or df_signals.is_empty():
-        return pl.DataFrame()
-
-    latest_ns = df_signals["time_ns"].max()
-    return df_signals.filter(pl.col("time_ns") == latest_ns).sort(["side", "idx"])
-
-def _combo_name(cfg: dict) -> str:
-    parts = []
-    if _as_int_list(cfg.get("ma_periods", [])):
-        parts.append("MA")
-    if _as_bool(cfg.get("use_stochastic", False), False):
-        parts.append("STOCH")
-    if _as_int(cfg.get("entry_lookback_units", 0), 0) > 0:
-        parts.append("LOOKBACK")
-    if _as_bool(cfg.get("use_bbw", False), False):
-        parts.append("BBW")
-    return "+".join(parts) if parts else "RAW"
-
-
-def _signal_key(row: dict) -> str:
-    return (
-        f"{row.get('pair', '')}|"
-        f"{row.get('market_type', '')}|"
-        f"{row.get('time_ns', '')}|"
-        f"{row.get('side', '')}|"
-        f"{row.get('regime_id', '')}"
-    )
-
-def _read_last_state() -> dict:
-    if not STATE_PATH.exists():
-        return {}
-    try:
-        return json.loads(STATE_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
-def _write_last_state(state: dict) -> None:
-    tmp = STATE_PATH.with_suffix(STATE_PATH.suffix + ".tmp")
-    tmp.write_text(json.dumps(state, indent=2, default=str), encoding="utf-8")
-    os.replace(tmp, STATE_PATH)
-
-def _build_message(rows: List[dict]) -> str:
-    lines = ["Trading signal alert"]
-    for r in rows:
-        side = "BUY" if int(r["side"]) == 1 else "SELL"
-        lines.append(
-            f"{side} | {r['pair']} | {r.get('market_type')} | "
-            f"regime={r.get('regime_id')} | time_ns={r.get('time_ns')} | idx={r.get('idx')}"
-        )
-    return "\n".join(lines)
 
 
 @dag(
@@ -354,7 +451,8 @@ def kraken_signal_ingest():
                 "reason": "no df_main rows",
             }
 
-        df_signals = _build_live_signal_frame(df_main, params, pair, market_type)
+        df_feat = df_main.clone()
+        df_signals = _build_live_signal_frame(df_feat, params, pair, market_type)
         if df_signals.is_empty():
             return {
                 "pair": pair,
@@ -362,11 +460,13 @@ def kraken_signal_ingest():
                 "has_signal": False,
                 "reason": "no signal",
             }
-            
-        df_signals = df_signals.with_columns([
-            pl.lit(pair).alias("pair"),
-            pl.lit(market_type).alias("market_type")
-        ])
+
+        df_signals = df_signals.with_columns(
+            [
+                pl.lit(pair).alias("pair"),
+                pl.lit(market_type).alias("market_type"),
+            ]
+        )
 
         df_signals = df_signals.sort("time_ns")
         latest_ts = df_signals["time_ns"].max()
@@ -387,17 +487,32 @@ def kraken_signal_ingest():
                 "has_signal": False,
                 "reason": "conflicting latest-bar signals",
             }
-            
+
         prev_rows = (
             df_signals.filter(pl.col("time_ns") == prev_ts_df["time_ns"].max())
             if not prev_ts_df.is_empty()
             else pl.DataFrame()
         )
 
-        combo = _combo_name(params)
-        rows = []
+        combo = "MA" if _as_int_list(params.get("ma_periods", [])) else "RAW"
+        if _as_bool(params.get("use_stochastic", False), False):
+            combo = f"{combo}+STOCH"
+        if _as_int_list(params.get("entry_lookback_units", [])):
+            combo = f"{combo}+LOOKBACK"
+        if _as_bool(params.get("use_bbw", False), False):
+            combo = f"{combo}+BBW"
 
-        for row in latest_rows.select(["pair", "market_type", "time_ns", "side", "regime_id", "idx"]).to_dicts():
+        trade_window_intervals = _resolve_trade_window_intervals(params)
+        state = _read_last_state()
+
+        latest_rows = latest_rows.join(
+            df_feat.select(["idx", "close", "high", "low"]),
+            on="idx",
+            how="left",
+        )
+
+        rows = []
+        for row in latest_rows.select(["pair", "market_type", "time_ns", "side", "regime_id", "idx", "close", "high", "low"]).to_dicts():
             same_side_prev = not prev_rows.filter(
                 (pl.col("side") == row["side"]) & (pl.col("regime_id") == row["regime_id"])
             ).is_empty()
@@ -405,7 +520,19 @@ def kraken_signal_ingest():
             if same_side_prev:
                 continue
 
+            limit_price, sl_price, tp_price = _resolve_prices_for_row(row, params)
+            cooldown_key = _cooldown_key(row)
             row["combo"] = combo
+            row["time_local"] = _format_local_time_ns(int(row["time_ns"]))
+            row["limit_price"] = limit_price
+            row["sl_price"] = sl_price
+            row["tp_price"] = tp_price
+            row["within_trade_window"] = _within_trade_window(
+                int(row["time_ns"]),
+                state,
+                cooldown_key,
+                trade_window_intervals,
+            )
             rows.append(row)
 
         if not rows:
@@ -432,6 +559,8 @@ def kraken_signal_ingest():
 
         token = os.getenv("TG_BOT_TOKEN_SIGNAL")
         chat_id = os.getenv("TG_SIGNAL_CHANNEL_ID")
+        if not token or not chat_id:
+            raise RuntimeError("TG_BOT_TOKEN_SIGNAL / TG_SIGNAL_CHANNEL_ID are required")
 
         all_rows = []
         for r in valid:
@@ -471,7 +600,22 @@ def kraken_signal_ingest():
         resp.raise_for_status()
 
         for row in fresh_rows:
-            state[_signal_key(row)] = True
+            exact_key = _signal_key(row)
+            cooldown_key = _cooldown_key(row)
+            sent_time_ns = int(row["time_ns"])
+
+            state[exact_key] = {
+                "sent": True,
+                "time_ns": sent_time_ns,
+            }
+            state[cooldown_key] = {
+                "time_ns": sent_time_ns,
+                "pair": row.get("pair"),
+                "market_type": row.get("market_type"),
+                "side": int(row.get("side", 0)),
+                "regime_id": int(row.get("regime_id", 0)),
+            }
+
         _write_last_state(state)
 
         return {"sent": True, "count": len(fresh_rows), "status_code": resp.status_code}
@@ -481,5 +625,6 @@ def kraken_signal_ingest():
 
     mapped = build_one.partial(cfg=cfg).expand(item=items)
     send_telegram(mapped)
+
 
 kraken_signal_ingest_dag = kraken_signal_ingest()

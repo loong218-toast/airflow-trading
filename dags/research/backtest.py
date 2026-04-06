@@ -1,3 +1,5 @@
+# backtest.py
+# Keep the above .py filename for reference, but this is not a standalone script. It's meant to be imported and used by other code in the research pipeline for backtesting trading signals.
 """
 Backtest numeric kernels for close/high/low driven simulation.
 
@@ -14,9 +16,6 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 from numba import njit
-
-from etl.feature_helpers import get_ma_price_gaps_for_indices
-
 
 # -------------------------
 # small helpers
@@ -87,6 +86,33 @@ def _apply_trade_window_interval(
         rets[keep_idx],
         exit_reason[keep_idx],
     )
+
+@njit(cache=True)
+def _max_consecutive_losses_numba(rets):
+    max_streak = 0
+    streak = 0
+
+    for i in range(rets.shape[0]):
+        r = rets[i]
+
+        if not np.isfinite(r):
+            r = -1.0
+
+        if r < 0.0:
+            streak += 1
+            if streak > max_streak:
+                max_streak = streak
+        else:
+            streak = 0
+
+    return max_streak
+
+
+def compute_max_consecutive_losses(rets: np.ndarray) -> int:
+    arr = np.asarray(rets, dtype=np.float64)
+    if arr.size == 0:
+        return 0
+    return int(_max_consecutive_losses_numba(arr))
 
 @njit(cache=True)
 def fast_compound_equity_gate(pnl_arr, start_equity=100.0, max_dd_threshold=-1.0):
@@ -720,14 +746,17 @@ def backtest_from_arrays(
             trade_window_bars=trade_window_bars,
         )
 
+    max_consecutive_losses = compute_max_consecutive_losses(rets)
+
     return {
-        "signal_idx": signal_idx,
-        "entry_idx": entry_idx,
-        "entry_price": entry_price,
-        "exit_idx": exit_idx,
-        "exit_price": exit_price,
-        "rets": rets,
-        "exit_reason": exit_reason,
+    "signal_idx": signal_idx,
+    "entry_idx": entry_idx,
+    "entry_price": entry_price,
+    "exit_idx": exit_idx,
+    "exit_price": exit_price,
+    "rets": rets,
+    "exit_reason": exit_reason,
+    "max_consecutive_losses": max_consecutive_losses,
     }
 
 

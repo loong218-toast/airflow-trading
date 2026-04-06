@@ -14,7 +14,7 @@ import numpy as np
 from etl.db import get_engine
 from etl.transform import build_df_main_from_5m_polars, load_candles_from_db_polars
 
-from etl.io_utils import (
+from research.io_utils import (
     _ensure_full_lake_dir,
     FULL_LAKE_DIR,
     MANIFEST_FILE,
@@ -135,7 +135,7 @@ def prepare_base_data(session_dir: str, db_uri: str, run_cfg: Dict[str, Any], fo
     s_dir = Path(session_dir)
     s_dir.mkdir(parents=True, exist_ok=True)
 
-    # Ensure FULL_LAKE_DIR exists (comes from etl.io_utils)
+    # Ensure FULL_LAKE_DIR exists (comes from research.io_utils)
     base_full_dir = Path(FULL_LAKE_DIR)
     base_full_dir.mkdir(parents=True, exist_ok=True)
     global_base_file = base_full_dir / "base_data_full.parquet"

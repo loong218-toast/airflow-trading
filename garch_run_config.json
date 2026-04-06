@@ -5,9 +5,9 @@
   "grid_end_date": "2025-09-15T23:59:59Z",
 
   "garch_timeframes": [5, 15],
-  "garch_train_window_days": 30,
+  "garch_train_window_days": 60,
   "garch_refit_every_days": 2,
-  "garch_horizons_hours": [24],
+  "garch_horizons_hours": [12],
 
   "garch_chunk_origins": 8000,
   "garch_progress_every": 500,
