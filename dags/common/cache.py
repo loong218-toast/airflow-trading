@@ -10,7 +10,7 @@ from functools import lru_cache
 
 import polars as pl
 
-from research.schema import get_schema, enforce_schema
+from common.schema import get_schema, enforce_schema
 
 _LOG = logging.getLogger(__name__)
 

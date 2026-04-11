@@ -449,8 +449,10 @@ def combine_results_to_master(session_dir: str) -> Dict[str, Any]:
         _cleanup_path(tmp_master)
         raise
 
-    df_master = pl.read_parquet(master_metrics_path)
-    df_master = enforce_schema(df_master, "master", strict=True)
+    try:
+        rows = pq.ParquetFile(str(master_metrics_path)).metadata.num_rows
+    except Exception:
+        rows = None
 
     _LOG.info(
         "✅ Successfully merged master_metrics: merged=%d skipped=%d",
@@ -460,7 +462,7 @@ def combine_results_to_master(session_dir: str) -> Dict[str, Any]:
     return {
         "status": "complete_master_only",
         "path": str(master_metrics_path),
-        "rows": df_master.height,
+        "rows": rows,
         "merged_files": result["merged_files"],
         "skipped_files": result["skipped_files"],
         "skipped": result["skipped"],

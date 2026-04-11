@@ -7,7 +7,6 @@ from typing import Any, Optional
 
 import requests
 
-
 BOT_TOKEN = os.getenv("TG_BOT_TOKEN_SIGNAL", "").strip()
 TEST_CHAT_ID = os.getenv("TG_TEST_CHAT_ID", "").strip()
 EXPECTED_CHAT_ID = os.getenv("TG_EXPECTED_CHAT_ID", "").strip()
@@ -48,67 +47,29 @@ def pretty(obj: Any) -> str:
     return json.dumps(obj, indent=2, ensure_ascii=False, sort_keys=True)
 
 
-def chat_matches(chat: dict[str, Any], expected: str) -> bool:
-    expected = str(expected).strip()
-    candidates = {
-        str(chat.get("id")),
-        str(chat.get("username") or ""),
-        f"@{chat.get('username')}" if chat.get("username") else "",
-    }
-    return expected in candidates
-
-
 def is_parquet_document(msg: dict[str, Any]) -> bool:
     doc = msg.get("document")
     if not isinstance(doc, dict):
         return False
     file_name = str(doc.get("file_name") or "").lower()
     mime_type = str(doc.get("mime_type") or "").lower()
-    return file_name.endswith(".parquet") or "parquet" in file_name or "parquet" in mime_type
-
-
-def classify_message(msg: dict[str, Any]) -> tuple[bool, list[str]]:
-    reasons: list[str] = []
-
-    chat = msg.get("chat", {}) or {}
-    if EXPECTED_CHAT_ID and not chat_matches(chat, EXPECTED_CHAT_ID):
-        reasons.append("chat_mismatch")
-
-    doc = msg.get("document")
-    if not isinstance(doc, dict):
-        reasons.append("no_document")
-    else:
-        file_name = str(doc.get("file_name") or "")
-        if not (file_name.lower().endswith(".parquet") or "parquet" in file_name.lower()):
-            reasons.append("not_parquet")
-        if not doc.get("file_id"):
-            reasons.append("no_file_id")
-
-    ok = len(reasons) == 0
-    return ok, reasons
+    return file_name.endswith(".parquet") or "parquet" in mime_type or "parquet" in file_name
 
 
 def show_update(update: dict[str, Any]) -> None:
     print("\n====================================")
     print("update_id:", update.get("update_id"))
 
-    found_any = False
-
     for key in ("message", "channel_post", "edited_message", "edited_channel_post"):
         msg = update.get(key)
         if not isinstance(msg, dict):
             continue
-        found_any = True
 
         chat = msg.get("chat", {}) or {}
         sender_chat = msg.get("sender_chat", {}) or {}
         doc = msg.get("document", {}) or {}
 
-        ok, reasons = classify_message(msg)
-
         print("type:", key)
-        print("would_consume:", ok)
-        print("skip_reasons:", reasons if reasons else [])
         print("message_id:", msg.get("message_id"))
         print("date:", msg.get("date"))
         print("chat.id:", chat.get("id"))
@@ -125,15 +86,12 @@ def show_update(update: dict[str, Any]) -> None:
         print("document.file_id:", doc.get("file_id"))
         print("looks_like_parquet:", is_parquet_document(msg))
 
-        if ok and doc.get("file_id"):
+        if is_parquet_document(msg) and doc.get("file_id"):
             try:
                 file_info = api_get("getFile", {"file_id": doc["file_id"]})
                 print("getFile:", pretty(file_info))
             except Exception as e:
                 print("getFile failed:", repr(e))
-
-    if not found_any:
-        print("No message/channel_post payload found in this update.")
 
 
 def main() -> None:
@@ -159,7 +117,7 @@ def main() -> None:
         except Exception as e:
             print("getChat failed:", repr(e))
 
-        print("\n4) getChatMember")
+        print("\n4) getChatMember (bot membership in that chat/channel)")
         try:
             member = api_get(
                 "getChatMember",
@@ -196,37 +154,18 @@ def main() -> None:
     results = updates.get("result", []) if isinstance(updates, dict) else []
 
     print("\nUpdates count:", len(results))
-    total_matches = 0
-    total_skip_chat = 0
-    total_skip_doc = 0
-    total_skip_parquet = 0
+    parquet_hits = 0
 
     for upd in results:
         if not isinstance(upd, dict):
             continue
-
+        show_update(upd)
         for key in ("message", "channel_post", "edited_message", "edited_channel_post"):
             msg = upd.get(key)
-            if not isinstance(msg, dict):
-                continue
+            if isinstance(msg, dict) and is_parquet_document(msg):
+                parquet_hits += 1
 
-            ok, reasons = classify_message(msg)
-            if ok:
-                total_matches += 1
-            if "chat_mismatch" in reasons:
-                total_skip_chat += 1
-            if "no_document" in reasons:
-                total_skip_doc += 1
-            if "not_parquet" in reasons:
-                total_skip_parquet += 1
-
-        show_update(upd)
-
-    print("\nSummary:")
-    print("  matching parquet updates:", total_matches)
-    print("  chat mismatch skips:", total_skip_chat)
-    print("  missing document skips:", total_skip_doc)
-    print("  non-parquet skips:", total_skip_parquet)
+    print("\nParquet updates found:", parquet_hits)
 
     if TEST_CHAT_ID:
         print("\n6) sendMessage test")

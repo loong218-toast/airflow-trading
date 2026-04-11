@@ -8,7 +8,7 @@ import math
 import gc
 import datetime
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Sequence
 from collections import defaultdict
 import numpy as np
 import polars as pl
@@ -40,14 +40,14 @@ from common.feature_prep import (
     )
 from common.feature_helpers import (
     generate_filtered_signals, 
-    get_regime_amp_index_for_indices
     )
 
 from research.backtest import (
+    _avg_hit_pcts,
     backtest_signals_sl_tp_rets,
     fast_compound_equity_gate,
-    compute_pnl_pct_vectorized,
-    compute_max_consecutive_losses
+    compute_max_consecutive_losses,
+    _numba_pnl_from_actual_exits
 )
 
 from common.cache import (
@@ -69,6 +69,8 @@ from research.master_io_utils import (
 from common.profiling import maybe_profile
 
 from research.grid_row_builders import _make_master_row, build_trade_ml_rows_from_backtest
+
+from research.ccd_surrogate import make_ccd_eval_row, stage_ccd_eval_rows
 
 from common.schema import enforce_schema, get_schema, cast_to_schema, classify_fragment
 
@@ -323,7 +325,7 @@ class EquityStager:
         self._writers = {}
         self._paths = {}
 
-# SL/TP helpers (unchanged)
+# SL/TP helpers
 def _expand_sl_tp(run_cfg: Dict) -> Tuple[List[float], List[float]]:
     def _get_vals(key):
         if f"{key}_values" in run_cfg:
@@ -446,10 +448,10 @@ def _get_or_generate_global_signals(
     run_cfg: dict,
     data_ctx: dict,
     months: int,
-) -> pl.DataFrame:
+):
     """
     Build one global signal set for the full date range of the regime.
-    Cache it under era_label='GLOBAL' so it reuses your existing cache layout.
+    Returns: (signals_df, signal_stats)
     """
     force_rebuild_cache = bool(run_cfg.get("force_rebuild_cache", False))
     df_main: pl.DataFrame = data_ctx["df_main"]
@@ -458,26 +460,34 @@ def _get_or_generate_global_signals(
         try:
             cached = load_global_signals_cached(months, str(regime_id))
             if cached is not None and not cached.is_empty():
-                return enforce_schema(cached, "signals", strict=False)
+                cached = enforce_schema(cached, "signals", strict=False)
+                return cached, {
+                    "input_rows": int(cached.height),
+                    "final_buy_signals": int((cached["side"] == 1).sum()) if "side" in cached.columns else 0,
+                    "final_sell_signals": int((cached["side"] == -1).sum()) if "side" in cached.columns else 0,
+                    "final_total_signals": int(cached.height),
+                    "buy_filtered_out": 0,
+                    "sell_filtered_out": 0,
+                    "source": "cache",
+                }
         except Exception as e:
             logger.debug("global signal cache read failed cfg=%s: %s", regime_id, e)
 
-    df_signals = generate_filtered_signals(
-        df_main,
-        {**run_cfg, **regime_cfg, "regime_id": regime_id},
-        df_main=df_main,
-    )
+    cfg = {**run_cfg, **regime_cfg, "regime_id": regime_id}
+    signals, sig_stats = generate_filtered_signals(df_main, cfg, df_context=df_main, return_stats=True)
 
-    if not df_signals.is_empty():
+    if signals is not None and not signals.is_empty():
         try:
-            signals_for_cache = df_signals.select(["idx", "time_ns", "side", "regime_id"])
+            signals_for_cache = signals.select(["idx", "time_ns", "side", "regime_id"])
             signals_for_cache = enforce_schema(signals_for_cache, "signals", strict=True)
             stage_global_signals(months, str(regime_id), signals_for_cache)
         except Exception as e:
             logger.debug("stage_for_flush(global signals) failed cfg=%s: %s", regime_id, e)
 
-    return enforce_schema(df_signals, "signals", strict=False) if not df_signals.is_empty() else pl.DataFrame([], schema=get_schema("signals"))
+    if signals is None or signals.is_empty():
+        signals = pl.DataFrame([], schema=get_schema("signals"))
 
+    return enforce_schema(signals, "signals", strict=False), sig_stats
 
 def _build_era_registry(
     windows,
@@ -530,62 +540,6 @@ def _build_era_registry(
 
     return out
 
-@njit(cache=True)
-def _numba_pnl_from_actual_exits(
-    entry_prices,
-    exit_prices,
-    spread_arr,
-    funding_raw,
-    entry_idxs,
-    exit_idxs,
-    main_time_ns,
-    side_flag,
-    risk_pct,
-    sl_val,
-    sl_tp_in_pct,
-    spread_is_percent,
-    funding_period_hours,
-):
-    n = entry_prices.shape[0]
-    pnl_out = np.empty(n, dtype=np.float64)
-
-    risk = float(risk_pct)
-    ns_to_hours = 1.0 / (1e9 * 3600.0)
-    f_period = float(max(1, funding_period_hours))
-    side = 1 if int(side_flag) >= 0 else -1
-
-    for i in range(n):
-        ep = float(entry_prices[i])
-        xp = float(exit_prices[i])
-        ep_safe = ep if ep != 0.0 else 1.0
-
-        h_hours = (main_time_ns[exit_idxs[i]] - main_time_ns[entry_idxs[i]]) * ns_to_hours
-        f_fee = (funding_raw[i] / f_period) * h_hours
-
-        spread = float(spread_arr[i])
-        if spread_is_percent:
-            spr_pct = spread
-        else:
-            spr_pct = (spread / ep_safe) * 100.0
-
-        if sl_tp_in_pct:
-            raw_sl = float(sl_val)
-        else:
-            raw_sl = (float(sl_val) / ep_safe) * 100.0
-
-        eff_sl = max(raw_sl + spr_pct, 0.01)
-        pos_size = min(risk / (eff_sl / 100.0), 100.0)
-
-        if side == 1:
-            trade_ret = (xp - ep) / ep_safe
-        else:
-            trade_ret = (ep - xp) / ep_safe
-
-        pnl_out[i] = max(min((pos_size * trade_ret) - f_fee, 1e10), -1.0)
-
-    return pnl_out
-
-
 def compute_equity_preview(
     closed_entry_prices_arr: np.ndarray,
     closed_exit_prices_arr: np.ndarray,
@@ -616,6 +570,7 @@ def compute_equity_preview(
         sl_tp_in_pct=bool(run_cfg.get("sl_tp_in_pct", True)),
         spread_is_percent=bool(run_cfg.get("spread_is_percent", True)),
         funding_period_hours=int(run_cfg.get("funding_period_hours", 8)),
+        trading_fee_rate=float(run_cfg.get("trading_fees", 0.0) or 0.0),
     )
 
     if pnl_pct_arr is None or pnl_pct_arr.size == 0:
@@ -698,347 +653,6 @@ def stage_equity_from_preview(
 
     return final_balance, win_pos, float(max_dd)
 
-def _run_backtest_grid(
-    regime_id: int,
-    regime_cfg: dict,
-    run_cfg: dict,
-    data_ctx: dict,
-    df_signals: pl.DataFrame,
-    months: int,
-    era_label: str,
-    era_int: int,
-    results_dir: Path,
-    batch_id: int,
-    stager,
-    max_dd_threshold: float,
-    current_idx: int,
-    total_in_batch: int,
-    combos: List[Tuple[float, float]],
-):
-    df_main = data_ctx["df_main"]
-    main_close_arr = data_ctx["main_close_arr"]
-    main_high_arr = data_ctx["main_high_arr"]
-    main_low_arr = data_ctx["main_low_arr"]
-    main_time_ns_arr = data_ctx["main_time_ns_arr"]
-    main_spread_arr = data_ctx["main_spread_arr"]
-    main_funding_arr = data_ctx["main_funding_arr"]
-
-    use_limit_entry = bool(regime_cfg.get("use_limit_entry", True))
-    limit_order_expiry_h = int(regime_cfg.get("limit_order_expiry_h", 0) or 0)
-    trade_window_interval = int(regime_cfg.get("trade_window_interval", 0) or 0)
-
-    if df_signals is not None and not df_signals.is_empty():
-        buys = df_signals.filter(pl.col("side") == 1)
-        sells = df_signals.filter(pl.col("side") == -1)
-    else:
-        buys = pl.DataFrame([], schema=get_schema("signals"))
-        sells = pl.DataFrame([], schema=get_schema("signals"))
-
-    bucket_map = {}
-    if not bool(run_cfg.get("force_rebuild_cache", False)):
-        try:
-            bucket_df = load_backtest_cached(months, era_label, str(regime_id))
-            if bucket_df is not None and not bucket_df.is_empty():
-                for row in bucket_df.iter_rows(named=True):
-                    key = (
-                        int(row["sig_n"]),
-                        int(row["sig_min_ns"]),
-                        int(row["sig_max_ns"]),
-                        round(float(row["SL"]), 6),
-                        round(float(row["TP"]), 6),
-                        int(row["side"]),
-                        int(row["exit_window_h"]),
-                        int(bool(row.get("use_trailing_sl", False))),
-                        round(float(row.get("trailing_sl_pct", 0.0)), 6),
-                        int(row.get("trailing_sl_interval", 0)),
-                        int(bool(row.get("trailing_sl_stop_at_pos", True))),
-                        int(bool(row.get("use_limit_entry", True))),
-                        int(row.get("limit_order_expiry_h", 0)),
-                        int(row.get("trade_window_interval", 0)),
-                    )
-                    bucket_map[key] = row
-        except Exception as e:
-            logger.debug("load_backtest_cached failed for cfg=%s era=%s: %s", regime_id, era_label, e)
-            bucket_map = {}
-
-    logger.info(
-        "DEBUG: era=%s regime=%s total_signals=%d",
-        era_label,
-        regime_id,
-        int(df_signals.height) if df_signals is not None else 0,
-    )
-
-    dd_pass = 0
-    dd_fail = 0
-    cache_hit = 0
-    cache_miss = 0
-    staged_equity = 0
-    master_rows_written = 0
-    empty_rows_written = 0
-
-    for sl_val, tp_val in combos:
-        for side_df_pl, side_flag in ((buys, 1), (sells, -1)):
-            total_pos = int(side_df_pl.height) if side_df_pl is not None and not side_df_pl.is_empty() else 0
-
-            if total_pos == 0:
-                master_row_raw = _make_empty_master_row(
-                    regime_id=regime_id,
-                    era_int=era_int,
-                    side_flag=side_flag,
-                    sl_val=sl_val,
-                    tp_val=tp_val,
-                    regime_cfg=regime_cfg,
-                )
-                buffer_master_row(results_dir, batch_id, master_row_raw)
-                empty_rows_written += 1
-                master_rows_written += 1
-                continue
-
-            sig_idxs = side_df_pl["idx"].to_numpy(allow_copy=True).astype(np.int64)
-            sig_times_ns = side_df_pl["time_ns"].to_numpy(allow_copy=True).astype(np.int64)
-            sig_n = int(sig_idxs.size)
-            sig_min_ns = int(sig_times_ns.min()) if sig_n > 0 else -1
-            sig_max_ns = int(sig_times_ns.max()) if sig_n > 0 else -1
-
-            entry_idx = None
-            entry_price_arr = None
-            exit_idx = None
-            rets = None
-
-            key = (
-                sig_n,
-                sig_min_ns,
-                sig_max_ns,
-                round(float(sl_val), 6),
-                round(float(tp_val), 6),
-                int(side_flag),
-                int(regime_cfg.get("exit_window_h", 0)),
-                int(bool(regime_cfg.get("use_trailing_sl", False))),
-                round(float(regime_cfg.get("trailing_sl_pct", 0.0)), 6),
-                int(regime_cfg.get("trailing_sl_interval", 0)),
-                int(bool(regime_cfg.get("trailing_sl_stop_at_pos", True))),
-                int(use_limit_entry),
-                int(limit_order_expiry_h),
-                int(trade_window_interval),
-            )
-
-            hit = bucket_map.get(key)
-            if hit is not None:
-                entry_idx = np.asarray(hit.get("entry_idx", []), dtype=np.int64)
-                entry_price_arr = np.asarray(hit.get("entry_price", []), dtype=np.float64)
-                exit_idx = np.asarray(hit.get("exit_idx", []), dtype=np.int64)
-                exit_price_arr = np.asarray(hit.get("exit_price", []), dtype=np.float64)
-                rets = np.asarray(hit.get("ret", []), dtype=np.float64)
-                exit_reason_arr = np.asarray(hit.get("exit_reason", []), dtype=np.int8)
-
-                if use_limit_entry and entry_price_arr.size != entry_idx.size:
-                    hit = None
-                    entry_idx = None
-                    entry_price_arr = None
-                    exit_idx = None
-                    exit_price_arr = None
-                    rets = None
-                    exit_reason_arr = None
-                    cache_miss += 1
-                else:
-                    if exit_price_arr.size != entry_price_arr.size:
-                        if side_flag == 1:
-                            exit_price_arr = entry_price_arr * (1.0 + rets)
-                        else:
-                            exit_price_arr = entry_price_arr * (1.0 - rets)
-
-                    if exit_reason_arr.size != entry_idx.size:
-                        exit_reason_arr = np.zeros(entry_idx.size, dtype=np.int8)
-
-                    cache_hit += 1
-            else:
-                cache_miss += 1
-
-            if (sig_idxs < 0).any() or (sig_idxs >= len(main_close_arr)).any():
-                logger.error("OOB Index: cfg=%s era=%s sig_idxs out of range", regime_id, era_label)
-                continue
-
-            if entry_idx is None:
-                try:
-                    res = backtest_signals_sl_tp_rets(
-                        main_close_arr=main_close_arr,
-                        main_high_arr=main_high_arr,
-                        main_low_arr=main_low_arr,
-                        main_time_ns_arr=main_time_ns_arr,
-                        sig_idxs=sig_idxs,
-                        sl=float(sl_val),
-                        tp=float(tp_val),
-                        sl_tp_in_pct=bool(run_cfg.get("sl_tp_in_pct", True)),
-                        exit_window_h=int(regime_cfg.get("exit_window_h", 0)),
-                        limit_order_expiry_h=limit_order_expiry_h,
-                        trade_window_interval=trade_window_interval,
-                        base_minutes=int(run_cfg.get("BASE_MINUTES", 5)),
-                        spread=float(run_cfg.get("BTC_SETTINGS", {}).get("spread", 0.0)),
-                        conservative_sl_first=bool(run_cfg.get("conservative_sl_first", True)),
-                        side_flag=side_flag,
-                        use_limit_entry=use_limit_entry,
-                        use_trailing_sl=bool(regime_cfg.get("use_trailing_sl", False)),
-                        trailing_sl_pct=float(regime_cfg.get("trailing_sl_pct", 0.0)),
-                        trailing_sl_interval=int(regime_cfg.get("trailing_sl_interval", 0)),
-                        trailing_sl_stop_at_pos=bool(regime_cfg.get("trailing_sl_stop_at_pos", True)),
-                    )
-
-                    entry_idx = np.asarray(res.get("entry_idx", []), dtype=np.int64)
-                    entry_price_arr = np.asarray(res.get("entry_price", []), dtype=np.float64)
-                    exit_idx = np.asarray(res.get("exit_idx", []), dtype=np.int64)
-                    exit_price_arr = np.asarray(res.get("exit_price", []), dtype=np.float64)
-                    rets = np.asarray(res.get("rets", []), dtype=np.float64)
-                    exit_reason_arr = np.asarray(res.get("exit_reason", []), dtype=np.int8)
-
-                    filled_pos = int(entry_idx.size)
-
-                    res_df = pl.DataFrame(
-                        {
-                            "sig_n": [sig_n],
-                            "sig_min_ns": [sig_min_ns],
-                            "sig_max_ns": [sig_max_ns],
-                            "SL": [float(sl_val)],
-                            "TP": [float(tp_val)],
-                            "side": [int(side_flag)],
-                            "regime_id": [int(regime_id)],
-                            "exit_window_h": [int(regime_cfg.get("exit_window_h", 0))],
-                            "use_trailing_sl": [bool(regime_cfg.get("use_trailing_sl", False))],
-                            "trailing_sl_pct": [float(regime_cfg.get("trailing_sl_pct", 0.0))],
-                            "trailing_sl_interval": [int(regime_cfg.get("trailing_sl_interval", 0))],
-                            "trailing_sl_stop_at_pos": [bool(regime_cfg.get("trailing_sl_stop_at_pos", True))],
-                            "use_limit_entry": [bool(use_limit_entry)],
-                            "limit_order_expiry_h": [int(limit_order_expiry_h)],
-                            "trade_window_interval": [int(trade_window_interval)],
-                            "entry_idx": pl.Series([entry_idx], dtype=pl.List(pl.Int64)),
-                            "entry_price": pl.Series([entry_price_arr], dtype=pl.List(pl.Float32)),
-                            "exit_idx": pl.Series([exit_idx], dtype=pl.List(pl.Int64)),
-                            "ret": pl.Series([rets], dtype=pl.List(pl.Float32)),
-                            "exit_price": pl.Series([exit_price_arr], dtype=pl.List(pl.Float32)),
-                            "exit_reason": pl.Series([exit_reason_arr], dtype=pl.List(pl.Int8)),
-                        }
-                    ).pipe(enforce_schema, "backtest", strict=True)
-
-                    stage_for_flush("backtest", months, era_label, str(regime_id), res_df)
-                except Exception as e:
-                    logger.error("Backtest kernel error cfg=%s era=%s: %s", regime_id, era_label, e)
-                    continue
-            else:
-                filled_pos = int(entry_idx.size)
-
-            if entry_idx.size == 0:
-                master_row_raw = _make_empty_master_row(
-                    regime_id=regime_id,
-                    era_int=era_int,
-                    side_flag=side_flag,
-                    sl_val=sl_val,
-                    tp_val=tp_val,
-                    regime_cfg=regime_cfg,
-                )
-                buffer_master_row(results_dir, batch_id, master_row_raw)
-                empty_rows_written += 1
-                master_rows_written += 1
-                continue
-
-            mask_closed = exit_idx >= 0
-            if not mask_closed.any():
-                master_row_raw = _make_empty_master_row(
-                    regime_id=regime_id,
-                    era_int=era_int,
-                    side_flag=side_flag,
-                    sl_val=sl_val,
-                    tp_val=tp_val,
-                    regime_cfg=regime_cfg,
-                )
-                buffer_master_row(results_dir, batch_id, master_row_raw)
-                master_rows_written += 1
-                continue
-
-            closed_rets = rets[mask_closed]
-            max_consecutive_losses = compute_max_consecutive_losses(closed_rets)
-            closed_entry_idxs = entry_idx[mask_closed].astype(np.int64)
-            closed_exit_idxs = exit_idx[mask_closed].astype(np.int64)
-            closed_entry_prices = entry_price_arr[mask_closed].astype(np.float64)
-            closed_exit_prices = exit_price_arr[mask_closed].astype(np.float64)
-
-            pnl_pct_arr, exit_times_ns, equity_arr, current_max_dd, breached = compute_equity_preview(
-                closed_rets=closed_rets,
-                closed_entry_idxs=closed_entry_idxs,
-                closed_exit_idxs=closed_exit_idxs,
-                entry_prices_arr=closed_entry_prices,
-                main_close_arr=main_close_arr,
-                main_time_ns_arr=main_time_ns_arr,
-                main_spread_arr=main_spread_arr,
-                main_funding_arr=main_funding_arr,
-                sl_val=float(sl_val),
-                tp_val=float(tp_val),
-                run_cfg=run_cfg,
-            )
-
-            if breached:
-                dd_fail += 1
-                final_balance = float(equity_arr[-1]) if equity_arr.size else 100.0
-                win_pos = int(np.count_nonzero(closed_rets > 0.0)) if closed_rets.size else 0
-
-                master_row_raw = _make_master_row(
-                    regime_id=regime_id,
-                    era_int=era_int,
-                    side_flag=side_flag,
-                    sl_val=sl_val,
-                    tp_val=tp_val,
-                    total_pos=filled_pos,
-                    win_pos=win_pos,
-                    balance=final_balance,
-                    max_dd=current_max_dd,
-                    max_consecutive_losses=max_consecutive_losses,
-                    regime_cfg=regime_cfg,
-                )
-                buffer_master_row(results_dir, batch_id, master_row_raw)
-                master_rows_written += 1
-                continue
-
-            dd_pass += 1
-
-            final_balance, win_pos, max_dd = stage_equity_from_preview(
-                pnl_pct_arr=pnl_pct_arr,
-                exit_times_ns=exit_times_ns,
-                equity_arr=equity_arr,
-                closed_entry_idxs=closed_entry_idxs,
-                closed_exit_idxs=closed_exit_idxs,
-                sl_val=float(sl_val),
-                tp_val=float(tp_val),
-                regime_id=regime_id,
-                era_int=era_int,
-                side_flag=side_flag,
-                stager=stager,
-                max_dd=current_max_dd,
-            )
-            staged_equity += 1
-
-            master_row_raw = _make_master_row(
-                regime_id=regime_id,
-                era_int=era_int,
-                side_flag=side_flag,
-                sl_val=sl_val,
-                tp_val=tp_val,
-                total_pos=filled_pos,
-                win_pos=win_pos,
-                balance=final_balance,
-                max_dd=max_dd,
-                max_consecutive_losses=max_consecutive_losses,
-                regime_cfg=regime_cfg,
-            )
-            buffer_master_row(results_dir, batch_id, master_row_raw)
-
-    return {
-        "dd_pass": dd_pass,
-        "dd_fail": dd_fail,
-        "cache_hit": cache_hit,
-        "cache_miss": cache_miss,
-        "staged_equity": staged_equity,
-        "master_rows_written": master_rows_written,
-        "empty_rows_written": empty_rows_written,
-    }
-    
 def process_era_combos(
     regime_id: int,
     regime_cfg: dict,
@@ -1050,12 +664,11 @@ def process_era_combos(
     max_dd_threshold: float,
     current_idx: int,
     total_in_batch: int,
-) -> Tuple[int, int]:
+) -> Dict[str, int]:
     """
     Global signals once, global trade simulation once per combo/side,
     then slice the global trade arrays by era.
     """
-
     required_keys = (
         "df_main",
         "main_time_ns_arr",
@@ -1077,7 +690,6 @@ def process_era_combos(
     main_low_arr: np.ndarray = data_ctx["main_low_arr"]
     main_spread_arr: np.ndarray = data_ctx["main_spread_arr"]
     main_funding_arr: np.ndarray = data_ctx["main_funding_arr"]
-    lookback_map: dict = data_ctx["lookback_map"]
 
     months = int(run_cfg["sl_tp_interval_months"])
     grid_start = pd.to_datetime(run_cfg["grid_start_date"]).to_pydatetime()
@@ -1096,13 +708,37 @@ def process_era_combos(
 
     logger.debug("process_era_combos: regime=%s windows=%d", regime_id, len(windows))
 
-    global_signals = _get_or_generate_global_signals(
+    global_signals, sig_stats = _get_or_generate_global_signals(
         regime_id=regime_id,
         regime_cfg=regime_cfg,
         run_cfg=run_cfg,
         data_ctx=data_ctx,
         months=months,
     )
+
+    coord_cfg = dict(run_cfg.get("coord_descent", {}) or {})
+    min_signal_floor = int(coord_cfg.get("min_signal_floor", run_cfg.get("MIN_SIGNAL_FLOOR", 40)) or 40)
+
+    if str(run_cfg.get("search_mode", "cyclic_coordinate_descent")) == "cyclic_coordinate_descent":
+        active_block = str(run_cfg.get("coord_descent", {}).get("active_block", ""))
+        if active_block == "signal_structure" and int(sig_stats.get("final_total_signals", 0)) < min_signal_floor:
+            logger.info(
+                "Skipping regime=%s due to signal floor: %d < %d",
+                regime_id,
+                int(sig_stats.get("final_total_signals", 0)),
+                min_signal_floor,
+            )
+            return {
+                "processed_inc": 0,
+                "skipped_inc": 1,
+                "dd_pass": 0,
+                "dd_fail": 0,
+                "cache_hit": 0,
+                "cache_miss": 0,
+                "staged_equity": 0,
+                "master_rows_written": 0,
+                "empty_rows_written": 0,
+            }
 
     era_registry = _build_era_registry(windows, global_signals)
 
@@ -1289,7 +925,7 @@ def process_era_combos(
                 if sig_n == 0:
                     master_row_raw = _make_empty_master_row(
                         regime_id=regime_id,
-                        era_int=era_int,
+                        era_int=era["era_int"],
                         side_flag=side_flag,
                         sl_val=sl_val,
                         tp_val=tp_val,
@@ -1304,7 +940,9 @@ def process_era_combos(
                 entry_idx = None
                 entry_price_arr = None
                 exit_idx = None
+                exit_price_arr = None
                 rets = None
+                exit_reason_arr = None
 
                 key = (
                     int(sig_n),
@@ -1356,13 +994,12 @@ def process_era_combos(
                     cache_miss += 1
 
                 if hit is None:
-                    cache_miss += 1
                     trade_mask = closed_mask_all & (entry_time_ns_all >= start_ns) & (entry_time_ns_all < end_ns)
 
                     if not trade_mask.any():
                         master_row_raw = _make_empty_master_row(
                             regime_id=regime_id,
-                            era_int=era_int,
+                            era_int=era["era_int"],
                             side_flag=side_flag,
                             sl_val=sl_val,
                             tp_val=tp_val,
@@ -1448,6 +1085,14 @@ def process_era_combos(
                 closed_exit_idxs = exit_idx[mask_closed].astype(np.int64)
                 closed_entry_prices = entry_price_arr[mask_closed].astype(np.float64)
                 closed_exit_prices = exit_price_arr[mask_closed].astype(np.float64)
+                closed_exit_reasons = exit_reason_arr[mask_closed].astype(np.int8)
+
+                avg_sl_hit, avg_tp_hit = _avg_hit_pcts(
+                    closed_entry_prices,
+                    closed_exit_prices,
+                    closed_exit_reasons,
+                    side_flag,
+                )
 
                 pnl_pct_arr, exit_times_ns, equity_arr, current_max_dd, breached = compute_equity_preview(
                     closed_entry_prices_arr=closed_entry_prices,
@@ -1467,7 +1112,7 @@ def process_era_combos(
                 if breached:
                     dd_fail += 1
                     final_balance = float(equity_arr[-1]) if equity_arr.size else 100.0
-                    win_pos = int(np.count_nonzero(closed_rets > 0.0)) if closed_rets.size else 0
+                    win_pos = int(np.count_nonzero(pnl_pct_arr > 0.0)) if pnl_pct_arr.size else 0
 
                     master_row_raw = _make_master_row(
                         regime_id=regime_id,
@@ -1479,8 +1124,10 @@ def process_era_combos(
                         win_pos=win_pos,
                         balance=final_balance,
                         max_dd=current_max_dd,
-                        max_consecutive_losses=compute_max_consecutive_losses(closed_rets),
+                        max_consecutive_losses=compute_max_consecutive_losses(pnl_pct_arr),
                         regime_cfg=regime_cfg,
+                        sl_hit=avg_sl_hit,
+                        tp_hit=avg_tp_hit,
                     )
                     buffer_master_row(results_dir, batch_id, master_row_raw)
                     era_master_rows_written[era_label] += 1
@@ -1517,6 +1164,8 @@ def process_era_combos(
                     max_dd=max_dd,
                     max_consecutive_losses=compute_max_consecutive_losses(closed_rets),
                     regime_cfg=regime_cfg,
+                    sl_hit=avg_sl_hit,
+                    tp_hit=avg_tp_hit,
                 )
                 buffer_master_row(results_dir, batch_id, master_row_raw)
 
@@ -1547,7 +1196,7 @@ def process_era_combos(
         "master_rows_written": master_rows_written,
         "empty_rows_written": empty_rows_written,
     }
-    
+
 def compute_config_and_save(batch_path: str, session_dir: str, compute_backtest: bool = True) -> Dict:
     try:
         _HAS_PSUTIL = True
@@ -1573,15 +1222,43 @@ def compute_config_and_save(batch_path: str, session_dir: str, compute_backtest:
     results_dir = session_dir / "results"
     results_dir.mkdir(parents=True, exist_ok=True)
 
+    coord_state_path = session_dir / "coord_descent_state.json"
+    coord_state = {}
+    if coord_state_path.exists():
+        try:
+            with open(coord_state_path, "r", encoding="utf8") as f:
+                coord_state = json.load(f)
+        except Exception as e:
+            logger.debug("Failed to load coord_descent_state.json: %s", e)
+            coord_state = {}
+
     with open(batch_path, "r", encoding="utf8") as f:
         batch_data = json.load(f)
 
     regimes = batch_data["regimes"]
     batch_id = int(batch_data.get("batch_id", 0))
-    logger.info("🧵 Worker started: %s | Regimes to process: %d (batch_id=%d)", batch_path.name, len(regimes), batch_id)
+    coord_meta = dict(batch_data.get("coord_descent", {}) or {})
+
+    batch_search_mode = str(batch_data.get("search_mode", "") or "").strip()
+    run_search_mode = str(run_cfg.get("search_mode", "cyclic_coordinate_descent")).strip()
+
+    search_mode = batch_search_mode or run_search_mode
+
+    if search_mode == "cyclic_coordinate_descent":
+        equity_base = session_dir / "equity_search_partitioned"
+    else:
+        equity_base = session_dir / "equity_partitioned"
+
+    logger.info(
+        "🧵 Worker started: %s | Regimes to process: %d (batch_id=%d | mode=%s)",
+        batch_path.name,
+        len(regimes),
+        batch_id,
+        search_mode,
+    )
 
     prepared = prepare_worker_data(session_dir, run_cfg)
-    data_ctx = prepared  # keep the entire prepared dict intact; pass around as context
+    data_ctx = prepared
 
     if "lookback_map" not in data_ctx or not isinstance(data_ctx["lookback_map"], dict):
         raise RuntimeError("prepare_worker_data did not return a valid 'lookback_map'. Ensure precompute produced it.")
@@ -1590,8 +1267,6 @@ def compute_config_and_save(batch_path: str, session_dir: str, compute_backtest:
     flush_rows = int(run_cfg.get("PARQUET_FLUSH_ROWS", 100_000))
     partition_by = str(run_cfg.get("EQUITY_PARTITION_BY", "era_int"))
 
-    # Use session-local tmp dir so coordinator can find parts (session_dir/equity_partitioned/_tmp)
-    equity_base = session_dir / "equity_partitioned"
     equity_tmp = equity_base / "_tmp"
     stager = EquityStager(
         equity_part_base=equity_base,
@@ -1608,7 +1283,6 @@ def compute_config_and_save(batch_path: str, session_dir: str, compute_backtest:
     rss_mb = _get_process_rss_mb()
 
     if container_limit_mb > 0:
-        # keep some headroom for Polars / PyArrow / Python allocator spikes
         soft_cap_mb = container_limit_mb * 0.80
         if rss_mb >= soft_cap_mb:
             logger.error("OOM RISK: process RSS %.1f MB is near container limit %.1f MB", rss_mb, container_limit_mb)
@@ -1639,11 +1313,11 @@ def compute_config_and_save(batch_path: str, session_dir: str, compute_backtest:
             if idx % 10 == 0:
                 heartbeat_log(f"batch{batch_id}_progress", {"idx": idx, "regime_id": str(regime_cfg.get("regime_id"))})
 
-            # normalize regime types
             try:
                 regime_cfg["regime_id"] = int(regime_cfg.get("regime_id"))
             except Exception:
                 logger.debug("regime_id not int-convertible: %s", regime_cfg.get("regime_id"))
+
             regime_cfg["ma_int"] = int(regime_cfg.get("ma_int", 0) or 0)
             regime_cfg["ma_reversion"] = bool(regime_cfg.get("ma_reversion", False))
             lb_val = regime_cfg.get("entry_lookback_units", 0)
@@ -1663,17 +1337,18 @@ def compute_config_and_save(batch_path: str, session_dir: str, compute_backtest:
 
             regime_cfg["use_limit_entry"] = bool(regime_cfg.get("use_limit_entry", True))
             regime_cfg["limit_order_expiry_h"] = int(regime_cfg.get("limit_order_expiry_h", 0) or 0)
-
             regime_cfg["trade_window_interval"] = int(regime_cfg.get("trade_window_interval", 0) or 0)
 
             regime_id = regime_cfg.get("regime_id")
-            summary_path = results_dir / f"cfg_{regime_id}_summary.json"
-            if summary_path.exists():
-                skipped_count += 1
-                continue
 
             if processed_count % 5 == 0 or processed_count == 0:
-                logger.info("📑 [Batch %d] Progress: %d/%d (%.1f%%) ...", batch_id, idx, total_in_batch, (idx / total_in_batch) * 100.0)
+                logger.info(
+                    "📑 [Batch %d] Progress: %d/%d (%.1f%%) ...",
+                    batch_id,
+                    idx,
+                    total_in_batch,
+                    (idx / total_in_batch) * 100.0,
+                )
 
             with maybe_profile(f"regime_{regime_id}_process"):
                 result = process_era_combos(
@@ -1698,16 +1373,25 @@ def compute_config_and_save(batch_path: str, session_dir: str, compute_backtest:
             processed_count += p_inc
             skipped_count += s_inc
 
-            final_output = {"regime_id": regime_id, "regime_params": regime_cfg, "combos_tested": 0, "results": []}
-            with open(results_dir / f"cfg_{regime_id}_summary.json", "w", encoding="utf8") as fh:
-                json.dump(final_output, fh, indent=2)
+            final_output = {
+                "regime_id": regime_id,
+                "regime_params": regime_cfg,
+                "search_mode": search_mode,
+                "coord_descent": {
+                    "active_block": coord_meta.get("active_block"),
+                    "cycle_idx": coord_meta.get("cycle_idx"),
+                    "profile_count": coord_meta.get("profile_count"),
+                    "state_path": coord_meta.get("state_path"),
+                },
+                "combos_tested": 0,
+                "results": [],
+            }
 
     except Exception as e:
         logger.error("Error processing batch %s: %s", batch_path.name, e)
         raise
     finally:
         try:
-            # spill staged equity parts to tmp files (workers do not merge final files)
             stager.flush_all()
             _flush_master_rows_buffer(results_dir, batch_id)
         except Exception as e:
@@ -1723,6 +1407,20 @@ def compute_config_and_save(batch_path: str, session_dir: str, compute_backtest:
         except Exception as e:
             logger.exception("Failed to merge master parts for batch %s: %s", batch_id, e)
             raise
+
+        batch_summary = {
+            "batch_id": batch_id,
+            "search_mode": search_mode,
+            "coord_descent": {
+                "active_block": coord_meta.get("active_block"),
+                "cycle_idx": coord_meta.get("cycle_idx"),
+                "profile_count": coord_meta.get("profile_count"),
+                "state_path": coord_meta.get("state_path"),
+            },
+            "processed": processed_count,
+            "skipped": skipped_count,
+            "regimes": len(regimes),
+        }
 
     logger.info("🏁 Batch %s finished. Processed: %d, Skipped: %d", batch_path.name, processed_count, skipped_count)
     return {"batch": batch_path.name, "processed": processed_count, "skipped": skipped_count}

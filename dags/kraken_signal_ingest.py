@@ -1,5 +1,3 @@
-# kraken_signal_ingest.py
-
 from __future__ import annotations
 
 import json
@@ -11,9 +9,9 @@ from typing import Any, Dict, List, Optional
 import pendulum
 import polars as pl
 import requests
+from airflow.exceptions import AirflowSkipException
 from airflow.sdk import dag, task
 
-from etl.db import get_engine
 from common.feature_helpers import (
     _as_bool,
     _as_float,
@@ -25,7 +23,7 @@ from common.feature_helpers import (
     generate_filtered_signals,
 )
 from common.feature_prep import precompute_all_possible_features
-from common.schema import enforce_schema
+from etl.kraken_api import fetch_futures_ohlc, fetch_ohlc
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +32,9 @@ STATE_PATH = Path("/opt/airflow/airflow-trading/last_signal_state.json")
 
 LIVE_MAX_ROWS = 500
 LOCAL_TZ = "Asia/Kuala_Lumpur"
+LIVE_INTERVAL_MINUTES = 15
+LIVE_BASE_MINUTES = 15
+LIVE_SIGNAL_TIMEFRAME_MODIFIER = 1
 
 
 def _load_json_file(path: Path) -> dict:
@@ -43,16 +44,6 @@ def _load_json_file(path: Path) -> dict:
     if not isinstance(data, dict):
         raise ValueError(f"{path} must contain a JSON object")
     return data
-
-
-def _db_uri() -> str:
-    db_user = os.getenv("POSTGRES_USER")
-    db_pass = os.getenv("POSTGRES_PASSWORD")
-    db_host = os.getenv("POSTGRES_HOST", "postgres")
-    db_name = os.getenv("POSTGRES_DB", "airflow")
-    if not db_user or not db_pass:
-        raise RuntimeError("POSTGRES_USER / POSTGRES_PASSWORD are required")
-    return f"postgresql+psycopg2://{db_user}:{db_pass}@{db_host}/{db_name}"
 
 
 def _normalize_live_item(item: Any) -> Dict[str, str]:
@@ -66,10 +57,7 @@ def _normalize_live_item(item: Any) -> Dict[str, str]:
     if market_type not in {"spot", "future", "xstock"}:
         market_type = "spot"
 
-    return {
-        "pair": str(item["pair"]),
-        "market_type": market_type,
-    }
+    return {"pair": str(item["pair"]), "market_type": market_type}
 
 
 def _normalize_positive_int_list(value: Any) -> list[int]:
@@ -81,15 +69,6 @@ def _normalize_positive_int_list(value: Any) -> list[int]:
             seen.add(v)
             out.append(v)
     return out
-
-
-def _normalize_int_or_list(value: Any) -> list[int]:
-    if value is None:
-        return []
-    if isinstance(value, (list, tuple)):
-        return _normalize_positive_int_list(value)
-    v = _as_int(value, 0)
-    return [v] if v > 0 else []
 
 
 def _fmt_price(value: Any) -> str:
@@ -106,88 +85,6 @@ def _format_local_time_ns(time_ns: int) -> str:
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _estimate_needed_bars(pair_cfg: dict) -> int:
-    base_min = _as_int(pair_cfg.get("BASE_MINUTES", 5), 5)
-    modifier = _as_int(pair_cfg.get("signal_timeframe_modifier", 3), 3)
-
-    ma_periods = _as_int_list(pair_cfg.get("ma_periods", []))
-    entry_lookback = _as_int(pair_cfg.get("entry_lookback_units", 0), 0)
-    stoch_k = _as_int_list(pair_cfg.get("stoch_k", []))
-    stoch_d = _as_int_list(pair_cfg.get("stoch_d", []))
-    stoch_s = _as_int_list(pair_cfg.get("stoch_s", []))
-    bbw_periods = _as_int_list(pair_cfg.get("bbw_periods", []))
-
-    max_units = 0
-    for x in ma_periods:
-        max_units = max(max_units, x)
-
-    if isinstance(entry_lookback, int):
-        max_units = max(max_units, entry_lookback)
-
-    for x in stoch_k:
-        max_units = max(max_units, x)
-    for x in stoch_d:
-        max_units = max(max_units, x)
-    for x in stoch_s:
-        max_units = max(max_units, x)
-
-    for x in bbw_periods:
-        max_units = max(max_units, x)
-
-    if max_units <= 0:
-        return 300
-
-    bars = int(max_units * modifier + 20)
-    return max(bars, int((120 / max(base_min, 1))))
-
-
-def _load_recent_df_main(pair: str, market_type: str, limit_rows: int) -> pl.DataFrame:
-    uri_obj = get_engine(_db_uri()).url
-    uri = f"postgresql://{uri_obj.username}:{uri_obj.password}@{uri_obj.host}:{uri_obj.port or 5432}/{uri_obj.database}"
-
-    query = """
-        SELECT
-            pair, market_type, time, time_ns, open, high, low, close,
-            volume, funding_rate, spread
-        FROM df_main
-        WHERE pair = $1 AND market_type = $2
-        ORDER BY time_ns DESC
-        LIMIT $3
-    """
-
-    try:
-        df = pl.read_database_uri(
-            query=query,
-            uri=uri,
-            engine="adbc",
-            execute_options={"parameters": [pair, market_type, int(limit_rows)]},
-        )
-    except Exception as e:
-        logger.error("ADBC Signal Load failed for %s: %s", pair, e)
-        raise RuntimeError(f"Polars ADBC failed: {e}")
-
-    if df.is_empty():
-        return pl.DataFrame()
-
-    return (
-        df.with_columns(
-            [
-                pl.col("time").cast(pl.Datetime("ns", "UTC")),
-                pl.col("time_ns").cast(pl.Int64),
-                pl.col("open").cast(pl.Float32),
-                pl.col("high").cast(pl.Float32),
-                pl.col("low").cast(pl.Float32),
-                pl.col("close").cast(pl.Float32),
-                pl.col("volume").cast(pl.Float32),
-                pl.col("spread").cast(pl.Float32),
-                pl.col("funding_rate").cast(pl.Float32),
-            ]
-        )
-        .sort("time")
-        .with_row_index("idx")
-    )
-
-
 def _as_single_int(value: Any) -> Optional[int]:
     if value is None:
         return None
@@ -199,6 +96,26 @@ def _as_single_int(value: Any) -> Optional[int]:
         return int(value)
     except Exception:
         return None
+
+
+def _resolve_stoch_bounds(cfg: dict) -> tuple[float, float]:
+    lower = cfg.get("stoch_lower", None)
+    upper = cfg.get("stoch_upper", None)
+
+    if lower is not None or upper is not None:
+        return _as_float(lower, 30.0), _as_float(upper, 70.0)
+
+    ths = cfg.get("stoch_thresholds", None)
+    pairs = _as_threshold_pairs(ths)
+    if pairs and len(pairs[0]) >= 2:
+        return float(pairs[0][0]), float(pairs[0][1])
+
+    return 30.0, 70.0
+
+
+def _resolve_trade_window_intervals(cfg: dict) -> list[int]:
+    raw = cfg.get("trade_window_interval", [])
+    return _normalize_positive_int_list(raw)
 
 
 def _resolve_live_stoch_col(cfg: dict, df: Optional[pl.DataFrame] = None) -> Optional[str]:
@@ -236,9 +153,82 @@ def _resolve_live_stoch_col(cfg: dict, df: Optional[pl.DataFrame] = None) -> Opt
     return None
 
 
-def _resolve_trade_window_intervals(cfg: dict) -> list[int]:
-    raw = cfg.get("trade_window_interval", [])
-    return _normalize_positive_int_list(raw)
+def _estimate_needed_bars(pair_cfg: dict) -> int:
+    base_min = _as_int(pair_cfg.get("BASE_MINUTES", LIVE_BASE_MINUTES), LIVE_BASE_MINUTES)
+    modifier = _as_int(pair_cfg.get("signal_timeframe_modifier", LIVE_SIGNAL_TIMEFRAME_MODIFIER), LIVE_SIGNAL_TIMEFRAME_MODIFIER)
+
+    ma_periods = _as_int_list(pair_cfg.get("ma_periods", []))
+    entry_lookback = _as_int(pair_cfg.get("entry_lookback_units", 0), 0)
+    stoch_k = _as_int_list(pair_cfg.get("stoch_k", []))
+    stoch_d = _as_int_list(pair_cfg.get("stoch_d", []))
+    stoch_s = _as_int_list(pair_cfg.get("stoch_s", []))
+    bbw_periods = _as_int_list(pair_cfg.get("bbw_periods", []))
+
+    max_units = 0
+    for x in ma_periods:
+        max_units = max(max_units, x)
+
+    if isinstance(entry_lookback, int):
+        max_units = max(max_units, entry_lookback)
+
+    for x in stoch_k:
+        max_units = max(max_units, x)
+    for x in stoch_d:
+        max_units = max(max_units, x)
+    for x in stoch_s:
+        max_units = max(max_units, x)
+    for x in bbw_periods:
+        max_units = max(max_units, x)
+
+    if max_units <= 0:
+        return 120
+
+    bars = int(max_units * modifier + 20)
+    return max(bars, int((120 / max(base_min, 1))))
+
+
+def _load_recent_live_ohlc(pair: str, market_type: str, interval_minutes: int = LIVE_INTERVAL_MINUTES, limit_rows: int = 300) -> pl.DataFrame:
+    """
+    Live OHLC is fetched directly from Kraken to avoid delayed batch tables.
+    """
+    market_type = (market_type or "spot").lower().strip()
+
+    if market_type == "future":
+        df_pd, _ = fetch_futures_ohlc(pair, interval_minutes)
+    else:
+        df_pd, _ = fetch_ohlc(pair, interval_minutes, market_type=market_type)
+
+    if df_pd is None or df_pd.empty:
+        return pl.DataFrame()
+
+    df = pl.from_pandas(df_pd)
+
+    if "vwap" in df.columns:
+        df = df.drop("vwap")
+    if "count" in df.columns:
+        df = df.drop("count")
+
+    df = df.with_columns([
+        pl.col("time").cast(pl.Datetime("ns", "UTC")),
+        pl.col("time_ns").cast(pl.Int64),
+        pl.col("open").cast(pl.Float32),
+        pl.col("high").cast(pl.Float32),
+        pl.col("low").cast(pl.Float32),
+        pl.col("close").cast(pl.Float32),
+        pl.col("volume").cast(pl.Float32),
+        pl.lit(0.0).cast(pl.Float32).alias("spread"),
+        pl.lit(0.0).cast(pl.Float32).alias("funding_rate"),
+    ])
+
+    df = df.sort("time").with_row_index("idx")
+
+    if df.height > limit_rows:
+        df = df.tail(limit_rows)
+
+    if df.height > 1:
+        df = df[:-1]
+
+    return df
 
 
 def _resolve_prices_for_row(row: dict, cfg: dict) -> tuple[float, float, float]:
@@ -266,22 +256,11 @@ def _resolve_prices_for_row(row: dict, cfg: dict) -> tuple[float, float, float]:
 
 
 def _cooldown_key(row: dict) -> str:
-    return (
-        f"{row.get('pair', '')}|"
-        f"{row.get('market_type', '')}|"
-        f"{row.get('side', '')}|"
-        f"{row.get('regime_id', '')}"
-    )
+    return f"{row.get('pair', '')}|{row.get('market_type', '')}|{row.get('side', '')}|{row.get('regime_id', '')}"
 
 
 def _signal_key(row: dict) -> str:
-    return (
-        f"{row.get('pair', '')}|"
-        f"{row.get('market_type', '')}|"
-        f"{row.get('time_ns', '')}|"
-        f"{row.get('side', '')}|"
-        f"{row.get('regime_id', '')}"
-    )
+    return f"{row.get('pair', '')}|{row.get('market_type', '')}|{row.get('time_ns', '')}|{row.get('side', '')}|{row.get('regime_id', '')}"
 
 
 def _read_last_state() -> dict:
@@ -343,41 +322,6 @@ def _build_message(rows: List[dict]) -> str:
     return "\n".join(lines)
 
 
-def _build_live_signal_frame(
-    df_main: pl.DataFrame,
-    pair_params: dict,
-    pair: str,
-    market_type: str,
-) -> pl.DataFrame:
-    live = dict(pair_params)
-    live["pair"] = pair
-    live["market_type"] = market_type
-
-    ma_periods = live.get("ma_periods", []) or []
-    if isinstance(ma_periods, (int, float)):
-        ma_periods = [int(ma_periods)]
-    live["ma_periods"] = [int(x) for x in ma_periods]
-    live["ma_int"] = (1 << len(live["ma_periods"])) - 1 if live["ma_periods"] else 0
-
-    thr = live.get("stoch_thresholds", [[20, 80]])
-    thr = _as_threshold_pairs(thr)
-    if thr and "stoch_lower" not in live and "stoch_upper" not in live:
-        live["stoch_lower"] = thr[0][0]
-        live["stoch_upper"] = thr[0][1]
-
-    df_feat, live = precompute_all_possible_features(df_main, live)
-
-    if _as_bool(live.get("use_stochastic", False), False):
-        live["stoch_col"] = _resolve_live_stoch_col(live, df_feat)
-        if not live.get("stoch_col"):
-            raise ValueError(
-                "use_stochastic=true but no unambiguous stoch_col could be resolved. "
-                "Set stoch_col explicitly in live config."
-            )
-
-    return generate_filtered_signals(df_feat, live, df_main=df_feat)
-
-
 @dag(
     dag_id="kraken_signal_ingest",
     schedule="*/15 * * * *",
@@ -429,119 +373,195 @@ def kraken_signal_ingest():
 
         live_all = cfg.get("live_signal", {})
         params = live_all.get(pair, {}) if isinstance(live_all, dict) else {}
+        if not params:
+            raise AirflowSkipException(f"No per-pair live config for {pair}")
 
-        needed_rows = _estimate_needed_bars(params)
+        live = dict(params)
+        live["pair"] = pair
+        live["market_type"] = market_type
+        live.setdefault("BASE_MINUTES", LIVE_BASE_MINUTES)
+        live.setdefault("signal_timeframe_modifier", LIVE_SIGNAL_TIMEFRAME_MODIFIER)
+
+        logger.info("LIVE build_one start pair=%s market_type=%s", pair, market_type)
+        logger.debug("LIVE raw params pair=%s params=%s", pair, params)
+
+        needed_rows = _estimate_needed_bars(live)
         limit_rows = min(needed_rows, LIVE_MAX_ROWS)
 
-        df_main = _load_recent_df_main(pair, market_type, limit_rows)
-
-        if not params:
-            return {
-                "pair": pair,
-                "market_type": market_type,
-                "has_signal": False,
-                "reason": "no per-pair live config",
-            }
-
-        if df_main.is_empty():
-            return {
-                "pair": pair,
-                "market_type": market_type,
-                "has_signal": False,
-                "reason": "no df_main rows",
-            }
-
-        df_feat = df_main.clone()
-        df_signals = _build_live_signal_frame(df_feat, params, pair, market_type)
-        if df_signals.is_empty():
-            return {
-                "pair": pair,
-                "market_type": market_type,
-                "has_signal": False,
-                "reason": "no signal",
-            }
-
-        df_signals = df_signals.with_columns(
-            [
-                pl.lit(pair).alias("pair"),
-                pl.lit(market_type).alias("market_type"),
-            ]
+        logger.info(
+            "LIVE history request pair=%s market_type=%s needed_rows=%s limit_rows=%s",
+            pair,
+            market_type,
+            needed_rows,
+            limit_rows,
         )
 
-        df_signals = df_signals.sort("time_ns")
-        latest_ts = df_signals["time_ns"].max()
-        prev_ts_df = df_signals.filter(pl.col("time_ns") < latest_ts)
+        # Live OHLC is fetched directly from Kraken.
+        # The fetched frame becomes the source for feature generation and signal filtering.
+        df_live = _load_recent_live_ohlc(pair, market_type, interval_minutes=LIVE_INTERVAL_MINUTES, limit_rows=limit_rows)
 
+        logger.info(
+            "LIVE df_live loaded pair=%s market_type=%s rows=%s cols=%s",
+            pair,
+            market_type,
+            df_live.height,
+            df_live.columns,
+        )
+
+        if df_live.is_empty():
+            raise AirflowSkipException(f"No OHLC data for {pair}")
+
+        df_feat = df_live.clone()
+
+        # precompute_all_possible_features expands the live indicator columns used by
+        # generate_filtered_signals. The frame must retain the same live candle structure.
+        df_feat, live = precompute_all_possible_features(df_feat, live)
+
+        stoch_lower, stoch_upper = _resolve_stoch_bounds(live)
+        stoch_tol = _as_float(live.get("stoch_threshold_tolerance", 10.0), 10.0)
+
+        logger.info(
+            "LIVE DEBUG stoch config pair=%s lower=%s upper=%s tol=%s",
+            pair,
+            stoch_lower,
+            stoch_upper,
+            stoch_tol,
+        )
+
+        logger.info(
+            "LIVE DEBUG last candles pair=%s rows=%s data=%s",
+            pair,
+            df_feat.height,
+            df_feat.select([
+                "idx",
+                "time_ns",
+                "close",
+                "high",
+                "low",
+                "stoch_k12_d8_s4",
+                "breakout_2u",
+            ]).tail(5).to_dicts(),
+        )
+
+        logger.info(
+            "LIVE features computed pair=%s market_type=%s rows=%s cols=%s",
+            pair,
+            market_type,
+            df_feat.height,
+            df_feat.columns,
+        )
+
+        # generate_filtered_signals applies the live regime filters on the freshly built frame.
+        # An empty result means no signal at the current closed candle.
+        df_signals, stats = generate_filtered_signals(
+            df_feat,
+            live,
+            df_context=df_feat,
+            return_stats=True,
+        )
+
+        logger.info(
+            "LIVE signal stats pair=%s market_type=%s stats=%s",
+            pair,
+            market_type,
+            stats,
+        )
+
+        if df_signals.is_empty():
+            raise AirflowSkipException(f"Market conditions not met for {pair}")
+
+        df_signals = df_signals.with_columns([
+            pl.lit(pair).alias("pair"),
+            pl.lit(market_type).alias("market_type"),
+        ]).sort("time_ns")
+
+        latest_ts = df_signals["time_ns"].max()
         latest_rows = df_signals.filter(pl.col("time_ns") == latest_ts)
 
-        sides = set(latest_rows["side"].to_list())
-        if 1 in sides and -1 in sides:
-            logger.warning(
-                "Conflicting BUY and SELL signals on the latest bar for %s %s. Skipping alert.",
-                pair,
-                market_type,
-            )
-            return {
-                "pair": pair,
-                "market_type": market_type,
-                "has_signal": False,
-                "reason": "conflicting latest-bar signals",
-            }
-
-        prev_rows = (
-            df_signals.filter(pl.col("time_ns") == prev_ts_df["time_ns"].max())
-            if not prev_ts_df.is_empty()
-            else pl.DataFrame()
+        logger.info(
+            "LIVE latest signal candidates pair=%s market_type=%s latest_ts=%s count=%s",
+            pair,
+            market_type,
+            latest_ts,
+            latest_rows.height,
         )
 
-        combo = "MA" if _as_int_list(params.get("ma_periods", [])) else "RAW"
-        if _as_bool(params.get("use_stochastic", False), False):
-            combo = f"{combo}+STOCH"
-        if _as_int_list(params.get("entry_lookback_units", [])):
-            combo = f"{combo}+LOOKBACK"
-        if _as_bool(params.get("use_bbw", False), False):
-            combo = f"{combo}+BBW"
+        if latest_rows.is_empty():
+            raise RuntimeError(f"Signal frame produced rows but latest selection failed for {pair}")
 
-        trade_window_intervals = _resolve_trade_window_intervals(params)
         state = _read_last_state()
-
-        latest_rows = latest_rows.join(
-            df_feat.select(["idx", "close", "high", "low"]),
-            on="idx",
-            how="left",
-        )
+        trade_window_intervals = _resolve_trade_window_intervals(params)
 
         rows = []
-        for row in latest_rows.select(["pair", "market_type", "time_ns", "side", "regime_id", "idx", "close", "high", "low"]).to_dicts():
-            same_side_prev = not prev_rows.filter(
-                (pl.col("side") == row["side"]) & (pl.col("regime_id") == row["regime_id"])
-            ).is_empty()
+        for row in latest_rows.select(
+            ["pair", "market_type", "time_ns", "side", "regime_id", "idx"]
+        ).to_dicts():
+            signal_time_ns = int(row["time_ns"])
 
-            if same_side_prev:
-                continue
+            price_frame = (
+                df_feat
+                .filter(pl.col("time_ns") == signal_time_ns)
+                .select(["close", "high", "low"])
+                .head(1)
+            )
+
+            logger.info(
+                "LIVE PRICE LOOKUP pair=%s time_ns=%s found=%s",
+                pair,
+                signal_time_ns,
+                price_frame.height,
+            )
+
+            if price_frame.is_empty():
+                raise RuntimeError(
+                    f"Price lookup failed for {pair} at time_ns={signal_time_ns}. "
+                    "Signal row exists, but candle row could not be matched."
+                )
+
+            row["close"] = float(price_frame["close"][0])
+            row["high"] = float(price_frame["high"][0])
+            row["low"] = float(price_frame["low"][0])
 
             limit_price, sl_price, tp_price = _resolve_prices_for_row(row, params)
             cooldown_key = _cooldown_key(row)
-            row["combo"] = combo
-            row["time_local"] = _format_local_time_ns(int(row["time_ns"]))
+
+            row["combo"] = (
+                ("MA" if _as_int_list(params.get("ma_periods", [])) else "RAW")
+                + ("+STOCH" if _as_bool(params.get("use_stochastic", False), False) else "")
+                + ("+LOOKBACK" if _as_int_list(params.get("entry_lookback_units", [])) else "")
+                + ("+BBW" if _as_bool(params.get("use_bbw", False), False) else "")
+            )
+            row["time_local"] = _format_local_time_ns(signal_time_ns)
             row["limit_price"] = limit_price
             row["sl_price"] = sl_price
             row["tp_price"] = tp_price
             row["within_trade_window"] = _within_trade_window(
-                int(row["time_ns"]),
+                signal_time_ns,
                 state,
                 cooldown_key,
                 trade_window_intervals,
             )
+
+            logger.info(
+                "LIVE candidate pair=%s market_type=%s side=%s regime_id=%s time_ns=%s time_local=%s "
+                "close=%s limit=%s sl=%s tp=%s within_trade_window=%s",
+                row.get("pair"),
+                row.get("market_type"),
+                row.get("side"),
+                row.get("regime_id"),
+                row.get("time_ns"),
+                row.get("time_local"),
+                row.get("close"),
+                _fmt_price(row.get("limit_price")),
+                _fmt_price(row.get("sl_price")),
+                _fmt_price(row.get("tp_price")),
+                row.get("within_trade_window"),
+            )
+
             rows.append(row)
 
         if not rows:
-            return {
-                "pair": pair,
-                "market_type": market_type,
-                "has_signal": False,
-                "reason": "combo already active on previous bar",
-            }
+            raise AirflowSkipException(f"No final live rows for {pair}")
 
         return {
             "pair": pair,
@@ -554,8 +574,7 @@ def kraken_signal_ingest():
     def send_telegram(results: list[dict]) -> dict:
         valid = [r for r in results if isinstance(r, dict) and r.get("has_signal")]
         if not valid:
-            logger.info("No valid signals found.")
-            return {"sent": False, "count": 0}
+            raise AirflowSkipException("No live signal to send")
 
         token = os.getenv("TG_BOT_TOKEN_SIGNAL")
         chat_id = os.getenv("TG_SIGNAL_CHANNEL_ID")
@@ -567,7 +586,7 @@ def kraken_signal_ingest():
             all_rows.extend(r.get("rows", []))
 
         if not all_rows:
-            return {"sent": False, "count": 0}
+            raise AirflowSkipException("No rows to send")
 
         state = _read_last_state()
 
@@ -579,8 +598,7 @@ def kraken_signal_ingest():
             fresh_rows.append(row)
 
         if not fresh_rows:
-            logger.info("All signals are duplicates.")
-            return {"sent": False, "count": 0, "reason": "duplicate signal"}
+            raise AirflowSkipException("All live signals are duplicates")
 
         message = _build_message(fresh_rows)
         logger.info("Telegram message:\n%s", message)
@@ -622,7 +640,6 @@ def kraken_signal_ingest():
 
     cfg = load_cfg()
     items = resolve_pairs(cfg)
-
     mapped = build_one.partial(cfg=cfg).expand(item=items)
     send_telegram(mapped)
 

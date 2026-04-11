@@ -32,7 +32,7 @@ FEATURE_CACHE_DIR = Path(
 )
 
 # Bump this when feature definitions or naming rules change.
-FEATURE_CACHE_VERSION = 2
+FEATURE_CACHE_VERSION = 3
 
 
 def _ordered_unique_ints(values: Any) -> list[int]:
@@ -345,21 +345,19 @@ def precompute_all_possible_features(
             continue
 
         periods = max(1, int(lb_units) * manifest["signal_timeframe_modifier"])
-        hi = pl.col("high").rolling_max(periods).shift(1)
-        lo = pl.col("low").rolling_min(periods).shift(1)
-        den = hi - lo
+        prior_high = pl.col("high").rolling_max(periods).shift(1)
+        prior_low = pl.col("low").rolling_min(periods).shift(1)
 
         if lb_units == 0:
             df = df.with_columns([pl.lit(1.0).cast(pl.Float32).alias("breakout_0u")])
         else:
             df = df.with_columns(
                 [
-                    pl.when(den != 0)
-                    .then((pl.col("close") - lo) / den)
-                    .otherwise(0.0)
-                    .fill_nan(0.0)
-                    .fill_null(0.0)
-                    .clip(0.0, 1.0)
+                    pl.when((pl.col("close") > prior_high) & prior_high.is_not_null())
+                    .then(1.0)
+                    .when((pl.col("close") < prior_low) & prior_low.is_not_null())
+                    .then(0.0)
+                    .otherwise(0.5)
                     .cast(pl.Float32)
                     .alias(f"breakout_{lb_units}u")
                 ]

@@ -39,6 +39,8 @@ MASTER_SCHEMA: Dict[str, pl.DataType] = {
     "bbw_thresholds": pl.Int32,
     "SL": pl.Float32,
     "TP": pl.Float32,
+    "SL_hit": pl.Float32,
+    "TP_hit": pl.Float32,
 
     "use_trailing_sl": pl.Boolean,
     "trailing_sl_pct": pl.Float32,
@@ -77,6 +79,8 @@ TRADE_ML_SCHEMA: Dict[str, pl.DataType] = {
     "side": pl.Int8,
     "SL": pl.Float32,
     "TP": pl.Float32,
+    "SL_hit": pl.Float32,
+    "TP_hit": pl.Float32,
 
     "use_limit_entry": pl.Boolean,
     "limit_order_expiry_h": pl.Int32,
@@ -108,6 +112,49 @@ TRADE_ML_SCHEMA: Dict[str, pl.DataType] = {
     "rng_72h_entry": pl.Float32,
     "rng_1w_entry": pl.Float32,
     "rng_1m_entry": pl.Float32,
+}
+
+CCD_EVAL_SCHEMA: Dict[str, pl.DataType] = {
+    "regime_id": pl.Int32,
+    "era_int": pl.Int64,
+    "side": pl.Int8,
+    "block_name": pl.String,
+    "profile_name": pl.String,
+    "candidate_sig": pl.String,
+    "candidate_rank": pl.Int32,
+    "accepted": pl.Boolean,
+    "selected": pl.Boolean,
+
+    # core performance / selection metrics
+    "total_pos": pl.Int32,
+    "win_pos": pl.Int32,
+    "balance": pl.Float32,
+    "max_drawdown": pl.Float32,
+    "max_consecutive_losses": pl.Int32,
+
+    # trade settings
+    "SL": pl.Float32,
+    "TP": pl.Float32,
+    "SL_hit": pl.Float32,
+    "TP_hit": pl.Float32,
+    "use_trailing_sl": pl.Boolean,
+    "trailing_sl_pct": pl.Float32,
+    "trailing_sl_interval": pl.Int32,
+    "trailing_sl_stop_at_pos": pl.Boolean,
+    "use_limit_entry": pl.Boolean,
+    "limit_order_expiry_h": pl.Int32,
+    "trade_window_interval": pl.Int32,
+
+    # winner score / scalarized target
+    "recency_weighted_era_consistency_score": pl.Float32,
+    "era_consistency_score": pl.Float32,
+    "dominance_score": pl.Float32,
+    "elite_median_alpha": pl.Float32,
+    "score_loss": pl.Float32,
+
+    # forward-compatible payload
+    "cfg_json": pl.String,
+    "created_at": pl.Datetime("ns"),
 }
 
 CACHE_SIGNAL_SCHEMA: Dict[str, pl.DataType] = {
@@ -162,6 +209,7 @@ SCHEMA_REGISTRY: Dict[str, Dict[str, pl.DataType]] = {
     "equity": EQUITY_SCHEMA,
     "signals": CACHE_SIGNAL_SCHEMA,
     "backtest": CACHE_BACKTEST_SCHEMA,
+    "ccd_eval": CCD_EVAL_SCHEMA,
     "df_main": DF_MAIN_SCHEMA,
 }
 
@@ -169,17 +217,17 @@ CLEAN_SCHEMA = DF_MAIN_SCHEMA
 
 # Optional per-schema metadata (single place to adjust behavior)
 SCHEMA_METADATA: Dict[str, Dict[str, Any]] = {
-    # you can change key_columns in future if you want a different detection rule
     "equity": {
         "key_columns": ["time_ns", "pnl_pct", "equity"],
-        # the fraction of non-null values (per-column) required to consider the fragment as trade-like
         "min_non_null_fraction": 0.01,
     },
     "master": {
-        # master-specific columns used to detect master-like files accidentally written into equity
         "key_columns": ["balance", "total_pos", "max_drawdown"],
     },
-    # other schemas may add metadata later...
+    "ccd_eval": {
+        "key_columns": ["regime_id", "era_int", "side", "block_name", "candidate_sig"],
+        "min_non_null_fraction": 0.01,
+    },
 }
 
 

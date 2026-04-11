@@ -4,10 +4,6 @@ import polars as pl
 import numpy as np
 from typing import Dict
 
-# Local imports inferred from function calls in the script
-from common.feature_helpers import (
-    get_regime_amp_index_for_indices,
-)
 
 def _make_empty_master_row(
     regime_id: int,
@@ -16,6 +12,8 @@ def _make_empty_master_row(
     sl_val: float,
     tp_val: float,
     regime_cfg: dict,
+    sl_hit: float = np.nan,
+    tp_hit: float = np.nan,
 ) -> dict:
     return _make_master_row(
         regime_id=regime_id,
@@ -29,6 +27,8 @@ def _make_empty_master_row(
         max_dd=0.0,
         max_consecutive_losses=0,
         regime_cfg=regime_cfg,
+        sl_hit=sl_hit,
+        tp_hit=tp_hit,
     )
     
 def _make_master_row(
@@ -43,11 +43,15 @@ def _make_master_row(
     max_dd: float,
     max_consecutive_losses: int,
     regime_cfg: dict,
+    sl_hit: float = np.nan,
+    tp_hit: float = np.nan,
 ) -> dict:
     return {
         "balance": float(balance),
         "SL": float(sl_val),
         "TP": float(tp_val),
+        "SL_hit": float(sl_hit),
+        "TP_hit": float(tp_hit),
         "win_pos": int(win_pos),
         "total_pos": int(total_pos),
         "side": int(side_flag),
@@ -104,6 +108,8 @@ def build_trade_ml_rows_from_backtest(
                 "side": pl.Series([], dtype=pl.Int8),
                 "SL": pl.Series([], dtype=pl.Float32),
                 "TP": pl.Series([], dtype=pl.Float32),
+                "SL_hit": pl.Series([], dtype=pl.Float32),
+                "TP_hit": pl.Series([], dtype=pl.Float32),
                 "use_limit_entry": pl.Series([], dtype=pl.Boolean),
                 "limit_order_expiry_h": pl.Series([], dtype=pl.Int32),
                 "trade_window_interval": pl.Series([], dtype=pl.Int32),
@@ -162,6 +168,12 @@ def build_trade_ml_rows_from_backtest(
     pnl_pct = np.full(n, np.nan, dtype=np.float64)
     fill_delay_bars = np.full(n, -1, dtype=np.int32)
 
+    tp_hit_price = np.full(n, np.nan, dtype=np.float64)
+    sl_hit_price = np.full(n, np.nan, dtype=np.float64)
+
+    filled_tp_hit = np.asarray(backtest_res.get("TP_hit", []), dtype=np.float64)
+    filled_sl_hit = np.asarray(backtest_res.get("SL_hit", []), dtype=np.float64)
+
     filled_signal_idx = np.asarray(backtest_res.get("signal_idx", []), dtype=np.int64)
     filled_entry_idx = np.asarray(backtest_res.get("entry_idx", []), dtype=np.int64)
     filled_entry_price = np.asarray(backtest_res.get("entry_price", []), dtype=np.float64)
@@ -195,12 +207,12 @@ def build_trade_ml_rows_from_backtest(
         if entry_idx[i] >= 0:
             fill_delay_bars[i] = int(entry_idx[i] - sidx)
 
-    feature_entry_idxs = np.where(fill_status == 1, entry_idx, sig_idxs).astype(np.int64)
+        if j < filled_tp_hit.shape[0]:
+            tp_hit_price[i] = float(filled_tp_hit[j])
+        if j < filled_sl_hit.shape[0]:
+            sl_hit_price[i] = float(filled_sl_hit[j])
 
-    rng_24h_entry, rng_72h_entry, rng_1w_entry, rng_1m_entry = get_regime_amp_index_for_indices(
-        df_main=df_main,
-        entry_idxs=feature_entry_idxs,
-    )
+    feature_entry_idxs = np.where(fill_status == 1, entry_idx, sig_idxs).astype(np.int64)
 
     filled_mask = fill_status == 1
 

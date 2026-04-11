@@ -190,7 +190,7 @@ def _selected_ma_pair(cfg: dict, df: pl.DataFrame) -> list[str]:
 # -----------------------------
 # time / index helpers
 # -----------------------------
-def normalize_signals_times(df_signals: pl.DataFrame, df_main: Optional[pl.DataFrame] = None) -> pl.DataFrame:
+def normalize_signals_times(df_signals: pl.DataFrame, df_context: Optional[pl.DataFrame] = None) -> pl.DataFrame:
     if df_signals is None or df_signals.height == 0:
         return df_signals
 
@@ -204,12 +204,12 @@ def normalize_signals_times(df_signals: pl.DataFrame, df_main: Optional[pl.DataF
         pl.col("time").cast(pl.Int64).alias("time_ns")
     )
 
-    if df_main is not None and df_main.height > 0:
-        main_times = df_main["time_ns"]
+    if df_context is not None and df_context.height > 0:
+        main_times = df_context["time_ns"]
         sig_times = df["time_ns"]
         idxs = np.searchsorted(main_times, sig_times, side="left")
         df = df.with_columns(
-            pl.Series("idx", idxs).clip(0, df_main.height - 1).cast(pl.Int64)
+            pl.Series("idx", idxs).clip(0, df_context.height - 1).cast(pl.Int64)
         )
 
     return df
@@ -230,135 +230,6 @@ def _resolve_ma_col_name(df: pl.DataFrame, idx: int) -> Optional[str]:
         if c in df.columns:
             return c
     return None
-
-
-def get_ma_price_gaps_for_indices(
-    df_main: pl.DataFrame,
-    entry_idxs: np.ndarray,
-    exit_idxs: np.ndarray,
-    regime_cfg: Optional[dict] = None,
-    run_cfg: Optional[dict] = None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    regime_cfg = regime_cfg or {}
-    run_cfg = run_cfg or {}
-
-    n_entry = int(entry_idxs.shape[0]) if entry_idxs is not None else 0
-    n_exit = int(exit_idxs.shape[0]) if exit_idxs is not None else 0
-
-    gap_a_entry = np.zeros(n_entry, dtype=np.float32)
-    gap_b_entry = np.zeros(n_entry, dtype=np.float32)
-    gap_a_exit = np.zeros(n_exit, dtype=np.float32)
-    gap_b_exit = np.zeros(n_exit, dtype=np.float32)
-
-    if df_main is None or df_main.height == 0:
-        return gap_a_entry, gap_b_entry, gap_a_exit, gap_b_exit
-
-    cfg = {**run_cfg, **regime_cfg}
-    pair = _selected_ma_pair(cfg, df_main)
-
-    if len(pair) < 2:
-        return gap_a_entry, gap_b_entry, gap_a_exit, gap_b_exit
-
-    fast_col, slow_col = pair[0], pair[1]
-
-    fast_arr = (
-        df_main[fast_col]
-        .fill_nan(0.0)
-        .fill_null(0.0)
-        .to_numpy()
-        .astype(np.float64, copy=False)
-    )
-    slow_arr = (
-        df_main[slow_col]
-        .fill_nan(0.0)
-        .fill_null(0.0)
-        .to_numpy()
-        .astype(np.float64, copy=False)
-    )
-
-    def _fill_gaps(idxs: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        idxs = np.asarray(idxs, dtype=np.int64)
-        if idxs.size == 0:
-            return np.zeros(0, dtype=np.float32), np.zeros(0, dtype=np.float32)
-
-        valid = (idxs >= 0) & (idxs < fast_arr.shape[0])
-        if not valid.any():
-            return np.zeros(idxs.size, dtype=np.float32), np.zeros(idxs.size, dtype=np.float32)
-
-        out_a = np.zeros(idxs.size, dtype=np.float32)
-        out_b = np.zeros(idxs.size, dtype=np.float32)
-
-        pos = idxs[valid]
-        fast_v = fast_arr[pos]
-        slow_v = slow_arr[pos]
-
-        fast_v = np.nan_to_num(fast_v, nan=0.0, posinf=0.0, neginf=0.0)
-        slow_v = np.nan_to_num(slow_v, nan=0.0, posinf=0.0, neginf=0.0)
-
-        spread = fast_v - slow_v
-        spread_pct = np.where(slow_v != 0.0, spread / slow_v, 0.0)
-
-        out_a[valid] = spread.astype(np.float32)
-        out_b[valid] = spread_pct.astype(np.float32)
-        return out_a, out_b
-
-    gap_a_entry, gap_b_entry = _fill_gaps(entry_idxs)
-    gap_a_exit, gap_b_exit = _fill_gaps(exit_idxs)
-    return gap_a_entry, gap_b_entry, gap_a_exit, gap_b_exit
-
-
-# -----------------------------
-# regime amplitude extraction
-# -----------------------------
-def get_regime_amp_index_for_indices(
-    df_main: pl.DataFrame,
-    entry_idxs: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Extract regime amplitude values at trade entry positions.
-    Returns:
-        regime_amp_24h_entry, regime_amp_72h_entry, regime_amp_1w_entry, regime_amp_1m_entry
-    """
-    if entry_idxs is None:
-        entry_idxs = np.asarray([], dtype=np.int64)
-    else:
-        entry_idxs = np.asarray(entry_idxs, dtype=np.int64)
-
-    n = entry_idxs.shape[0]
-    zero = np.zeros(n, dtype=np.float32)
-
-    if df_main is None or df_main.height == 0 or n == 0:
-        return zero, zero.copy(), zero.copy(), zero.copy()
-
-    cols = [
-        ("regime_amp_index_24h", "rng_24h"),
-        ("regime_amp_index_72h", "rng_72h"),
-        ("regime_amp_index_1w", "rng_1w"),
-        ("regime_amp_index_1m", "rng_1m"),
-    ]
-
-    out = []
-    for new_col, legacy_col in cols:
-        col_name = new_col if new_col in df_main.columns else legacy_col if legacy_col in df_main.columns else None
-        if col_name is None:
-            out.append(zero.copy())
-            continue
-
-        arr = (
-            df_main[col_name]
-            .fill_nan(0.0)
-            .fill_null(0.0)
-            .to_numpy()
-            .astype(np.float32, copy=False)
-        )
-
-        idxs = np.clip(entry_idxs, 0, max(0, arr.shape[0] - 1))
-        vals = arr[idxs]
-        vals = np.nan_to_num(vals, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
-        out.append(vals)
-
-    return tuple(out)
-
 
 # -----------------------------
 # stochastic helpers
@@ -494,11 +365,26 @@ def _stoch_state_masks(
 # -----------------------------
 # signal generator
 # -----------------------------
-def generate_filtered_signals(df_slice: pl.DataFrame, cfg: dict, df_main: Optional[pl.DataFrame] = None) -> pl.DataFrame:
+def generate_filtered_signals(
+    df_slice: pl.DataFrame,
+    cfg: dict,
+    df_context: Optional[pl.DataFrame] = None,
+    return_stats: bool = False,
+):
     if df_slice is None or not isinstance(df_slice, pl.DataFrame) or df_slice.height == 0:
-        return pl.DataFrame([], schema=get_schema("signals"))
+        empty = pl.DataFrame([], schema=get_schema("signals"))
+        if return_stats:
+            return empty, {
+                "input_rows": 0,
+                "final_buy_signals": 0,
+                "final_sell_signals": 0,
+                "final_total_signals": 0,
+                "buy_filtered_out": 0,
+                "sell_filtered_out": 0,
+            }
+        return empty
 
-    df_slice = normalize_signals_times(df_slice, df_main=df_main)
+    df_slice = normalize_signals_times(df_slice, df_context=df_context)
     if "idx" in df_slice.columns:
         df_slice = df_slice.sort(["idx", "time_ns"])
     else:
@@ -508,11 +394,33 @@ def generate_filtered_signals(df_slice: pl.DataFrame, cfg: dict, df_main: Option
     final_buy = np.ones(n, dtype=bool)
     final_sell = np.ones(n, dtype=bool)
 
+    stats = {
+        "input_rows": int(n),
+        "ma_enabled": False,
+        "stochastic_enabled": False,
+        "lookback_enabled": False,
+        "bbw_enabled": False,
+        "after_ma_buy": int(n),
+        "after_ma_sell": int(n),
+        "after_stochastic_buy": int(n),
+        "after_stochastic_sell": int(n),
+        "after_lookback_buy": int(n),
+        "after_lookback_sell": int(n),
+        "after_bbw_buy": int(n),
+        "after_bbw_sell": int(n),
+        "final_buy_signals": 0,
+        "final_sell_signals": 0,
+        "final_total_signals": 0,
+        "buy_filtered_out": 0,
+        "sell_filtered_out": 0,
+    }
+
     # --- 1. MA filter ---
     ma_int = _as_int(cfg.get("ma_int", 0), 0)
     ma_cols = _resolve_ma_cols(cfg, df_slice)
 
     if ma_int > 0 and ma_cols:
+        stats["ma_enabled"] = True
         ma_reversion = _as_bool(cfg.get("ma_reversion", False), False)
 
         close_arr = (
@@ -527,7 +435,7 @@ def generate_filtered_signals(df_slice: pl.DataFrame, cfg: dict, df_main: Option
         ma_sell = np.ones(n, dtype=bool)
 
         for i, ma_col in enumerate(ma_cols):
-            if (ma_int >> i) & 1:
+            if (ma_int >> i) & 1 and ma_col in df_slice.columns:
                 ma_arr = (
                     df_slice[ma_col]
                     .fill_nan(0.0)
@@ -545,9 +453,12 @@ def generate_filtered_signals(df_slice: pl.DataFrame, cfg: dict, df_main: Option
 
         final_buy &= ma_buy
         final_sell &= ma_sell
+        stats["after_ma_buy"] = int(ma_buy.sum())
+        stats["after_ma_sell"] = int(ma_sell.sum())
 
-    # --- 2. Stochastic stateful gate ---
+    # --- 2. Stochastic gate ---
     if _as_bool(cfg.get("use_stochastic", False), False):
+        stats["stochastic_enabled"] = True
         stoch_col = _resolve_stoch_col(cfg)
         lower, upper = _resolve_stoch_bounds(cfg)
         tolerance = _as_float(cfg.get("stoch_threshold_tolerance", 10.0), 10.0)
@@ -563,32 +474,70 @@ def generate_filtered_signals(df_slice: pl.DataFrame, cfg: dict, df_main: Option
             stoch_buy, stoch_sell = _stoch_state_masks(stoch_arr, lower, upper, tolerance)
             final_buy &= stoch_buy
             final_sell &= stoch_sell
+            stats["after_stochastic_buy"] = int(stoch_buy.sum())
+            stats["after_stochastic_sell"] = int(stoch_sell.sum())
 
     # --- 3. Lookback filter ---
+        # --- 3. Lookback filter ---
     lb_units_list = _as_int_list(cfg.get("entry_lookback_units", []))
+    modifier = max(1, _as_int(cfg.get("signal_timeframe_modifier", 3), 3))
 
     if lb_units_list:
+        stats["lookback_enabled"] = True
         any_breakout_buy = np.zeros(n, dtype=bool)
         any_breakout_sell = np.zeros(n, dtype=bool)
         found_any = False
 
+        close_arr = (
+            df_slice["close"]
+            .fill_nan(np.nan)
+            .fill_null(np.nan)
+            .to_numpy()
+            .astype(np.float64, copy=False)
+        )
+
         for lb in lb_units_list:
             if lb <= 0:
                 continue
-            brk_col = f"breakout_{lb}u"
 
-            if brk_col in df_slice.columns:
-                found_any = True
-                vals = df_slice[brk_col].to_numpy()
-                any_breakout_buy |= (vals >= 0.9)
-                any_breakout_sell |= (vals <= 0.1)
+            periods = max(1, int(lb) * modifier)
+
+            prior_high = (
+                df_slice["high"]
+                .rolling_max(periods)
+                .shift(1)
+                .fill_nan(np.nan)
+                .fill_null(np.nan)
+                .to_numpy()
+                .astype(np.float64, copy=False)
+            )
+
+            prior_low = (
+                df_slice["low"]
+                .rolling_min(periods)
+                .shift(1)
+                .fill_nan(np.nan)
+                .fill_null(np.nan)
+                .to_numpy()
+                .astype(np.float64, copy=False)
+            )
+
+            valid = ~np.isnan(prior_high) & ~np.isnan(prior_low) & ~np.isnan(close_arr)
+            found_any = True
+
+            # strict trend-following breakout logic
+            any_breakout_buy |= valid & (close_arr >= prior_high)
+            any_breakout_sell |= valid & (close_arr <= prior_low)
 
         if found_any:
             final_buy &= any_breakout_buy
             final_sell &= any_breakout_sell
+            stats["after_lookback_buy"] = int(any_breakout_buy.sum())
+            stats["after_lookback_sell"] = int(any_breakout_sell.sum())
 
     # --- 4. BBW filter ---
     if _as_bool(cfg.get("use_bbw", False), False):
+        stats["bbw_enabled"] = True
         bbw_col = _resolve_bbw_col(cfg)
         threshold = _as_float(cfg.get("bbw_thresholds", 50), 50.0)
 
@@ -603,6 +552,8 @@ def generate_filtered_signals(df_slice: pl.DataFrame, cfg: dict, df_main: Option
             vol_gate = bbw_arr <= threshold
             final_buy &= vol_gate
             final_sell &= vol_gate
+            stats["after_bbw_buy"] = int(vol_gate.sum())
+            stats["after_bbw_sell"] = int(vol_gate.sum())
 
     regime_id = _as_int(cfg.get("regime_id", 0), 0)
 
@@ -621,32 +572,19 @@ def generate_filtered_signals(df_slice: pl.DataFrame, cfg: dict, df_main: Option
     ])
 
     out = pl.concat([buy_df, sell_df], how="vertical").sort(["idx", "side"])
+
+    stats["final_buy_signals"] = int(final_buy.sum())
+    stats["final_sell_signals"] = int(final_sell.sum())
+    stats["final_total_signals"] = int(final_buy.sum() + final_sell.sum())
+    stats["buy_filtered_out"] = int(n - final_buy.sum())
+    stats["sell_filtered_out"] = int(n - final_sell.sum())
+
+    if return_stats:
+        return out, stats
     return out
-
-
-# -----------------------------
-# small util: compute selected ma_price_gap series name
-# -----------------------------
-def selected_gap_cols_for_ma_int(ma_int: int, ma_cols: list[str]) -> tuple[str, str]:
-    try:
-        mi = int(ma_int or 0)
-    except Exception:
-        mi = 0
-
-    active = [c for i, c in enumerate(ma_cols) if (mi >> i) & 1]
-    if len(active) >= 2:
-        return active[0], active[1]
-
-    if len(ma_cols) >= 2:
-        return ma_cols[0], ma_cols[1]
-
-    return "", ""
 
 
 __all__ = [
     "normalize_signals_times",
-    "get_ma_price_gaps_for_indices",
-    "get_regime_amp_index_for_indices",
     "generate_filtered_signals",
-    "selected_gap_cols_for_ma_int",
 ]

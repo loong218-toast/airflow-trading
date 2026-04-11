@@ -64,6 +64,15 @@ def _get_telegram_token_and_chat_id() -> tuple[str, str]:
 
     return token, str(chat_id)
 
+def _chat_matches(post: dict, expected_chat_id: str) -> bool:
+    chat = post.get("chat", {})
+    expected = str(expected_chat_id).strip()
+    candidates = {
+        str(chat.get("id")),
+        str(chat.get("username") or ""),
+        f"@{chat.get('username')}" if chat.get("username") else "",
+    }
+    return expected in candidates
 
 def _read_cursor() -> int:
     if not STATE_PATH.exists():
@@ -108,6 +117,7 @@ def _telegram_get_updates(token: str, offset: int, limit: int = 100) -> list[dic
     )
     r.raise_for_status()
     payload = r.json()
+    logger.info("getUpdates raw: ok=%s count=%s", payload.get("ok"), len(payload.get("result", [])))
     if not payload.get("ok"):
         raise RuntimeError(payload)
     return payload.get("result", [])
@@ -194,8 +204,8 @@ def kraken_ingest():
         inbox = Path("/tmp/telegram_inbox")
         inbox.mkdir(parents=True, exist_ok=True)
 
-        last_update_id = _read_cursor()
-        max_seen_update_id = last_update_id
+        cursor = _read_cursor()
+        max_seen_update_id = cursor
         affected_pairs: set[str] = set()
         processed_messages: list[dict[str, Any]] = []
 
@@ -204,118 +214,100 @@ def kraken_ingest():
 
         while batch_count < max_batches:
             updates = sorted(
-                _telegram_get_updates(token, last_update_id + 1, limit=100),
+                _telegram_get_updates(token, cursor + 1, limit=100),
                 key=lambda u: int(u["update_id"]),
             )
 
             if not updates:
                 break
 
+            batch_max_update_id = cursor
+            batch_failed = False
+
             for update in updates:
                 update_id = int(update["update_id"])
                 max_seen_update_id = max(max_seen_update_id, update_id)
+                batch_max_update_id = max(batch_max_update_id, update_id)
+
+                post = (
+                    update.get("channel_post")
+                    or update.get("edited_channel_post")
+                    or update.get("message")
+                )
+
+                if not post:
+                    continue
+
+                if not _chat_matches(post, chat_id):
+                    continue
+
+                doc = post.get("document")
+                if not doc:
+                    continue
+
+                file_name = doc.get("file_name") or f"{post.get('message_id', update_id)}.parquet"
+                if "parquet" not in file_name.lower():
+                    continue
+
                 local_path: Optional[Path] = None
-
-                success = False
-
                 try:
-                    post = (
-                        update.get("channel_post")
-                        or update.get("edited_channel_post")
-                        or update.get("message")
+                    file_path = _telegram_get_file_path(token, doc["file_id"])
+                    local_path = inbox / file_name
+                    _telegram_download_file(token, file_path, local_path)
+
+                    df = _read_parquet_file(local_path)
+                    pair = str(df["pair"][0])
+                    interval_minutes = int(df["interval_minutes"][0])
+                    market_type = str(df["market_type"][0]).lower().strip()
+
+                    if market_type not in VALID_MARKET_TYPES:
+                        raise ValueError(f"Unsupported market_type in {file_name}: {market_type}")
+
+                    bulk_upsert_candles(
+                        engine=engine,
+                        df=df,
+                        pair=pair,
+                        interval_minutes=interval_minutes,
+                        market_type=market_type,
                     )
-                    if not post:
-                        _write_cursor(update_id)
-                        last_update_id = update_id
-                        continue
-
-                    chat = post.get("chat", {})
-                    actual_id = str(chat.get("id"))
-
-                    if actual_id != chat_id:
-                        _write_cursor(update_id)
-                        last_update_id = update_id
-                        continue
-
-                    doc = post.get("document")
-                    if not doc:
-                        _write_cursor(update_id)
-                        last_update_id = update_id
-                        continue
-
-                    file_name = doc.get("file_name") or f"{post.get('message_id', update_id)}.parquet"
-                    if "parquet" not in file_name.lower():
-                        _write_cursor(update_id)
-                        last_update_id = update_id
-                        continue
 
                     try:
-                        # Download and read parquet
-                        file_path = _telegram_get_file_path(token, doc["file_id"])
-                        local_path = inbox / file_name
-                        _telegram_download_file(token, file_path, local_path)
-
-                        df = _read_parquet_file(local_path)
-
-                        pair = str(df["pair"][0])
-                        interval_minutes = int(df["interval_minutes"][0])
-                        market_type = str(df["market_type"][0]).lower().strip()
-
-                        if market_type not in VALID_MARKET_TYPES:
-                            raise ValueError(f"Unsupported market_type in {file_name}: {market_type}")
-
-                        bulk_upsert_candles(
-                            engine=engine,
-                            df=df,
-                            pair=pair,
-                            interval_minutes=interval_minutes,
-                            market_type=market_type,
-                        )
-
-                        _telegram_delete_message(token, chat_id, int(post["message_id"]))
-                        success = True
-
-                        if interval_minutes == 5:
-                            affected_pairs.add(pair)
-
-                        processed_messages.append(
-                            {
-                                "pair": pair,
-                                "interval_minutes": interval_minutes,
-                                "market_type": market_type,
-                                "message_id": int(post["message_id"]),
-                                "file_name": file_name,
-                                "rows": int(df.height),
-                            }
-                        )
-
-                        # ✅ Log success
-                        logger.info(
-                            "Successfully consumed parquet: %s | pair=%s | interval=%s | market_type=%s | rows=%d",
+                        actual_chat_id = str(post["chat"]["id"])
+                        _telegram_delete_message(token, actual_chat_id, int(post["message_id"]))
+                    except Exception as delete_err:
+                        logger.warning(
+                            "Ingested but could not delete Telegram message: %s | message_id=%s | error=%s",
                             file_name,
-                            pair,
-                            interval_minutes,
-                            market_type,
-                            df.height,
+                            post.get("message_id"),
+                            delete_err,
                         )
 
-                    except Exception as e:
-                        # ❌ Log failure with file name and exception
-                        logger.error(
-                            "Failed to consume parquet: %s | update_id=%s | error=%s",
-                            file_name,
-                            update_id,
-                            e,
-                            exc_info=True,
-                        )
+                    processed_messages.append(
+                        {
+                            "pair": pair,
+                            "interval_minutes": interval_minutes,
+                            "market_type": market_type,
+                            "message_id": int(post["message_id"]),
+                            "file_name": file_name,
+                            "rows": int(df.height),
+                        }
+                    )
 
-                    finally:
-                        if success:
-                            _write_cursor(update_id)
-                            last_update_id = update_id
-                        else:
-                            # write to a failed queue / retry list instead of losing it
-                            pass
+                    if interval_minutes == 5:
+                        affected_pairs.add(pair)
+
+                    logger.info(
+                        "Successfully consumed parquet: %s | pair=%s | interval=%s | market_type=%s | rows=%d",
+                        file_name, pair, interval_minutes, market_type, df.height,
+                    )
+
+                except Exception as e:
+                    logger.error(
+                        "Failed to consume parquet: %s | update_id=%s | error=%s",
+                        file_name, update_id, e, exc_info=True,
+                    )
+                    batch_failed = True
+                    break
 
                 finally:
                     if local_path is not None:
@@ -324,15 +316,12 @@ def kraken_ingest():
                         except Exception:
                             pass
 
-            batch_count += 1
-            last_update_id = max_seen_update_id
+            if batch_failed:
+                break
 
-        if batch_count >= max_batches:
-            logger.warning(
-                "Stopped after max_batches=%s to avoid endless drain; cursor=%s",
-                max_batches,
-                last_update_id,
-            )
+            _write_cursor(batch_max_update_id)
+            cursor = batch_max_update_id
+            batch_count += 1
 
         return {
             "pairs": sorted(affected_pairs),

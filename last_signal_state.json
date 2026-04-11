@@ -4,5 +4,35 @@
   "XXBTZUSD|1774764300000000000|1|101": true,
   "XXBTZUSD|spot|1775091600000000000|-1|101": true,
   "XXBTZUSD|spot|1775236500000000000|-1|101": true,
-  "XXBTZUSD|spot|1775268000000000000|1|101": true
+  "XXBTZUSD|spot|1775268000000000000|1|101": true,
+  "XXBTZUSD|spot|1775702700000000000|1|101": {
+    "sent": true,
+    "time_ns": 1775702700000000000
+  },
+  "XXBTZUSD|spot|1|101": {
+    "time_ns": 1775702700000000000,
+    "pair": "XXBTZUSD",
+    "market_type": "spot",
+    "side": 1,
+    "regime_id": 101
+  },
+  "XXBTZUSD|spot|1775733900000000000|-1|101": {
+    "sent": true,
+    "time_ns": 1775733900000000000
+  },
+  "XXBTZUSD|spot|-1|101": {
+    "time_ns": 1775880000000000000,
+    "pair": "XXBTZUSD",
+    "market_type": "spot",
+    "side": -1,
+    "regime_id": 101
+  },
+  "XXBTZUSD|spot|1775758800000000000|-1|101": {
+    "sent": true,
+    "time_ns": 1775758800000000000
+  },
+  "XXBTZUSD|spot|1775880000000000000|-1|101": {
+    "sent": true,
+    "time_ns": 1775880000000000000
+  }
 }

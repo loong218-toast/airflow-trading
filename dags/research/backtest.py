@@ -36,6 +36,38 @@ def _hours_to_bars(hours: Optional[int], base_minutes: int) -> int:
         return -1
     return int((int(hours) * 60) / max(1, int(base_minutes)))
 
+def _avg_hit_pcts(
+    entry_price_arr: np.ndarray,
+    exit_price_arr: np.ndarray,
+    exit_reason_arr: np.ndarray,
+    side_flag: int,
+) -> tuple[float, float]:
+    entry_price_arr = np.asarray(entry_price_arr, dtype=np.float64)
+    exit_price_arr = np.asarray(exit_price_arr, dtype=np.float64)
+    exit_reason_arr = np.asarray(exit_reason_arr, dtype=np.int8)
+
+    n = min(entry_price_arr.size, exit_price_arr.size, exit_reason_arr.size)
+    if n == 0:
+        return np.nan, np.nan
+
+    entry_price_arr = entry_price_arr[:n]
+    exit_price_arr = exit_price_arr[:n]
+    exit_reason_arr = exit_reason_arr[:n]
+
+    tp_mask = exit_reason_arr == 1
+    sl_mask = exit_reason_arr == -1
+
+    if int(side_flag) == 1:
+        tp_pct = ((exit_price_arr[tp_mask] - entry_price_arr[tp_mask]) / entry_price_arr[tp_mask]) * 100.0 if tp_mask.any() else np.array([], dtype=np.float64)
+        sl_pct = ((exit_price_arr[sl_mask] - entry_price_arr[sl_mask]) / entry_price_arr[sl_mask]) * 100.0 if sl_mask.any() else np.array([], dtype=np.float64)
+    else:
+        tp_pct = ((entry_price_arr[tp_mask] - exit_price_arr[tp_mask]) / entry_price_arr[tp_mask]) * 100.0 if tp_mask.any() else np.array([], dtype=np.float64)
+        sl_pct = ((entry_price_arr[sl_mask] - exit_price_arr[sl_mask]) / entry_price_arr[sl_mask]) * 100.0 if sl_mask.any() else np.array([], dtype=np.float64)
+
+    avg_sl_hit = float(np.nanmean(sl_pct)) if sl_pct.size else np.nan
+    avg_tp_hit = float(np.nanmean(tp_pct)) if tp_pct.size else np.nan
+    return avg_sl_hit, avg_tp_hit
+    
 def _apply_trade_window_interval(
     signal_idx: np.ndarray,
     entry_idx: np.ndarray,
@@ -44,8 +76,10 @@ def _apply_trade_window_interval(
     exit_price: np.ndarray,
     rets: np.ndarray,
     exit_reason: np.ndarray,
+    tp_hit_price: np.ndarray,
+    sl_hit_price: np.ndarray,
     trade_window_bars: int,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Keep only trades that start after the previous accepted trade has exited
     plus the configured cooldown window.
@@ -53,7 +87,17 @@ def _apply_trade_window_interval(
     trade_window_bars = 0 => no filtering.
     """
     if trade_window_bars <= 0 or signal_idx.size == 0:
-        return signal_idx, entry_idx, entry_price, exit_idx, exit_price, rets, exit_reason
+        return (
+            signal_idx,
+            entry_idx,
+            entry_price,
+            exit_idx,
+            exit_price,
+            rets,
+            exit_reason,
+            tp_hit_price,
+            sl_hit_price,
+        )
 
     keep_idx = []
     last_exit_idx = -1
@@ -61,7 +105,6 @@ def _apply_trade_window_interval(
     for i in range(signal_idx.shape[0]):
         cur_entry_idx = int(entry_idx[i])
 
-        # cooldown measured from previous accepted trade's exit
         if last_exit_idx >= 0 and cur_entry_idx <= (last_exit_idx + trade_window_bars):
             continue
 
@@ -74,7 +117,7 @@ def _apply_trade_window_interval(
         empty_i64 = np.empty(0, dtype=np.int64)
         empty_f64 = np.empty(0, dtype=np.float64)
         empty_i8 = np.empty(0, dtype=np.int8)
-        return empty_i64, empty_i64, empty_f64, empty_i64, empty_f64, empty_f64, empty_i8
+        return empty_i64, empty_i64, empty_f64, empty_i64, empty_f64, empty_f64, empty_i8, empty_f64, empty_f64
 
     keep_idx = np.asarray(keep_idx, dtype=np.int64)
     return (
@@ -85,6 +128,8 @@ def _apply_trade_window_interval(
         exit_price[keep_idx],
         rets[keep_idx],
         exit_reason[keep_idx],
+        tp_hit_price[keep_idx],
+        sl_hit_price[keep_idx],
     )
 
 @njit(cache=True)
@@ -175,6 +220,7 @@ def _numba_pnl_from_actual_exits(
     sl_tp_in_pct,
     spread_is_percent,
     funding_period_hours,
+    trading_fee_rate,
 ):
     n = entry_prices.shape[0]
     pnl_out = np.empty(n, dtype=np.float64)
@@ -183,6 +229,9 @@ def _numba_pnl_from_actual_exits(
     ns_to_hours = 1.0 / (1e9 * 3600.0)
     f_period = float(max(1, funding_period_hours))
     side = 1 if int(side_flag) >= 0 else -1
+
+    per_side_fee = max(0.0, float(trading_fee_rate))
+    round_trip_fee_rate = 2.0 * per_side_fee
 
     for i in range(n):
         ep = float(entry_prices[i])
@@ -205,17 +254,16 @@ def _numba_pnl_from_actual_exits(
 
         eff_sl = max(raw_sl + spr_pct, 0.01)
 
-        # Risk-based sizing:
-        # SL hit -> loss ~= risk_pct
-        # TP hit -> gain scales by TP/SL through the actual exit price
-        pos_size = risk / (eff_sl / 100.0)
+        # Notional / equity fraction implied by fixed-risk sizing.
+        notional_frac = risk / (eff_sl / 100.0)
 
         if side == 1:
             trade_ret = (xp - ep) / ep_safe
         else:
             trade_ret = (ep - xp) / ep_safe
 
-        pnl = (pos_size * trade_ret) - f_fee
+        fee_pct = notional_frac * round_trip_fee_rate
+        pnl = (notional_frac * trade_ret) - fee_pct - f_fee
 
         if not np.isfinite(pnl):
             pnl = -1.0
@@ -225,66 +273,6 @@ def _numba_pnl_from_actual_exits(
         pnl_out[i] = pnl
 
     return pnl_out
-
-
-def compute_pnl_pct_vectorized(
-    closed_masked_rets: np.ndarray,
-    closed_entry_idxs: np.ndarray,
-    closed_exit_idxs: np.ndarray,
-    main_close_arr: np.ndarray,
-    main_time_ns_arr: np.ndarray,
-    spread_arr: Optional[np.ndarray],
-    funding_arr: Optional[np.ndarray],
-    entry_prices_arr: Optional[np.ndarray],
-    sl_val: float = 0.0,
-    tp_val: float = 0.0,
-    risk_pct: float = 0.005,
-    sl_tp_in_pct: bool = True,
-    funding_period_hours: int = 8,
-    funding_rate_unit: str = "per_period",
-    spread_is_percent: bool = True,
-) -> Tuple[np.ndarray, np.ndarray]:
-    n = closed_masked_rets.shape[0]
-    if n == 0:
-        return np.empty(0, dtype=np.float64), np.empty(0, dtype=np.int64)
-
-    entry_prices = (
-        np.asarray(entry_prices_arr, dtype=np.float64)
-        if entry_prices_arr is not None
-        else np.asarray(main_close_arr[closed_entry_idxs], dtype=np.float64)
-    )
-
-    spreads = (
-        np.asarray(spread_arr[closed_entry_idxs], dtype=np.float64)
-        if spread_arr is not None
-        else np.zeros(n, dtype=np.float64)
-    )
-
-    funding_raw = (
-        np.asarray(funding_arr[closed_entry_idxs], dtype=np.float64)
-        if funding_arr is not None
-        else np.zeros(n, dtype=np.float64)
-    )
-
-    pnl_pct = _numba_pnl_kernel_optimized(
-        np.asarray(closed_masked_rets, dtype=np.float64),
-        entry_prices,
-        spreads,
-        funding_raw,
-        np.asarray(closed_entry_idxs, dtype=np.int64),
-        np.asarray(closed_exit_idxs, dtype=np.int64),
-        np.asarray(main_time_ns_arr, dtype=np.int64),
-        float(risk_pct),
-        float(sl_val),
-        float(tp_val),
-        bool(sl_tp_in_pct),
-        bool(spread_is_percent),
-        int(funding_period_hours),
-    )
-
-    exit_times_ns = np.asarray(main_time_ns_arr[closed_exit_idxs], dtype=np.int64)
-    return pnl_pct, exit_times_ns
-
 
 # -------------------------
 # backtest kernel
@@ -319,6 +307,8 @@ def _backtest_kernel_limit_ohlc(
     exit_price_out = np.empty(n_signals, dtype=np.float64)
     rets_out = np.empty(n_signals, dtype=np.float64)
     exit_reason_out = np.empty(n_signals, dtype=np.int8)  # 1=TP, -1=SL, 0=time exit
+    tp_hit_price_out = np.empty(n_signals, dtype=np.float64)
+    sl_hit_price_out = np.empty(n_signals, dtype=np.float64)
 
     k = 0
 
@@ -400,6 +390,8 @@ def _backtest_kernel_limit_ohlc(
         exit_at = -1
         exit_price = 0.0
         exit_reason = 0
+        tp_hit_price = np.nan
+        sl_hit_price = np.nan
 
         max_j = n_rows - 1
         if exit_window_bars_i64 >= 0:
@@ -415,8 +407,6 @@ def _backtest_kernel_limit_ohlc(
 
             current_sl_price = sl_price_adj
             if use_trailing_sl_bool and trailing_sl_interval_i64 > 0 and trailing_sl_pct_f64 > 0.0:
-                # Only tighten after fully closed candles.
-                # For bar j, the last fully closed candle is j - 1.
                 closed_bars = j - fill_idx - 1
                 if closed_bars >= trailing_sl_interval_i64:
                     steps = closed_bars // trailing_sl_interval_i64
@@ -434,6 +424,11 @@ def _backtest_kernel_limit_ohlc(
             if side == 1:
                 hit_sl = lo <= current_sl_price
                 hit_tp = hi >= tp_price_adj
+
+                if hit_tp:
+                    tp_hit_price = tp_price_adj
+                if hit_sl:
+                    sl_hit_price = current_sl_price
 
                 if hit_sl and hit_tp:
                     if conservative_sl_first_bool:
@@ -460,6 +455,11 @@ def _backtest_kernel_limit_ohlc(
             else:
                 hit_sl = hi >= current_sl_price
                 hit_tp = lo <= tp_price_adj
+
+                if hit_tp:
+                    tp_hit_price = tp_price_adj
+                if hit_sl:
+                    sl_hit_price = current_sl_price
 
                 if hit_sl and hit_tp:
                     if conservative_sl_first_bool:
@@ -512,6 +512,8 @@ def _backtest_kernel_limit_ohlc(
         exit_price_out[k] = exit_price
         rets_out[k] = ret
         exit_reason_out[k] = exit_reason
+        tp_hit_price_out[k] = tp_hit_price
+        sl_hit_price_out[k] = sl_hit_price
         k += 1
 
     return (
@@ -522,6 +524,8 @@ def _backtest_kernel_limit_ohlc(
         exit_price_out[:k],
         rets_out[:k],
         exit_reason_out[:k],
+        tp_hit_price_out[:k],
+        sl_hit_price_out[:k],
     )
 
 
@@ -714,7 +718,7 @@ def backtest_from_arrays(
     exit_window_bars = _hours_to_bars(exit_window_h, base_minutes)
     trade_window_bars = max(0, _hours_to_bars(trade_window_interval, base_minutes))
 
-    signal_idx, entry_idx, entry_price, exit_idx, exit_price, rets, exit_reason = _backtest_kernel_limit_ohlc(
+    signal_idx, entry_idx, entry_price, exit_idx, exit_price, rets, exit_reason, tp_hit_price, sl_hit_price = _backtest_kernel_limit_ohlc(
         close,
         high,
         low,
@@ -735,7 +739,7 @@ def backtest_from_arrays(
     )
 
     if trade_window_bars > 0 and signal_idx.size > 0:
-        signal_idx, entry_idx, entry_price, exit_idx, exit_price, rets, exit_reason = _apply_trade_window_interval(
+        signal_idx, entry_idx, entry_price, exit_idx, exit_price, rets, exit_reason, tp_hit_price, sl_hit_price = _apply_trade_window_interval(
             signal_idx=signal_idx,
             entry_idx=entry_idx,
             exit_idx=exit_idx,
@@ -743,20 +747,24 @@ def backtest_from_arrays(
             exit_price=exit_price,
             rets=rets,
             exit_reason=exit_reason,
+            tp_hit_price=tp_hit_price,
+            sl_hit_price=sl_hit_price,
             trade_window_bars=trade_window_bars,
         )
 
     max_consecutive_losses = compute_max_consecutive_losses(rets)
 
     return {
-    "signal_idx": signal_idx,
-    "entry_idx": entry_idx,
-    "entry_price": entry_price,
-    "exit_idx": exit_idx,
-    "exit_price": exit_price,
-    "rets": rets,
-    "exit_reason": exit_reason,
-    "max_consecutive_losses": max_consecutive_losses,
+        "signal_idx": signal_idx,
+        "entry_idx": entry_idx,
+        "entry_price": entry_price,
+        "exit_idx": exit_idx,
+        "exit_price": exit_price,
+        "rets": rets,
+        "exit_reason": exit_reason,
+        "TP_hit": tp_hit_price,
+        "SL_hit": sl_hit_price,
+        "max_consecutive_losses": max_consecutive_losses,
     }
 
 
@@ -794,6 +802,8 @@ def backtest_signals_sl_tp_rets(
             "exit_price": np.array([], dtype=np.float64),
             "rets": np.array([], dtype=np.float64),
             "exit_reason": np.array([], dtype=np.int8),
+            "TP_hit": np.array([], dtype=np.float64),
+            "SL_hit": np.array([], dtype=np.float64),
         }
 
     side_arr = np.full(sig_idxs.shape[0], side_flag, dtype=np.int8)
