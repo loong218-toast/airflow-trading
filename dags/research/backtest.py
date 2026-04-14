@@ -32,9 +32,31 @@ def _funding_per_hour_from_series(
 
 
 def _hours_to_bars(hours: Optional[int], base_minutes: int) -> int:
-    if hours is None or int(hours) <= 0:
-        return -1
-    return int((int(hours) * 60) / max(1, int(base_minutes)))
+    if hours is None:
+        return 0
+    try:
+        h = int(hours)
+    except Exception:
+        return 0
+    if h <= 0:
+        return 0
+    return int((h * 60) / max(1, int(base_minutes)))
+
+
+def _expiry_to_bars(limit_order_expiry_bars: Optional[int]) -> int:
+    """
+    New source of truth:
+    limit_order_expiry_bars only.
+
+    No fallback to hours.
+    """
+    if limit_order_expiry_bars is None:
+        return 0
+    try:
+        bars = int(limit_order_expiry_bars)
+    except Exception:
+        return 0
+    return max(0, bars)
 
 def _avg_hit_pcts(
     entry_price_arr: np.ndarray,
@@ -696,7 +718,7 @@ def backtest_from_arrays(
     sl: float = 0.0,
     tp: float = 0.0,
     sl_tp_in_pct: bool = True,
-    limit_order_expiry_h: Optional[int] = None,
+    limit_order_expiry_bars: int = 0,
     exit_window_h: Optional[int] = None,
     trade_window_interval: Optional[int] = 0,
     base_minutes: int = 5,
@@ -714,7 +736,7 @@ def backtest_from_arrays(
     signal_idx_arr = np.asarray(signal_idx_arr, dtype=np.int64)
     side_arr = np.asarray(side_arr, dtype=np.int8)
 
-    limit_window_bars = _hours_to_bars(limit_order_expiry_h, base_minutes)
+    limit_window_bars = _expiry_to_bars(limit_order_expiry_bars)
     exit_window_bars = _hours_to_bars(exit_window_h, base_minutes)
     trade_window_bars = max(0, _hours_to_bars(trade_window_interval, base_minutes))
 
@@ -781,7 +803,7 @@ def backtest_signals_sl_tp_rets(
     tp: float = 0.0,
     sl_tp_in_pct: bool = True,
     exit_window_h: Optional[int] = None,
-    limit_order_expiry_h: Optional[int] = None,
+    limit_order_expiry_bars: int = 0,
     trade_window_interval: Optional[int] = 0,
     base_minutes: int = 5,
     spread: float = 0.0,
@@ -817,7 +839,7 @@ def backtest_signals_sl_tp_rets(
         sl=sl,
         tp=tp,
         sl_tp_in_pct=sl_tp_in_pct,
-        limit_order_expiry_h=limit_order_expiry_h,
+        limit_order_expiry_bars=limit_order_expiry_bars,
         exit_window_h=exit_window_h,
         trade_window_interval=trade_window_interval,
         base_minutes=base_minutes,

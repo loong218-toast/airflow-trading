@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-import math
+import os
 import time
 import uuid
 from copy import deepcopy
@@ -17,28 +17,32 @@ import polars as pl
 from common.schema import enforce_schema, get_schema
 
 try:
-    from lightgbm import LGBMRegressor
-    HAS_LGBM = True
-except Exception:
-    HAS_LGBM = False
-
-try:
-    from sklearn.compose import ColumnTransformer
     from sklearn.ensemble import RandomForestRegressor
-    from sklearn.gaussian_process import GaussianProcessRegressor
-    from sklearn.gaussian_process.kernels import ConstantKernel, RBF, WhiteKernel
-    from sklearn.impute import SimpleImputer
-    from sklearn.pipeline import Pipeline
-    from sklearn.preprocessing import OneHotEncoder, StandardScaler
     HAS_SKLEARN = True
 except Exception:
     HAS_SKLEARN = False
 
+try:
+    from lightgbm import LGBMRegressor  # optional fallback, not required
+    HAS_LGBM = True
+except Exception:
+    HAS_LGBM = False
+
 STATE_FILE_NAME = "coord_descent_state.json"
 
-# These metrics are the CCD "winner score" features.
-# They come from real backtest results, not from the surrogate.
-# The surrogate learns to predict a loss built from these metrics.
+# The archive lives outside the session directory so future runs can reuse it.
+# This is deliberate: the surrogate should remember past backtests across runs,
+# while the current session keeps only the control state.
+CCD_DATA_LAKE_ROOT = Path(os.getenv("DATA_LAKE_ROOT", "/opt/airflow/airflow-trading/data_lake"))
+CCD_EVAL_ARCHIVE_ROOT = CCD_DATA_LAKE_ROOT / "cache" / "ccd_eval_parts"
+
+# Keep the surrogate bounded. This is the main safety guard against "hangs"
+# caused by huge historical parquet scans and very large pandas training frames.
+SURROGATE_HISTORY_LIMIT = 5_000
+SURROGATE_HISTORY_PART_LIMIT = 200
+SURROGATE_MIN_TRAIN_ROWS = 32
+SURROGATE_BOOTSTRAP_RANDOM = 4
+
 WINNER_METRICS = [
     "recency_weighted_era_consistency_score",
     "era_consistency_score",
@@ -46,8 +50,6 @@ WINNER_METRICS = [
     "elite_median_alpha",
 ]
 
-# Default weights for turning the multi-metric winner score into one scalar loss.
-# Lower score_loss is better.
 DEFAULT_WEIGHTS = {
     "recency_weighted_era_consistency_score": 0.35,
     "era_consistency_score": 0.25,
@@ -55,8 +57,6 @@ DEFAULT_WEIGHTS = {
     "elite_median_alpha": 0.10,
 }
 
-# These are only normalization bounds for the scalar loss target.
-# They do NOT cap the actual backtest metrics.
 DEFAULT_METRIC_BOUNDS = {
     "recency_weighted_era_consistency_score": (0.0, 1.0),
     "era_consistency_score": (0.0, 1.0),
@@ -67,21 +67,19 @@ DEFAULT_METRIC_BOUNDS = {
 
 @dataclass(frozen=True)
 class ParamSpec:
-    name: str
+    path: tuple[str, ...]
     kind: str  # "float", "int", "bool", "choice", "fixed"
     low: Optional[float] = None
     high: Optional[float] = None
-    step: Optional[float] = None
     choices: Optional[List[Any]] = None
     log: bool = False
+
 
 def _dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     return df.loc[:, ~df.columns.duplicated()].copy()
 
-def _drop_all_null_cols(df, cols):
-    return [c for c in cols if c in df.columns and df[c].notna().any()]
 
 def _now_iso_ns() -> datetime:
     return datetime.now(timezone.utc)
@@ -89,6 +87,64 @@ def _now_iso_ns() -> datetime:
 
 def _stable_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, default=str, separators=(",", ":"))
+
+
+def _unwrap_singleton(value: Any) -> Any:
+    if isinstance(value, (list, tuple)) and len(value) == 1:
+        return value[0]
+    return value
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, tuple):
+        return [_jsonable(v) for v in value]
+    return value
+
+
+def _path_get(cfg: dict, path: tuple[str, ...], default: Any = None) -> Any:
+    cur: Any = cfg
+    for key in path:
+        if not isinstance(cur, dict) or key not in cur:
+            return default
+        cur = cur[key]
+    return cur
+
+
+def _path_set(cfg: dict, path: tuple[str, ...], value: Any) -> None:
+    cur = cfg
+    for key in path[:-1]:
+        nxt = cur.get(key)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            cur[key] = nxt
+        cur = nxt
+    cur[path[-1]] = value
+
+
+def _iter_leaf_paths(node: Any, prefix: tuple[str, ...] = ()) -> Iterable[tuple[tuple[str, ...], Any]]:
+    if isinstance(node, dict):
+        for k, v in node.items():
+            yield from _iter_leaf_paths(v, prefix + (str(k),))
+    else:
+        yield prefix, node
+
+
+def _is_num_scalar(x: Any) -> bool:
+    return isinstance(x, (int, float, np.integer, np.floating)) and not isinstance(x, bool)
+
+
+def _listify(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    return [value]
 
 
 def flatten_cfg(cfg: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
@@ -151,6 +207,13 @@ def scalarize_winner_score(
     weights: Optional[Dict[str, float]] = None,
     metric_bounds: Optional[Dict[str, Tuple[float, float]]] = None,
 ) -> float:
+    """
+    Convert the real CCD winner metrics into one scalar loss.
+
+    Lower is better.
+    This scalar is only used for surrogate training and ranking.
+    The actual incumbent decision still uses the full backtest-derived metrics.
+    """
     weights = dict(weights or DEFAULT_WEIGHTS)
     metric_bounds = dict(metric_bounds or DEFAULT_METRIC_BOUNDS)
 
@@ -174,6 +237,28 @@ def scalarize_winner_score(
         total -= float(weight) * float(norm)
 
     return float(total)
+
+
+def _load_pair_from_session(session_dir: Path) -> str:
+    """
+    The archive path is namespaced by pair so multiple markets can share one cache root.
+    """
+    session_dir = Path(session_dir)
+    run_cfg_path = session_dir / "run_config.json"
+    if not run_cfg_path.exists():
+        return "unknown_pair"
+    try:
+        run_cfg = json.loads(run_cfg_path.read_text(encoding="utf8"))
+        pair = str(run_cfg.get("pair", "unknown_pair")).strip()
+        return pair or "unknown_pair"
+    except Exception:
+        return "unknown_pair"
+
+
+def _eval_archive_dir(session_dir: Path, batch_id: int) -> Path:
+    session_dir = Path(session_dir)
+    pair = _load_pair_from_session(session_dir)
+    return CCD_EVAL_ARCHIVE_ROOT / pair / session_dir.name / f"batch_{int(batch_id):04d}"
 
 
 def make_ccd_eval_row(
@@ -202,6 +287,14 @@ def make_ccd_eval_row(
     weights: Optional[Dict[str, float]] = None,
     metric_bounds: Optional[Dict[str, Tuple[float, float]]] = None,
 ) -> Dict[str, Any]:
+    """
+    Build one compact CCD evaluation row.
+
+    This is the bridge between backtest truth and surrogate learning:
+    - `regime_cfg` stores the exact candidate configuration
+    - `winner_score` stores the real backtest-derived ranking metrics
+    - `score_loss` is the scalar target used by the surrogate later
+    """
     cfg_json = _stable_json(regime_cfg or {})
 
     return {
@@ -214,26 +307,22 @@ def make_ccd_eval_row(
         "candidate_rank": int(candidate_rank),
         "accepted": bool(accepted),
         "selected": bool(selected),
-
         "total_pos": int(total_pos),
         "win_pos": int(win_pos),
         "balance": float(balance),
         "max_drawdown": float(max_drawdown),
         "max_consecutive_losses": int(max_consecutive_losses),
-
         "SL": float(sl_val),
         "TP": float(tp_val),
         "SL_hit": float(sl_hit) if np.isfinite(sl_hit) else None,
         "TP_hit": float(tp_hit) if np.isfinite(tp_hit) else None,
-
         "use_trailing_sl": bool(regime_cfg.get("use_trailing_sl", False)),
         "trailing_sl_pct": float(regime_cfg.get("trailing_sl_pct", 0.0) or 0.0),
         "trailing_sl_interval": int(regime_cfg.get("trailing_sl_interval", 0) or 0),
         "trailing_sl_stop_at_pos": bool(regime_cfg.get("trailing_sl_stop_at_pos", True)),
         "use_limit_entry": bool(regime_cfg.get("use_limit_entry", True)),
-        "limit_order_expiry_h": int(regime_cfg.get("limit_order_expiry_h", 0) or 0),
+        "limit_order_expiry_bars": int(regime_cfg.get("limit_order_expiry_bars", 0) or 0),
         "trade_window_interval": int(regime_cfg.get("trade_window_interval", 0) or 0),
-
         "recency_weighted_era_consistency_score": float(winner_score.get("recency_weighted_era_consistency_score", 0.0)),
         "era_consistency_score": float(winner_score.get("era_consistency_score", 0.0)),
         "dominance_score": float(winner_score.get("dominance_score", 0.0)),
@@ -243,18 +332,25 @@ def make_ccd_eval_row(
             weights=weights,
             metric_bounds=metric_bounds,
         ),
-
         "cfg_json": cfg_json,
         "created_at": created_at or _now_iso_ns(),
     }
 
 
 def stage_ccd_eval_rows(results_dir: str | Path, batch_id: int, rows: pl.DataFrame) -> Optional[Path]:
+    """
+    Persist one compact evaluation fragment for later surrogate training.
+
+    Important: this writes into the shared archive root, not just session-local
+    results, so future runs can reuse the history even after a new DAG run starts.
+    """
     if rows is None or rows.is_empty():
         return None
 
     results_dir = Path(results_dir)
-    out_dir = results_dir / "ccd_eval_parts" / f"batch_{int(batch_id):04d}"
+    session_dir = results_dir.parent  # expected to be session_dir / "results"
+
+    out_dir = _eval_archive_dir(session_dir, batch_id)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     df = enforce_schema(rows, "ccd_eval", strict=True)
@@ -266,14 +362,37 @@ def stage_ccd_eval_rows(results_dir: str | Path, batch_id: int, rows: pl.DataFra
 
 
 def load_ccd_eval_history(session_dir: str | Path) -> pl.DataFrame:
-    session_dir = Path(session_dir)
-    parts_root = session_dir / "results" / "ccd_eval_parts"
-    if not parts_root.exists():
-        return pl.DataFrame([], schema=get_schema("ccd_eval"))
+    """
+    Load history from both:
+    - the archive cache, for persistent learning across runs
+    - the legacy session-local folder, for backward compatibility
 
-    parts = sorted(parts_root.rglob("*.parquet"))
+    This function is intentionally bounded so the surrogate does not get stuck
+    scanning an ever-growing history corpus.
+    """
+    session_dir = Path(session_dir)
+    pair = _load_pair_from_session(session_dir)
+
+    archive_root = CCD_EVAL_ARCHIVE_ROOT / pair / session_dir.name
+    legacy_root = session_dir / "results" / "ccd_eval_parts"
+
+    parts: list[Path] = []
+
+    if archive_root.exists():
+        parts.extend(sorted(archive_root.rglob("*.parquet")))
+
+    if legacy_root.exists():
+        parts.extend(sorted(legacy_root.rglob("*.parquet")))
+
     if not parts:
         return pl.DataFrame([], schema=get_schema("ccd_eval"))
+
+    # Keep only the newest fragments. Older history is still useful, but not at
+    # the cost of blocking the entire CCD cycle.
+    try:
+        parts = sorted(parts, key=lambda p: p.stat().st_mtime, reverse=True)[:SURROGATE_HISTORY_PART_LIMIT]
+    except Exception:
+        parts = parts[:SURROGATE_HISTORY_PART_LIMIT]
 
     try:
         lf = pl.scan_parquet([str(p) for p in parts])
@@ -284,29 +403,28 @@ def load_ccd_eval_history(session_dir: str | Path) -> pl.DataFrame:
     return enforce_schema(df, "ccd_eval", strict=False)
 
 
-def refresh_ccd_eval_snapshot(session_dir: str | Path) -> Path:
-    session_dir = Path(session_dir)
-    out_path = session_dir / "ccd_eval.parquet"
-    df = load_ccd_eval_history(session_dir)
-    df.write_parquet(str(out_path), compression="snappy")
-    return out_path
+def _expand_json_columns(pdf: pd.DataFrame, cols: Sequence[str]) -> pd.DataFrame:
+    extra_frames = []
+    for c in cols:
+        if c not in pdf.columns:
+            continue
 
+        rows = []
+        for raw in pdf[c].tolist():
+            try:
+                payload = json.loads(raw) if isinstance(raw, str) and raw else (raw if isinstance(raw, dict) else {})
+            except Exception:
+                payload = {}
+            rows.append(flatten_cfg(payload) if isinstance(payload, dict) else {})
 
-def _one_hot_encoder():
-    try:
-        return OneHotEncoder(handle_unknown="ignore", sparse_output=False)
-    except TypeError:
-        return OneHotEncoder(handle_unknown="ignore", sparse=False)
+        if rows:
+            extra_frames.append(pd.DataFrame(rows).add_prefix(f"{c}__"))
 
+    if not extra_frames:
+        return pdf
 
-def _normalize_types(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    for c in df.columns:
-        if pd.api.types.is_bool_dtype(df[c]):
-            df[c] = df[c].astype("int8")
-        elif pd.api.types.is_object_dtype(df[c]):
-            df[c] = df[c].astype("string")
-    return df
+    merged = pd.concat([pdf.reset_index(drop=True)] + [f.reset_index(drop=True) for f in extra_frames], axis=1)
+    return _dedupe_columns(merged)
 
 
 def build_training_frame(
@@ -314,26 +432,28 @@ def build_training_frame(
     weights: Optional[Dict[str, float]] = None,
     metric_bounds: Optional[Dict[str, Tuple[float, float]]] = None,
 ) -> pd.DataFrame:
+    """
+    Turn CCD eval fragments into a surrogate-ready pandas frame.
+
+    The surrogate only needs:
+    - the flattened candidate config
+    - the scalar score_loss target
+    Everything else is kept as metadata.
+    """
     if eval_df is None or eval_df.is_empty():
         return pd.DataFrame()
 
     pdf = eval_df.to_pandas()
-    pdf = _normalize_types(pdf)
 
-    if "cfg_json" in pdf.columns:
-        cfg_rows = []
-        for raw in pdf["cfg_json"].tolist():
-            try:
-                cfg = json.loads(raw) if isinstance(raw, str) and raw else {}
-            except Exception:
-                cfg = {}
-            cfg_rows.append(flatten_cfg(cfg))
+    for c in pdf.columns:
+        if pd.api.types.is_bool_dtype(pdf[c]):
+            pdf[c] = pdf[c].astype("int8")
+        elif pd.api.types.is_object_dtype(pdf[c]):
+            pdf[c] = pdf[c].astype("string")
 
-        cfg_df = pd.DataFrame(cfg_rows)
-        cfg_df = _dedupe_columns(cfg_df)
-
-        pdf = pd.concat([pdf.reset_index(drop=True), cfg_df.reset_index(drop=True)], axis=1)
-        pdf = _dedupe_columns(pdf)
+    json_cols = [c for c in ("cfg_json", "signal_json") if c in pdf.columns]
+    if json_cols:
+        pdf = _expand_json_columns(pdf, json_cols)
 
     if metric_bounds is None:
         metric_bounds = infer_metric_bounds(eval_df)
@@ -360,215 +480,8 @@ def build_training_frame(
 def _candidate_signature(cfg: Dict[str, Any]) -> str:
     return _stable_json(flatten_cfg(cfg))
 
-def _stoch_options_from_run_cfg(run_cfg: dict, incumbent_cfg: dict) -> List[Dict[str, Any]]:
-    ks = run_cfg.get("stoch_k", [12])
-    ds = run_cfg.get("stoch_d", [3])
-    ss = run_cfg.get("stoch_s", [3])
-    ths = run_cfg.get("stoch_thresholds", [[30, 70]])
-
-    if not isinstance(ks, (list, tuple)):
-        ks = [ks]
-    if not isinstance(ds, (list, tuple)):
-        ds = [ds]
-    if not isinstance(ss, (list, tuple)):
-        ss = [ss]
-    if not isinstance(ths, (list, tuple)):
-        ths = [ths]
-
-    out = []
-    for k in ks:
-        for d in ds:
-            for s in ss:
-                for th in ths:
-                    if not isinstance(th, (list, tuple)) or len(th) != 2:
-                        continue
-                    low = float(th[0])
-                    high = float(th[1])
-                    out.append({
-                        "use_stochastic": True,
-                        "stoch_k": int(k),
-                        "stoch_d": int(d),
-                        "stoch_s": int(s),
-                        "stoch_thresholds": [low, high],
-                        "stoch_key": f"k{int(k)}_d{int(d)}_s{int(s)}_l{low:g}_u{high:g}",
-                        "stoch_col": f"stoch_k{int(k)}_d{int(d)}_s{int(s)}",
-                        "stoch_lower": low,
-                        "stoch_upper": high,
-                    })
-
-    off = {
-        "use_stochastic": False,
-        "stoch_key": "OFF",
-        "stoch_col": None,
-        "stoch_lower": None,
-        "stoch_upper": None,
-    }
-
-    current_key = str(incumbent_cfg.get("stoch_key", "OFF") or "OFF")
-    out = sorted(out, key=lambda x: 0 if str(x["stoch_key"]) == current_key else 1)
-    return [off] + out
-
-def build_param_specs(run_cfg: dict, incumbent_cfg: dict, active_block: str) -> List[ParamSpec]:
-    """
-    Convert the active CCD block into a search specification list.
-
-    The spec list defines:
-    - which parameters are searchable
-    - whether each parameter is fixed, boolean, categorical, or numeric
-    - which values are legal inside the current config snapshot
-    """
-    coord_cfg = dict(run_cfg.get("coord_descent", {}) or {})
-    blocks = dict(coord_cfg.get("blocks") or {})
-    active_keys = list(blocks.get(active_block, []))
-
-    use_stochastic_vals = _explicit_bool_values(run_cfg.get("use_stochastic", incumbent_cfg.get("use_stochastic", False)))
-    use_bbw_vals = _explicit_bool_values(run_cfg.get("use_bbw", incumbent_cfg.get("use_bbw", False)))
-
-    stochastic_forced_off = len(use_stochastic_vals) == 1 and use_stochastic_vals[0] is False
-    bbw_forced_off = len(use_bbw_vals) == 1 and use_bbw_vals[0] is False
-
-    specs: List[ParamSpec] = []
-
-    for key in active_keys:
-        if key == "ma_int":
-            specs.append(ParamSpec(name="ma_int", kind="fixed"))
-            continue
-
-        if key == "stoch_key":
-            if stochastic_forced_off:
-                specs.append(ParamSpec(name="stoch_key", kind="fixed"))
-            else:
-                opts = _stoch_options_from_run_cfg(run_cfg, incumbent_cfg)
-                choices = [o["stoch_key"] for o in opts if o["stoch_key"] != "OFF"]
-                if "OFF" not in choices:
-                    choices = ["OFF"] + choices
-                specs.append(ParamSpec(name="stoch_key", kind="choice", choices=choices))
-            continue
-
-        if key in {"use_stochastic", "use_bbw", "use_trailing_sl", "trailing_sl_stop_at_pos", "use_limit_entry", "ma_reversion"}:
-            raw = run_cfg.get(key, incumbent_cfg.get(key))
-            vals = _explicit_bool_values(raw)
-            if len(vals) <= 1:
-                specs.append(ParamSpec(name=key, kind="fixed"))
-            else:
-                specs.append(ParamSpec(name=key, kind="choice", choices=vals))
-            continue
-
-        if key in {"bbw_periods", "bbw_std", "bbw_thresholds"} and bbw_forced_off:
-            specs.append(ParamSpec(name=key, kind="fixed"))
-            continue
-
-        if key == "SL":
-            r = run_cfg.get("sl_range", {})
-            if isinstance(r, dict) and "min" in r and "max" in r:
-                specs.append(
-                    ParamSpec(
-                        name=key,
-                        kind="float",
-                        low=float(r["min"]),
-                        high=float(r["max"]),
-                        step=float(r.get("step", 0.0) or 0.0),
-                    )
-                )
-            else:
-                specs.append(ParamSpec(name=key, kind="fixed"))
-            continue
-
-        if key == "TP":
-            r = run_cfg.get("tp_range", {})
-            if isinstance(r, dict) and "min" in r and "max" in r:
-                specs.append(
-                    ParamSpec(
-                        name=key,
-                        kind="float",
-                        low=float(r["min"]),
-                        high=float(r["max"]),
-                        step=float(r.get("step", 0.0) or 0.0),
-                    )
-                )
-            else:
-                specs.append(ParamSpec(name=key, kind="fixed"))
-            continue
-
-        raw = run_cfg.get(key, incumbent_cfg.get(key))
-
-        if isinstance(raw, dict) and "min" in raw and "max" in raw:
-            is_int = all(isinstance(raw.get(x), int) for x in ("min", "max")) and not any(
-                isinstance(raw.get(x), float) for x in ("min", "max")
-            )
-            specs.append(
-                ParamSpec(
-                    name=key,
-                    kind="int" if is_int else "float",
-                    low=float(raw["min"]),
-                    high=float(raw["max"]),
-                    step=float(raw.get("step", 0.0) or 0.0),
-                )
-            )
-            continue
-
-        if isinstance(raw, (list, tuple)):
-            flat = list(raw)
-            if len(flat) == 2 and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in flat):
-                kind = "int" if all(isinstance(x, int) for x in flat) else "float"
-                specs.append(ParamSpec(name=key, kind=kind, low=float(flat[0]), high=float(flat[1]), step=0.0))
-            else:
-                specs.append(ParamSpec(name=key, kind="choice", choices=flat))
-            continue
-
-        if isinstance(raw, bool):
-            specs.append(ParamSpec(name=key, kind="fixed"))
-            continue
-
-        if isinstance(raw, (int, float)):
-            specs.append(ParamSpec(name=key, kind="fixed"))
-            continue
-
-        specs.append(ParamSpec(name=key, kind="fixed"))
-
-    return specs
-
-def _load_coord_state(session_dir: str | Path) -> dict:
-    path = Path(session_dir) / STATE_FILE_NAME
-    if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf8"))
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-
-def _resolve_search_scale(run_cfg: dict, state: dict) -> float:
-    """
-    Search scale is the local/global width of the surrogate probing step.
-
-    Smaller scale:
-      - tighter local moves around the incumbent
-      - more exploitation
-
-    Larger scale:
-      - wider moves around the incumbent
-      - more exploration
-    """
-    coord_cfg = dict(run_cfg.get("coord_descent", {}) or {})
-    start = float(coord_cfg.get("search_scale_start", 1.0) or 1.0)
-    raw = state.get("search_scale", start)
-    try:
-        scale = float(raw)
-    except Exception:
-        scale = start
-    return float(max(0.10, min(10.0, scale)))
-
 
 def _explicit_bool_values(value: Any) -> List[bool]:
-    """
-    Normalize config inputs into an explicit boolean option list.
-
-    Important CCD rule:
-    - if the user config only allows false, then the search should NOT invent true
-    - if the user config explicitly allows both [false, true], then the search may probe both
-    """
     if isinstance(value, (list, tuple)):
         out: List[bool] = []
         for x in value:
@@ -584,154 +497,205 @@ def _explicit_bool_values(value: Any) -> List[bool]:
 
 
 def _normalize_incumbent_for_search(run_cfg: dict, incumbent_cfg: dict) -> dict:
+    return deepcopy(incumbent_cfg or {})
+
+
+def _range_to_values(node: Any) -> list[Any]:
+    if not isinstance(node, dict):
+        return []
+
+    if "values" in node and isinstance(node["values"], (list, tuple)):
+        return list(node["values"])
+
+    lo = node.get("min", node.get("low", None))
+    hi = node.get("max", node.get("high", None))
+    step = node.get("step", None)
+
+    if lo is None or hi is None:
+        return []
+
+    try:
+        lo_f = float(lo)
+        hi_f = float(hi)
+        step_f = float(step) if step is not None else None
+    except Exception:
+        return []
+
+    if step_f is None or step_f <= 0:
+        return [lo_f, hi_f] if lo_f != hi_f else [lo_f]
+
+    vals: list[float] = []
+    cur = lo_f
+    eps = abs(step_f) * 1e-9 + 1e-12
+    while cur <= hi_f + eps:
+        vals.append(round(cur, 12))
+        cur += step_f
+    return vals
+
+
+def _trade_param_range(run_cfg: dict, key: str) -> list[Any]:
     """
-    Make the incumbent safe for candidate generation.
+    Map block keys to explicit range values.
 
-    This is where we prevent the generator from inventing options that are not
-    allowed by the config snapshot.
-
-    Examples:
-    - ma_periods empty / [0] => ma_int must stay 0
-    - use_stochastic=[false] => never generate true candidates
-    - use_bbw=[false] => never generate true candidates
+    This is what lets you define:
+      limit_order_expiry_bars: [3, 36]
+    or:
+      limit_order_expiry_bars: {min: 3, max: 36, step: 3}
+    and have the surrogate treat it as a real search dimension.
     """
-    base = deepcopy(incumbent_cfg or {})
+    range_map = {
+        "SL": "sl_range",
+        "TP": "tp_range",
+        "limit_order_expiry_bars": "limit_order_expiry_bars",
+        "trade_window_interval": "trade_window_interval",
+        "exit_window_h": "exit_windows_h",
+        "trailing_sl_pct": "trailing_sl_pct",
+    }
 
-    ma_periods = run_cfg.get("ma_periods", None)
-    has_ma = False
-    if isinstance(ma_periods, (list, tuple)):
-        for x in ma_periods:
-            try:
-                if float(x) > 0:
-                    has_ma = True
-                    break
-            except Exception:
+    src = range_map.get(key)
+    if src is None:
+        return []
+
+    node = run_cfg.get(src, None)
+
+    if isinstance(node, dict):
+        return _range_to_values(node)
+
+    if isinstance(node, (list, tuple)):
+        out = []
+        for x in node:
+            if isinstance(x, (int, float, np.integer, np.floating)) and not isinstance(x, bool):
+                out.append(x.item() if hasattr(x, "item") else x)
+            elif isinstance(x, bool):
+                out.append(bool(x))
+        return out
+
+    return []
+
+
+def _value_options_for_path(run_cfg: dict, incumbent_cfg: dict, path: tuple[str, ...]) -> list[Any]:
+    run_v = _path_get(run_cfg, path, None)
+    inc_v = _path_get(incumbent_cfg, path, None)
+
+    if path and path[-1] == "enabled":
+        vals = _explicit_bool_values(run_v if run_v is not None else inc_v)
+        return vals if vals else [False, True]
+
+    if path and path[-1] == "combine":
+        if isinstance(run_v, (list, tuple)):
+            return [str(x).strip().lower() for x in run_v if str(x).strip()]
+        if isinstance(inc_v, (list, tuple)):
+            return [str(x).strip().lower() for x in inc_v if str(x).strip()]
+        return [run_v if run_v is not None else inc_v] if (run_v is not None or inc_v is not None) else []
+
+    if path:
+        ranged = _trade_param_range(run_cfg, str(path[-1]))
+        if ranged:
+            return ranged
+
+    if isinstance(run_v, (list, tuple)):
+        return list(run_v)
+    if isinstance(inc_v, (list, tuple)):
+        return list(inc_v)
+
+    if isinstance(run_v, bool) or isinstance(inc_v, bool):
+        return _explicit_bool_values(run_v if run_v is not None else inc_v)
+
+    if _is_num_scalar(run_v) or _is_num_scalar(inc_v):
+        return [run_v if run_v is not None else inc_v]
+
+    if run_v is not None:
+        return [run_v]
+    if inc_v is not None:
+        return [inc_v]
+    return []
+
+
+def build_param_specs(run_cfg: dict, incumbent_cfg: dict, active_block: str) -> List[ParamSpec]:
+    coord_cfg = dict(run_cfg.get("coord_descent", {}) or {})
+    blocks = dict(coord_cfg.get("blocks") or {})
+    active_keys = list(blocks.get(active_block, []))
+
+    specs: List[ParamSpec] = []
+
+    if active_block == "signal_structure":
+        signal_block = _path_get(run_cfg, ("signal_structure",), {})
+        if not isinstance(signal_block, dict):
+            signal_block = {}
+
+        for family_name, family_node in signal_block.items():
+            if family_name not in active_keys and active_keys != ["signal_json"]:
                 continue
-    elif ma_periods is not None:
-        try:
-            has_ma = float(ma_periods) > 0
-        except Exception:
-            has_ma = False
+            if not isinstance(family_node, dict):
+                continue
 
-    if not has_ma:
-        base["ma_int"] = 0
-        base["ma_reversion"] = False
+            # Only the leaf settings matter to the surrogate. This keeps the search
+            # aligned with how the signal builder actually consumes the config.
+            for leaf_path, leaf_value in _iter_leaf_paths(family_node, prefix=("signal_structure", family_name)):
+                if leaf_path[-1] == "timeframes":
+                    continue
 
-    use_stoch_vals = _explicit_bool_values(run_cfg.get("use_stochastic", base.get("use_stochastic", False)))
-    if len(use_stoch_vals) == 1 and use_stoch_vals[0] is False:
-        base["use_stochastic"] = False
-        base["stoch_key"] = "OFF"
-        base["stoch_col"] = None
-        base["stoch_lower"] = None
-        base["stoch_upper"] = None
+                vals = _value_options_for_path(run_cfg, incumbent_cfg, leaf_path)
+                if isinstance(leaf_value, dict) or not vals:
+                    continue
 
-    use_bbw_vals = _explicit_bool_values(run_cfg.get("use_bbw", base.get("use_bbw", False)))
-    if len(use_bbw_vals) == 1 and use_bbw_vals[0] is False:
-        base["use_bbw"] = False
-        base["bbw_periods"] = 0
-        base["bbw_std"] = 0.0
-        base["bbw_thresholds"] = 0
+                cur = _path_get(incumbent_cfg, leaf_path, None)
+                if isinstance(cur, bool) or any(isinstance(v, bool) for v in vals):
+                    kind = "choice" if len(vals) > 1 else "fixed"
+                    specs.append(ParamSpec(path=leaf_path, kind=kind, choices=vals))
+                    continue
 
-    return base
+                if all(_is_num_scalar(v) for v in vals):
+                    kind = "choice" if len(vals) > 1 else "fixed"
+                    specs.append(ParamSpec(path=leaf_path, kind=kind, choices=vals))
+                    continue
+
+                specs.append(ParamSpec(path=leaf_path, kind="choice", choices=vals))
+
+        return specs
+
+    for key in active_keys:
+        path = (key,)
+        vals = _value_options_for_path(run_cfg, incumbent_cfg, path)
+        if not vals:
+            continue
+
+        if all(isinstance(v, bool) for v in vals):
+            kind = "choice" if len(vals) > 1 else "fixed"
+            specs.append(ParamSpec(path=path, kind=kind, choices=vals))
+        elif all(_is_num_scalar(v) for v in vals):
+            kind = "choice" if len(vals) > 1 else "fixed"
+            specs.append(ParamSpec(path=path, kind=kind, choices=vals))
+        else:
+            specs.append(ParamSpec(path=path, kind="choice", choices=vals))
+
+    return specs
 
 
 def _probe_values(spec: ParamSpec, current: Any, search_scale: float = 1.0) -> List[Any]:
-    """
-    Produce a compact ordered probe set for one parameter.
-
-    Probes are created before any new backtest is run.
-    The surrogate only ranks these probes; it does not produce the true score.
-    """
-    scale = float(max(0.10, min(float(search_scale), 10.0)))
-
     if spec.kind == "fixed":
         return [current]
-
-    if spec.kind == "bool":
-        vals = [bool(current)] if current is not None else []
-        vals.extend([False, True])
-        out = []
-        seen = set()
-        for v in vals:
-            b = bool(v)
-            if b not in seen:
-                seen.add(b)
-                out.append(b)
-        return out
 
     if spec.kind == "choice":
         vals = list(spec.choices or [])
         if not vals:
             return [current]
-
         if current is not None and current in vals:
             ordered = [current] + [v for v in vals if v != current]
         else:
             ordered = vals[:]
-
-        if scale <= 0.75 and len(ordered) > 2:
+        if search_scale <= 0.75 and len(ordered) > 2:
             return ordered[:2]
-        if scale <= 1.25 and len(ordered) > 4:
+        if search_scale <= 1.25 and len(ordered) > 4:
             return ordered[:4]
         return ordered
-
-    if spec.kind == "int" and spec.low is not None and spec.high is not None:
-        lo = int(math.floor(spec.low))
-        hi = int(math.ceil(spec.high))
-        if hi < lo:
-            return [current if current is not None else lo]
-
-        vals = list(range(lo, hi + 1))
-        if current is not None and current in vals:
-            vals.remove(current)
-            return [current] + vals
-        return vals
-
-    if spec.kind == "float" and spec.low is not None and spec.high is not None:
-        lo = float(spec.low)
-        hi = float(spec.high)
-        if hi <= lo:
-            return [current if current is not None else lo]
-
-        span = hi - lo
-        mid = (lo + hi) / 2.0
-        local = 0.12 * span * scale
-
-        raw_vals = [
-            current,
-            mid,
-            lo,
-            hi,
-            mid - local,
-            mid + local,
-        ]
-
-        out = []
-        seen = set()
-        for v in raw_vals:
-            v = float(np.clip(v, lo, hi))
-            if v not in seen:
-                seen.add(v)
-                out.append(v)
-        return out
 
     return [current]
 
 
 def _sample_value(spec: ParamSpec, rng: np.random.Generator, current: Any, search_scale: float = 1.0) -> Any:
-    """
-    Random local sampling around the incumbent.
-
-    The returned value is still only a candidate. The real evaluation comes from
-    the backtest stage.
-    """
-    scale = float(max(0.10, min(float(search_scale), 10.0)))
-
     if spec.kind == "fixed":
         return current
-
-    if spec.kind == "bool":
-        return bool(rng.integers(0, 2))
 
     if spec.kind == "choice":
         vals = list(spec.choices or [])
@@ -739,102 +703,61 @@ def _sample_value(spec: ParamSpec, rng: np.random.Generator, current: Any, searc
             return current
         if current is not None and current in vals and len(vals) > 1:
             idx = vals.index(current)
-            step = int(rng.integers(1, min(len(vals), 1 + int(round(scale * 2)))))
+            step = int(rng.integers(1, min(len(vals), 1 + int(round(search_scale * 2)))))
             return vals[(idx + step) % len(vals)]
         return vals[int(rng.integers(0, len(vals)))]
-
-    if spec.kind == "int" and spec.low is not None and spec.high is not None:
-        lo = int(math.floor(spec.low))
-        hi = int(math.ceil(spec.high))
-        if hi < lo:
-            return int(current) if current is not None else lo
-
-        if current is None:
-            return int(rng.integers(lo, hi + 1))
-
-        cur = int(current)
-        span = max(1, hi - lo)
-        sigma = max(1.0, span * 0.15 * scale)
-        v = int(round(rng.normal(cur, sigma)))
-        return int(np.clip(v, lo, hi))
-
-    if spec.kind == "float" and spec.low is not None and spec.high is not None:
-        lo = float(spec.low)
-        hi = float(spec.high)
-        if hi <= lo:
-            return float(current) if current is not None else lo
-
-        if current is None:
-            if spec.log and lo > 0 and hi > 0:
-                return float(np.exp(rng.uniform(np.log(lo), np.log(hi))))
-            return float(rng.uniform(lo, hi))
-
-        cur = float(current)
-        span = hi - lo
-        sigma = max(1e-9, span * 0.15 * scale)
-        v = float(rng.normal(cur, sigma))
-        return float(np.clip(v, lo, hi))
 
     return current
 
 
-def _joint_probe_candidates(
+def _bootstrap_probe_candidates(
+    base: Dict[str, Any],
     specs: List[ParamSpec],
-    base: dict,
-    search_scale: float,
-    n_candidates: int,
-    rng: np.random.Generator,
-    max_joint_moves: int = 3,
-) -> List[dict]:
+    active_block: str,
+    seed: Optional[int] = None,
+    n_random: int = SURROGATE_BOOTSTRAP_RANDOM,
+) -> List[Dict[str, Any]]:
     """
-    Generate coordinated probes that move multiple parameters together.
+    Bootstrap phase = very small, controlled diversity before the surrogate has
+    enough history to be meaningful.
 
-    This is the piece that makes the search more than a plain one-at-a-time grid.
-    It tries to discover simple "slope-like" directions:
-    for example, if changing SL together with trailing settings looks promising,
-    we want to test that as a combined move instead of only isolated moves.
+    This intentionally does not explore too aggressively. It creates just enough
+    variation to avoid getting locked to the seed.
     """
-    varying_specs = [s for s in specs if s.kind != "fixed"]
-    if len(varying_specs) < 2:
-        return []
+    rng = np.random.default_rng(seed if seed is not None else 12345)
+    out: List[Dict[str, Any]] = []
+    seen: set[str] = set()
 
-    out: List[dict] = []
-    seen = set()
-
-    def add_cfg(cfg: dict) -> None:
+    def add_cfg(cfg: Dict[str, Any]) -> None:
         sig = _candidate_signature(cfg)
         if sig in seen:
             return
         seen.add(sig)
         cfg = deepcopy(cfg)
         cfg["_candidate_sig"] = sig
+        cfg["_active_block"] = active_block
         out.append(cfg)
 
-    max_joint_moves = max(2, int(max_joint_moves))
-    joint_budget = max(12, int(n_candidates) // 2)
+    add_cfg(base)
 
-    for _ in range(joint_budget):
+    for spec in specs[: min(len(specs), 6)]:
+        vals = list(spec.choices or [])
+        for v in vals[:2]:
+            cfg = deepcopy(base)
+            _path_set(cfg, spec.path, v)
+            add_cfg(cfg)
+
+    for _ in range(max(0, int(n_random))):
         cfg = deepcopy(base)
-
-        k = int(rng.integers(2, min(max_joint_moves, len(varying_specs)) + 1))
-        chosen_idx = rng.choice(len(varying_specs), size=k, replace=False)
-
-        for idx in np.atleast_1d(chosen_idx):
-            spec = varying_specs[int(idx)]
-            current = cfg.get(spec.name)
-            vals = _probe_values(spec, current, search_scale)
-            if not vals:
+        moved = 0
+        for spec in specs:
+            if moved >= 2 and rng.random() < 0.75:
                 continue
-
-            if spec.kind in {"float", "int"}:
-                near = [v for v in vals if v != current]
-                if near:
-                    cfg[spec.name] = near[int(rng.integers(0, len(near)))]
-                else:
-                    cfg[spec.name] = vals[int(rng.integers(0, len(vals)))]
-            else:
-                cfg[spec.name] = vals[int(rng.integers(0, len(vals)))]
-
+            cur = _path_get(cfg, spec.path, None)
+            new_val = _sample_value(spec, rng, cur, search_scale=0.85)
+            if new_val != cur:
+                _path_set(cfg, spec.path, new_val)
+                moved += 1
         add_cfg(cfg)
 
     return out
@@ -849,20 +772,6 @@ def generate_probe_candidates(
     search_scale: Optional[float] = None,
     joint_probe_max_moves: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
-    """
-    Build the candidate pool for the current active block.
-
-    Important mental model:
-    - This happens before backtest.
-    - It does NOT know the real balance/drawdown/win rate yet.
-    - It only builds a search set around the incumbent.
-    - The surrogate ranks these candidates based on history.
-    - The backtest returns the real score_loss used to update CCD state.
-
-    n_candidates is per active block call.
-    So yes, if the active block is trade_management, these are trade_management candidates.
-    If the active block is execution, the candidate pool is for execution.
-    """
     rng = np.random.default_rng(seed if seed is not None else 12345)
     specs = build_param_specs(run_cfg, incumbent_cfg, active_block)
 
@@ -877,14 +786,6 @@ def generate_probe_candidates(
         float(coord_cfg.get("search_scale_min", 0.35) or 0.35),
         min(scale, float(coord_cfg.get("search_scale_max", 2.0) or 2.0)),
     ))
-
-    max_moves = int(
-        joint_probe_max_moves
-        if joint_probe_max_moves is not None
-        else coord_cfg.get("joint_probe_max_moves", 3)
-        or 3
-    )
-    max_moves = max(1, min(max_moves, max(1, len(specs))))
 
     base = _normalize_incumbent_for_search(run_cfg, incumbent_cfg)
     candidates: List[Dict[str, Any]] = []
@@ -901,112 +802,202 @@ def generate_probe_candidates(
         out["_search_scale"] = float(scale)
         candidates.append(out)
 
-    # Always include the incumbent first.
-    # This gives the surrogate and the backtest a stable baseline.
     add_cfg(base)
 
-    # One-parameter probes: isolate the effect of each parameter.
     for spec in specs:
-        current = base.get(spec.name)
+        current = _path_get(base, spec.path, None)
         for value in _probe_values(spec, current, search_scale=scale):
             cfg = deepcopy(base)
-            cfg[spec.name] = value
+            _path_set(cfg, spec.path, value)
             add_cfg(cfg)
 
-    # Joint probes: move multiple parameters together.
-    # This is useful when the useful direction is not axis-aligned.
-    movable_specs = [s for s in specs if s.kind != "fixed"]
-    if movable_specs:
-        priority = {"float": 0, "int": 1, "choice": 2, "bool": 3}
-        movable_specs = sorted(movable_specs, key=lambda s: (priority.get(s.kind, 9), s.name))
-        joint_specs = movable_specs[:max_moves]
-
-        def directional_value(spec: ParamSpec, current: Any, direction: int) -> Any:
-            if spec.kind in {"float", "int"} and spec.low is not None and spec.high is not None:
-                lo = float(spec.low)
-                hi = float(spec.high)
-                span = max(hi - lo, 1e-9)
-                try:
-                    cur = float(current)
-                except Exception:
-                    cur = (lo + hi) / 2.0
-
-                frac = 0.18 * scale
-                step = span * frac
-                if direction < 0:
-                    v = cur - step
-                else:
-                    v = cur + step
-
-                v = float(np.clip(v, lo, hi))
-                if spec.kind == "int":
-                    v = int(round(v))
-                return v
-
-            if spec.kind == "choice":
-                vals = list(spec.choices or [])
-                if not vals:
-                    return current
-                if current in vals:
-                    idx = vals.index(current)
-                else:
-                    idx = 0
-                if direction < 0:
-                    return vals[max(0, idx - 1)]
-                return vals[min(len(vals) - 1, idx + 1)]
-
-            if spec.kind == "bool":
-                return not bool(current)
-
-            return current
-
-        for move_count in range(2, max_moves + 1):
-            chosen_specs = joint_specs[:move_count]
-            if len(chosen_specs) < 2:
-                break
-
-            cfg_plus = deepcopy(base)
-            cfg_minus = deepcopy(base)
-
-            for spec in chosen_specs:
-                cur = base.get(spec.name)
-                v_plus = directional_value(spec, cur, +1)
-                v_minus = directional_value(spec, cur, -1)
-
-                if v_plus != cur:
-                    cfg_plus[spec.name] = v_plus
-                if v_minus != cur:
-                    cfg_minus[spec.name] = v_minus
-
-            add_cfg(cfg_plus)
-            add_cfg(cfg_minus)
-
-    # Random local joint probes until the pool is big enough.
     max_needed = max(int(n_candidates), 1)
     safety = max_needed * 12
     tries = 0
-
     while len(candidates) < max_needed and tries < safety:
         tries += 1
         cfg = deepcopy(base)
         moved = 0
 
         for spec in specs:
-            if spec.kind == "fixed":
+            if moved >= 3 and rng.random() < 0.70:
                 continue
-
-            if moved >= max_moves and rng.random() < 0.70:
-                continue
-
-            cur = cfg.get(spec.name)
+            cur = _path_get(cfg, spec.path, None)
             new_val = _sample_value(spec, rng, cur, search_scale=scale)
             if new_val != cur:
-                cfg[spec.name] = new_val
+                _path_set(cfg, spec.path, new_val)
                 moved += 1
 
         add_cfg(cfg)
 
     return candidates[:max_needed]
+
+
+def _compact_history_for_block(
+    history_df: pl.DataFrame,
+    active_block: str,
+    limit: int = SURROGATE_HISTORY_LIMIT,
+) -> pl.DataFrame:
+    if history_df is None or history_df.is_empty():
+        return pl.DataFrame([], schema=get_schema("ccd_eval"))
+
+    df = history_df
+
+    if "block_name" in df.columns:
+        try:
+            df = df.filter(pl.col("block_name") == str(active_block))
+        except Exception:
+            pass
+
+    if df.is_empty():
+        return pl.DataFrame([], schema=get_schema("ccd_eval"))
+
+    sort_cols = [c for c in ("created_at", "era_int", "candidate_rank") if c in df.columns]
+    if sort_cols:
+        try:
+            df = df.sort(sort_cols)
+        except Exception:
+            pass
+
+    if "candidate_sig" in df.columns:
+        try:
+            df = df.unique(subset=["candidate_sig"], keep="last")
+        except Exception:
+            pass
+
+    if df.height > int(limit):
+        df = df.tail(int(limit))
+
+    return df
+
+
+def rank_candidates_with_surrogate(
+    history_df: pl.DataFrame,
+    candidate_cfgs: List[Dict[str, Any]],
+    active_block: str,
+    weights: Optional[Dict[str, float]] = None,
+    top_k: int = 10,
+) -> List[Dict[str, Any]]:
+    """
+    Rank candidate configs using historical surrogate memory when possible.
+
+    Decision flow:
+    1) exact history match first
+    2) if enough history exists, train a small surrogate
+    3) otherwise keep a diverse, deterministic fallback order
+    """
+    if not candidate_cfgs:
+        return []
+
+    top_k = max(1, int(top_k or 1))
+    candidates = [deepcopy(c) for c in candidate_cfgs]
+
+    train_pdf = pd.DataFrame()
+    if history_df is not None and not history_df.is_empty():
+        hist = history_df
+        if "block_name" in hist.columns:
+            try:
+                hist = hist.filter(pl.col("block_name") == str(active_block))
+            except Exception:
+                pass
+        train_pdf = build_training_frame(hist, weights=weights)
+
+    history_loss_by_sig: dict[str, float] = {}
+    if not train_pdf.empty and "candidate_sig" in train_pdf.columns and "score_loss" in train_pdf.columns:
+        tmp = train_pdf[["candidate_sig", "score_loss"]].copy()
+        tmp = tmp.dropna(subset=["candidate_sig", "score_loss"])
+        for sig, grp in tmp.groupby("candidate_sig"):
+            try:
+                best_loss = float(np.nanmin(grp["score_loss"].astype(float).to_numpy()))
+                history_loss_by_sig[str(sig)] = best_loss
+            except Exception:
+                continue
+
+    def _candidate_row(cfg: Dict[str, Any]) -> Dict[str, Any]:
+        row = flatten_cfg(cfg)
+        row["candidate_sig"] = _candidate_signature(cfg)
+        return row
+
+    cand_rows = [_candidate_row(cfg) for cfg in candidates]
+    cand_pdf = pd.DataFrame(cand_rows)
+
+    # Not enough history to train a meaningful model.
+    if train_pdf.empty or "score_loss" not in train_pdf.columns or train_pdf.shape[0] < SURROGATE_MIN_TRAIN_ROWS:
+        scored = []
+        for idx, cfg in enumerate(candidates):
+            row = cand_rows[idx]
+            sig = str(row.get("candidate_sig", ""))
+            loss = history_loss_by_sig.get(sig, float("inf"))
+            new_cfg = deepcopy(cfg)
+            new_cfg["_surrogate_score_loss"] = float(loss if np.isfinite(loss) else idx)
+            new_cfg["_surrogate_score"] = float(-new_cfg["_surrogate_score_loss"])
+            scored.append(new_cfg)
+
+        scored.sort(key=lambda x: x.get("_surrogate_score_loss", float("inf")))
+        return scored[:top_k]
+
+    # Small model only. RandomForest is stable and works even when features are messy.
+    try:
+        train_X = train_pdf.drop(columns=["score_loss"], errors="ignore")
+        train_y = train_pdf["score_loss"].astype(float)
+
+        drop_cols = [c for c in ("created_at",) if c in train_X.columns]
+        if drop_cols:
+            train_X = train_X.drop(columns=drop_cols, errors="ignore")
+
+        combined = pd.concat([train_X, cand_pdf], axis=0, ignore_index=True)
+        combined = combined.replace([np.inf, -np.inf], np.nan)
+        combined = pd.get_dummies(combined, dummy_na=True)
+
+        X_train = combined.iloc[: len(train_X)].fillna(0.0)
+        X_cand = combined.iloc[len(train_X):].fillna(0.0)
+
+        if HAS_SKLEARN:
+            model = RandomForestRegressor(
+                n_estimators=200,
+                random_state=42,
+                n_jobs=-1,
+                min_samples_leaf=2,
+            )
+            model.fit(X_train, train_y.to_numpy())
+            preds = model.predict(X_cand)
+        else:
+            preds = np.full(len(candidates), float(train_y.median()), dtype=np.float64)
+
+        out: List[Dict[str, Any]] = []
+        for cfg, pred, row in zip(candidates, preds, cand_rows):
+            sig = str(row.get("candidate_sig", ""))
+
+            new_cfg = deepcopy(cfg)
+            new_cfg["_surrogate_pred_loss"] = float(pred)
+            new_cfg["_surrogate_exact_loss"] = float(history_loss_by_sig.get(sig, np.nan)) if sig in history_loss_by_sig else None
+            out.append(new_cfg)
+
+        out.sort(
+            key=lambda x: (
+                x.get("_surrogate_exact_loss", float("inf"))
+                if x.get("_surrogate_exact_loss", None) is not None
+                else float("inf"),
+                x.get("_surrogate_pred_loss", float("inf")),
+            )
+        )
+        return out[:top_k]
+
+    except Exception:
+        # Hard fallback: exact history first, then deterministic order.
+        scored = []
+        for idx, cfg in enumerate(candidates):
+            row = cand_rows[idx]
+            sig = str(row.get("candidate_sig", ""))
+            loss = history_loss_by_sig.get(sig, float("inf"))
+            new_cfg = deepcopy(cfg)
+            new_cfg["_surrogate_score_loss"] = float(loss)
+            new_cfg["_surrogate_score"] = float(-loss if np.isfinite(loss) else -1e18)
+            scored.append(new_cfg)
+
+        scored.sort(key=lambda x: x.get("_surrogate_score_loss", float("inf")))
+        return scored[:top_k]
+
 
 def suggest_next_candidates(
     session_dir: str | Path,
@@ -1018,26 +1009,27 @@ def suggest_next_candidates(
     seed: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Full local-search pipeline:
-    1) load prior CCD evaluation history
-    2) build a block-specific candidate pool
-    3) train surrogate on real historical backtest outcomes
-    4) rank the new candidates by predicted score_loss
-    5) return only the top_k to backtest
+    Public entrypoint used by CCD config generation.
 
-    - surrogate = candidate filter / ranker
-    - backtest = truth source
+    This is the only place that should decide whether the run is in bootstrap
+    mode or in surrogate-guided mode.
     """
     session_dir = Path(session_dir)
-    history_df = load_ccd_eval_history(session_dir)
-
-    state = load_coord_descent_state(session_dir)
     coord_cfg = dict(run_cfg.get("coord_descent", {}) or {})
+
+    top_k = max(1, min(int(top_k or 1), int(n_candidates or 1)))
+    state = {}
+    state_path = session_dir / STATE_FILE_NAME
+    if state_path.exists():
+        try:
+            state = json.loads(state_path.read_text(encoding="utf8"))
+        except Exception:
+            state = {}
+
     search_scale = float(
         state.get("search_scale", coord_cfg.get("search_scale_start", 1.0) or 1.0)
         or 1.0
     )
-    joint_probe_max_moves = int(coord_cfg.get("joint_probe_max_moves", 3) or 3)
 
     probes = generate_probe_candidates(
         run_cfg=run_cfg,
@@ -1046,272 +1038,59 @@ def suggest_next_candidates(
         n_candidates=n_candidates,
         seed=seed,
         search_scale=search_scale,
-        joint_probe_max_moves=joint_probe_max_moves,
+        joint_probe_max_moves=int(coord_cfg.get("joint_probe_max_moves", 3) or 3),
     )
 
-    return rank_candidates_with_surrogate(
-        history_df=history_df,
-        candidate_cfgs=probes,
-        active_block=active_block,
-        weights=None,
-        top_k=top_k,
-    )
-
-
-def _candidate_frame(candidate_cfgs: Sequence[Dict[str, Any]], active_block: str) -> pd.DataFrame:
-    rows = []
-    for i, cfg in enumerate(candidate_cfgs):
-        flat = flatten_cfg(cfg)
-        row = dict(flat)
-        row["_candidate_idx"] = int(i)
-        row["_active_block"] = active_block
-        row["_candidate_sig"] = cfg.get("_candidate_sig", _candidate_signature(cfg))
-        rows.append(row)
-
-    if not rows:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(rows)
-    df = _normalize_types(df)
-    return df.replace([np.inf, -np.inf], np.nan)
-
-
-def fit_auto_surrogate(
-    history_df: pl.DataFrame,
-    weights: Optional[Dict[str, float]] = None,
-) -> Optional[Dict[str, Any]]:
-    train_df = build_training_frame(history_df, weights=weights)
-    if train_df.empty or len(train_df) < 12:
-        return None
-
-    target_col = "score_loss"
-    feature_cols = [c for c in train_df.columns if c != target_col]
-
-    numeric_cols = []
-    categorical_cols = []
-    for c in feature_cols:
-        if pd.api.types.is_numeric_dtype(train_df[c]) or pd.api.types.is_bool_dtype(train_df[c]):
-            numeric_cols.append(c)
-        else:
-            categorical_cols.append(c)
-
-    X = train_df[feature_cols].copy()
-    numeric_cols = _drop_all_null_cols(X, numeric_cols)
-    categorical_cols = _drop_all_null_cols(X, categorical_cols)
-
-    y = train_df[target_col].astype(np.float64).to_numpy()
-
-    if not np.isfinite(y).all():
-        mask = np.isfinite(y)
-        X = X.loc[mask].copy()
-        y = y[mask]
-
-    if y.size < 12 or np.nanstd(y) < 1e-12:
-        return None
-
-    n_rows = int(X.shape[0])
-    n_features = int(X.shape[1])
-    has_cat = len(categorical_cols) > 0
-
-    if HAS_SKLEARN and n_rows <= 250 and n_features <= 12 and not has_cat:
-        preprocess = ColumnTransformer(
-            [
-                ("num", Pipeline([
-                    ("imputer", SimpleImputer(strategy="median")),
-                    ("scale", StandardScaler()),
-                ]), numeric_cols),
-            ],
-            remainder="drop",
-        )
-        model = GaussianProcessRegressor(
-            kernel=ConstantKernel(1.0, (1e-3, 1e3)) * RBF(length_scale=1.0) + WhiteKernel(noise_level=1e-5),
-            normalize_y=True,
-            random_state=42,
-            n_restarts_optimizer=2,
-        )
-        pipe = Pipeline([("prep", preprocess), ("model", model)])
-        pipe.fit(X[numeric_cols], y)
-
-        return {
-            "kind": "gp",
-            "model": pipe,
-            "feature_cols": numeric_cols,
-            "numeric_cols": numeric_cols,
-            "categorical_cols": [],
-        }
-
-    if HAS_LGBM:
-        X_lgbm = X.copy()
-        X_lgbm = _dedupe_columns(X_lgbm)
-
-        feature_cols = [c for c in feature_cols if c in X_lgbm.columns]
-        numeric_cols = [c for c in numeric_cols if c in X_lgbm.columns]
-        categorical_cols = [c for c in categorical_cols if c in X_lgbm.columns]
-
-        for c in categorical_cols:
-            X_lgbm[c] = X_lgbm[c].astype("string").fillna("__NA__").astype("category")
-        for c in numeric_cols:
-            X_lgbm[c] = pd.to_numeric(X_lgbm[c], errors="coerce")
-
-        if categorical_cols:
-            for c in categorical_cols:
-                if str(X_lgbm[c].dtype) != "category":
-                    X_lgbm[c] = X_lgbm[c].astype("category")
-
-        model = LGBMRegressor(
-            n_estimators=300,
-            learning_rate=0.05,
-            num_leaves=31,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            random_state=42,
-            n_jobs=1,
-        )
-        model.fit(
-            X_lgbm[feature_cols],
-            y,
-            categorical_feature=categorical_cols if categorical_cols else "auto",
-        )
-        return {
-            "kind": "lgbm",
-            "model": model,
-            "feature_cols": feature_cols,
-            "numeric_cols": numeric_cols,
-            "categorical_cols": categorical_cols,
-        }
-
-    if HAS_SKLEARN:
-        preprocess = ColumnTransformer(
-            [
-                ("num", Pipeline([
-                    ("imputer", SimpleImputer(strategy="median")),
-                ]), numeric_cols),
-                ("cat", Pipeline([
-                    ("imputer", SimpleImputer(strategy="most_frequent")),
-                    ("onehot", _one_hot_encoder()),
-                ]), categorical_cols),
-            ],
-            remainder="drop",
-        )
-        model = RandomForestRegressor(
-            n_estimators=300,
-            random_state=42,
-            n_jobs=1,
-            min_samples_leaf=2,
-        )
-        pipe = Pipeline([("prep", preprocess), ("model", model)])
-        pipe.fit(X[feature_cols], y)
-        return {
-            "kind": "rf",
-            "model": pipe,
-            "feature_cols": feature_cols,
-            "numeric_cols": numeric_cols,
-            "categorical_cols": categorical_cols,
-        }
-
-    return None
-
-
-def _predict_bundle(bundle: Dict[str, Any], cand_df: pd.DataFrame) -> np.ndarray:
-    if bundle is None or cand_df.empty:
-        return np.zeros((0,), dtype=np.float64)
-
-    feature_cols = list(bundle["feature_cols"])
-    kind = str(bundle["kind"])
-    model = bundle["model"]
-
-    X = cand_df.copy()
-    X = _dedupe_columns(X)
-
-    for c in feature_cols:
-        if c not in X.columns:
-            X[c] = np.nan
-
-    X = X[feature_cols].copy()
-    X = _normalize_types(X)
-
-    if kind == "gp":
-        pred = model.predict(X[bundle["numeric_cols"]])
-        return np.asarray(pred, dtype=np.float64)
-
-    if kind == "lgbm":
-        for c in bundle["categorical_cols"]:
-            if c in X.columns:
-                X[c] = X[c].astype("string").fillna("__NA__").astype("category")
-        pred = model.predict(X[feature_cols])
-        return np.asarray(pred, dtype=np.float64)
-
-    pred = model.predict(X[feature_cols])
-    return np.asarray(pred, dtype=np.float64)
-
-
-def rank_candidates_with_surrogate(
-    history_df: pl.DataFrame,
-    candidate_cfgs: Sequence[Dict[str, Any]],
-    active_block: str,
-    weights: Optional[Dict[str, float]] = None,
-    top_k: Optional[int] = None,
-) -> List[Dict[str, Any]]:
-    if not candidate_cfgs:
+    if not probes:
         return []
 
-    cand_df = _candidate_frame(candidate_cfgs, active_block=active_block)
-    if cand_df.empty:
-        return list(candidate_cfgs)
-
-    bundle = fit_auto_surrogate(history_df, weights=weights)
-
-    if bundle is None:
-        # simple fallback: keep existing order
-        ranked = cand_df.copy()
-        ranked["_pred_loss"] = 0.0
-    else:
-        try:
-            ranked = cand_df.copy()
-            ranked["_pred_loss"] = _predict_bundle(bundle, ranked)
-        except Exception:
-            ranked = cand_df.copy()
-            ranked["_pred_loss"] = 0.0
-
-    ranked = ranked.sort_values(["_pred_loss", "_candidate_idx"], ascending=[True, True])
-
-    if top_k is None:
-        top_k = len(candidate_cfgs)
-    top_k = max(1, int(top_k))
-
-    out: List[Dict[str, Any]] = []
-    for _, row in ranked.head(top_k).iterrows():
-        idx = int(row["_candidate_idx"])
-        cfg = deepcopy(candidate_cfgs[idx])
-        cfg["_surrogate_pred_loss"] = float(row["_pred_loss"])
-        cfg["_surrogate_rank"] = len(out) + 1
-        out.append(cfg)
-
-    return out
-
-
-def suggest_next_candidates(
-    session_dir: str | Path,
-    run_cfg: dict,
-    incumbent_cfg: dict,
-    active_block: str,
-    n_candidates: int = 40,
-    top_k: int = 10,
-    seed: Optional[int] = None,
-) -> List[Dict[str, Any]]:
-    session_dir = Path(session_dir)
     history_df = load_ccd_eval_history(session_dir)
-    probes = generate_probe_candidates(
-        run_cfg=run_cfg,
-        incumbent_cfg=incumbent_cfg,
-        active_block=active_block,
-        n_candidates=n_candidates,
-        seed=seed,
-    )
-    return rank_candidates_with_surrogate(
+    if history_df is None or history_df.is_empty():
+        return probes[:top_k]
+
+    compact_hist = _compact_history_for_block(
         history_df=history_df,
+        active_block=active_block,
+        limit=int(coord_cfg.get("surrogate_history_limit", SURROGATE_HISTORY_LIMIT) or SURROGATE_HISTORY_LIMIT),
+    )
+
+    if compact_hist.is_empty():
+        return probes[:top_k]
+
+    try:
+        train_pdf = build_training_frame(compact_hist, weights=None)
+    except Exception:
+        train_pdf = pd.DataFrame()
+
+    # Bootstrap phase: when there is not enough usable history, return a small
+    # diverse set quickly instead of trying to fit a weak model.
+    if train_pdf.empty or train_pdf.shape[0] < SURROGATE_MIN_TRAIN_ROWS:
+        scored = []
+        for idx, cfg in enumerate(probes):
+            new_cfg = deepcopy(cfg)
+            new_cfg["_surrogate_score_loss"] = float(idx)
+            new_cfg["_surrogate_score"] = float(-idx)
+            scored.append(new_cfg)
+        return scored[:top_k]
+
+    return rank_candidates_with_surrogate(
+        history_df=compact_hist,
         candidate_cfgs=probes,
         active_block=active_block,
         weights=None,
         top_k=top_k,
     )
+
+
+__all__ = [
+    "make_ccd_eval_row",
+    "stage_ccd_eval_rows",
+    "load_ccd_eval_history",
+    "build_training_frame",
+    "scalarize_winner_score",
+    "suggest_next_candidates",
+    "generate_probe_candidates",
+    "rank_candidates_with_surrogate",
+    "infer_metric_bounds",
+    "flatten_cfg",
+]

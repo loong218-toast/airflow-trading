@@ -1,3 +1,5 @@
+# research/ccd.py
+
 from __future__ import annotations
 
 import math
@@ -29,15 +31,10 @@ DEFAULT_BLOCK_ORDER = [
 
 DEFAULT_BLOCKS = {
     "signal_structure": [
-        "ma_int",
-        "ma_reversion",
-        "entry_lookback_units",
-        "use_stochastic",
-        "stoch_key",
-        "use_bbw",
-        "bbw_periods",
-        "bbw_std",
-        "bbw_thresholds",
+        "ma",
+        "stochastic",
+        "lookback",
+        "bbw",
     ],
     "trade_management": [
         "SL",
@@ -49,7 +46,7 @@ DEFAULT_BLOCKS = {
     ],
     "execution": [
         "use_limit_entry",
-        "limit_order_expiry_h",
+        "limit_order_expiry_bars",
         "trade_window_interval",
     ],
 }
@@ -67,6 +64,8 @@ DEFAULT_PROFILES = [
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+def _now_utc_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def state_path(session_dir: Path) -> Path:
     return Path(session_dir) / STATE_FILE_NAME
@@ -111,30 +110,43 @@ def _compose_stoch_key(cfg: dict) -> str:
 
 def _seeded_regime_cfg(run_cfg: dict) -> dict:
     """
-    Build the starting incumbent for CCD.
+    Build the initial incumbent configuration for CCD.
 
-    Priority:
-      1) run_cfg["coord_descent"]["seed"]
-      2) scalarized top-level values
-      3) hard defaults for a few critical fields
+    This is the starting point for every CCD session. It keeps two goals in balance:
+    1) preserve compatibility with older flat configs,
+    2) normalize values so later candidate generation can mutate them safely.
+
+    Important:
+    - This function does not decide the winner.
+    - It only prepares a clean baseline config for the first search round.
+    - Nested signal_structure is preserved because signal_json / CCD history
+      rely on that structure being available later.
     """
     coord_cfg = dict(run_cfg.get("coord_descent", {}) or {})
     seed = dict(coord_cfg.get("seed", {}) or {})
 
+    # Start from the current run config, but remove CCD-only control fields.
+    # The result should be a plain regime config that can be written into state.
     out: dict = {}
     for k, v in run_cfg.items():
         if k in {"coord_descent", "search_mode"}:
             continue
         out[k] = _scalarize(v)
 
-    # Overlay manual seed values on top of scalarized defaults.
+    # Manual seed overrides always win over flat defaults.
+    # This lets a session start from a carefully chosen configuration.
     for k, v in seed.items():
         out[k] = _scalarize(v)
 
-    # Canonicalize commonly used fields.
+    # Keep the search mode visible in the incumbent snapshot.
     out["search_mode"] = str(run_cfg.get("search_mode", "cyclic_coordinate_descent"))
 
-    # Signal block
+    # -------------------------
+    # Signal block normalization
+    # -------------------------
+    # Legacy MA gating used ma_int as a bitmask/selector.
+    # If you are fully migrating away from that model, keep this only as a
+    # compatibility field until all downstream MA logic stops reading it.
     ma_periods = run_cfg.get("ma_periods", None)
     has_ma_periods = False
     if isinstance(ma_periods, (list, tuple)):
@@ -155,6 +167,7 @@ def _seeded_regime_cfg(run_cfg: dict) -> dict:
     out["ma_reversion"] = bool(out.get("ma_reversion", False))
     out["entry_lookback_units"] = int(_scalarize(out.get("entry_lookback_units")) or 0)
 
+    # Stochastic parameters need to be normalized so signal_json can round-trip.
     out["use_stochastic"] = bool(out.get("use_stochastic", False))
     if not out["use_stochastic"]:
         out["stoch_key"] = "OFF"
@@ -178,7 +191,9 @@ def _seeded_regime_cfg(run_cfg: dict) -> dict:
         out["bbw_std"] = float(out.get("bbw_std", 0.0) or 0.0)
         out["bbw_thresholds"] = int(out.get("bbw_thresholds", 0) or 0)
 
+    # -------------------------
     # Trade management
+    # -------------------------
     out["SL"] = float(out.get("SL", _scalarize((run_cfg.get("sl_range") or {}).get("min", 0.2))) or 0.2)
     out["TP"] = float(out.get("TP", _scalarize((run_cfg.get("tp_range") or {}).get("max", 6.0))) or 6.0)
     out["use_trailing_sl"] = bool(out.get("use_trailing_sl", False))
@@ -186,15 +201,67 @@ def _seeded_regime_cfg(run_cfg: dict) -> dict:
     out["trailing_sl_interval"] = int(out.get("trailing_sl_interval", 0) or 0)
     out["trailing_sl_stop_at_pos"] = bool(out.get("trailing_sl_stop_at_pos", True))
 
+    # -------------------------
     # Execution
+    # -------------------------
     out["use_limit_entry"] = bool(out.get("use_limit_entry", True))
-    out["limit_order_expiry_h"] = int(out.get("limit_order_expiry_h", 0) or 0)
+    out["limit_order_expiry_bars"] = int(out.get("limit_order_expiry_bars", 0) or 0)
     out["trade_window_interval"] = int(out.get("trade_window_interval", 0) or 0)
 
+    # -------------------------
     # Time / era defaults
+    # -------------------------
+    # This keeps the incumbent aligned with the current session’s time horizon.
     exit_windows = run_cfg.get("exit_windows_h", [24])
     out["exit_window_h"] = int(_scalarize(out.get("exit_window_h", _scalarize(exit_windows))) or 24)
 
+    return out
+
+def _merge_signal_json_into_structure(regime_cfg: dict, signal_json: Any) -> dict:
+    """
+    Rehydrate the nested signal_structure tree from the compact master-side signal_json.
+
+    This keeps CCD aligned:
+    - master rows store compact signal_json
+    - accepted CCD state stores nested signal_structure again
+    - the next candidate generation pass can mutate the real nested fields
+    """
+    out = deepcopy(regime_cfg or {})
+
+    if not signal_json:
+        return out
+
+    try:
+        payload = json.loads(signal_json) if isinstance(signal_json, str) else dict(signal_json)
+    except Exception:
+        return out
+
+    signals = payload.get("signals", {})
+    if not isinstance(signals, dict):
+        return out
+
+    signal_structure = dict(out.get("signal_structure") or {})
+
+    for family_name, family_payload in signals.items():
+        if not isinstance(family_payload, dict):
+            continue
+
+        family_cfg = dict(signal_structure.get(family_name) or {})
+        family_cfg["enabled"] = True
+
+        tf_map = dict(family_cfg.get("by_timeframe") or {})
+        for tf, tf_cfg in family_payload.items():
+            if not isinstance(tf_cfg, dict):
+                continue
+            clean_tf_cfg = dict(tf_cfg)
+            clean_tf_cfg.pop("timeframe", None)
+            tf_map[str(tf)] = clean_tf_cfg
+
+        family_cfg["by_timeframe"] = tf_map
+        signal_structure[family_name] = family_cfg
+
+    out["signal_structure"] = signal_structure
+    out["signal_json"] = payload
     return out
 
 
@@ -214,9 +281,12 @@ def default_coord_descent_state(session_dir: Path, run_cfg: dict) -> dict:
 
     return {
         "version": 3,
+        "updated_at": _now_utc_iso(),
+        "updated_at_epoch_s": int(datetime.now(timezone.utc).timestamp()),
         "search_mode": str(run_cfg.get("search_mode", "cyclic_coordinate_descent")),
         "session_dir": str(Path(session_dir)),
         "cycle_idx": int(coord_cfg.get("cycle_idx", 0) or 0),
+        "block_cycle_idx": int(coord_cfg.get("block_cycle_idx", 0) or 0),
         "block_idx": int(coord_cfg.get("block_idx", 0) or 0),
         "block_refine_idx": 0,
         "block_refine_rounds": int(max(1, block_refine_rounds)),
@@ -278,6 +348,12 @@ def load_coord_descent_state(session_dir: Path) -> dict:
 
 def save_coord_descent_state(session_dir: Path, state: dict) -> Path:
     path = state_path(session_dir)
+
+    # Stamp the state right before saving so the JSON always shows the last write time.
+    state = dict(state or {})
+    state["updated_at"] = _now_utc_iso()
+    state["updated_at_epoch_s"] = int(datetime.now(timezone.utc).timestamp())
+
     path.write_text(json.dumps(state, indent=2, default=str), encoding="utf8")
     return path
 
@@ -317,6 +393,10 @@ def ensure_coord_descent_state(session_dir: Path, run_cfg: dict) -> dict:
 
     if "blocks" not in state:
         state["blocks"] = dict(coord_cfg.get("blocks") or DEFAULT_BLOCKS)
+        changed = True
+
+    if "block_cycle_idx" not in state:
+        state["block_cycle_idx"] = int(state.get("cycle_idx", 0) or 0)
         changed = True
 
     if "profiles" not in state:
@@ -554,6 +634,8 @@ def pick_next_incumbent(
         state["block_refine_idx"] = 0
     if "block_refine_rounds" not in state:
         state["block_refine_rounds"] = block_refine_rounds
+    if "reject_streak" not in state:
+        state["reject_streak"] = 0
 
     active_block = state.get("active_block") or state.get("last_generated", {}).get("active_block")
     if not active_block or active_block not in blocks:
@@ -566,12 +648,12 @@ def pick_next_incumbent(
     state["active_block"] = active_block
 
     candidate_keys = [k for k in blocks.get(active_block, []) if k in master_df.columns]
-    if not candidate_keys:
-        return {
-            "selected": False,
-            "reason": f"no_candidate_keys_for_block:{active_block}",
-            "state": state,
-        }
+
+    if active_block == "signal_structure":
+        if "signal_json" in master_df.columns:
+            candidate_keys = ["signal_json"]
+        else:
+            candidate_keys = []
 
     alpha_min_margin = float(selection_rules.get("alpha_min_margin", 0.016) or 0.016)
     rank_order = list(
@@ -741,8 +823,8 @@ def pick_next_incumbent(
     profile_ranked_rows = []
 
     if profiles:
-        # Multiple profiles let you inspect the same block under different strictness levels.
-        # If you only want one profile, keep just one entry in run_config.
+        # Multiple profiles let the same block be judged under different strictness levels.
+        # If only one profile is needed, keep just one entry in run_config.
         for p in profiles:
             if not isinstance(p, dict):
                 continue
@@ -884,22 +966,42 @@ def pick_next_incumbent(
     # Real acceptance test.
     # The surrogate may rank the candidate highly, but the incumbent only changes
     # if the real backtest metrics are better enough to justify it.
-    accepted = True
-    if incumbent_exists:
-        inc_tuple = _row_tuple(incumbent_score)
-        inc_alpha = float(incumbent_score.get("elite_median_alpha", -1e30) or -1e30)
+    #
+    # This keeps era consistency as a hard gate by default, while still allowing
+    # the score itself to drive improvement decisions.
+    era_consistency_floor = float(coord_cfg.get("accept_era_consistency_floor", 1.0) or 1.0)
+    accept_loss_margin = float(coord_cfg.get("accept_loss_margin", 0.0) or 0.0)
 
-        if cand_tuple > inc_tuple:
-            if (cand_alpha - inc_alpha) < alpha_min_margin:
-                accepted = False
+    accepted = False
+    if float(candidate_score.get("era_consistency_score", 0.0) or 0.0) >= era_consistency_floor:
+        if not incumbent_exists:
+            accepted = True
         else:
-            accepted = False
+            # Primary decision: lower loss is better.
+            if incumbent_loss is not None and candidate_loss < (incumbent_loss - accept_loss_margin):
+                accepted = True
+            else:
+                # Secondary tie-break: only use alpha margin when rank actually improves.
+                inc_tuple = _row_tuple(incumbent_score)
+                inc_alpha = float(incumbent_score.get("elite_median_alpha", -1e30) or -1e30)
+
+                if cand_tuple > inc_tuple and (cand_alpha - inc_alpha) >= alpha_min_margin:
+                    accepted = True
 
     if accepted:
+        state["reject_streak"] = 0
         incumbent = dict(incumbent_state.get("regime_cfg") or {})
+
+        # Copy normal scalar keys from the chosen row.
         for k in candidate_keys:
             if k in chosen:
                 incumbent[k] = chosen[k]
+
+        # IMPORTANT:
+        # signal_json is compact master output; rebuild signal_structure from it
+        # so the next search cycle can actually mutate signal params.
+        if active_block == "signal_structure" and "signal_json" in chosen:
+            incumbent = _merge_signal_json_into_structure(incumbent, chosen["signal_json"])
 
         state["incumbent"] = {
             "regime_id": int(chosen.get("regime_id", 0) or 0),
@@ -918,6 +1020,14 @@ def pick_next_incumbent(
             "updated_at": _now_iso(),
         }
     else:
+        reject_streak = int(state.get("reject_streak", 0) or 0) + 1
+        state["reject_streak"] = reject_streak
+
+        # After several failed rounds, the next generation pass should widen the
+        # search so the block does not keep probing too narrowly around the same point.
+        if reject_streak >= int(coord_cfg.get("force_explore_after", 3) or 3):
+            state["search_scale"] = float(search_scale_max)
+
         state["last_rejected"] = {
             "candidate_sig": str(best_sig),
             "candidate_score": {
@@ -982,9 +1092,10 @@ def pick_next_incumbent(
     )
 
     # Decide what block to search next.
-    # The key idea is:
-    # - do several refine rounds on one block
-    # - only rotate to the next block after the configured number of rounds
+    # block_cycle_idx is the internal CCD loop counter.
+    # cycle_idx is reserved for the outer Airflow self-trigger loop.
+    current_block_cycle = int(state.get("block_cycle_idx", 0) or 0)
+
     current_block_idx = 0
     if block_order:
         try:
@@ -994,13 +1105,12 @@ def pick_next_incumbent(
     else:
         current_block_idx = int(state.get("block_idx", 0) or 0)
 
+    # Internal state only tracks block refinement/rotation.
+    # The DAG run_id / dag conf cycle number should stay separate.
     refine_idx = int(state.get("block_refine_idx", 0) or 0)
     refine_rounds = int(state.get("block_refine_rounds", block_refine_rounds) or block_refine_rounds)
     refine_rounds = max(1, refine_rounds)
 
-    # Search scale is the "how wide do we probe around the current incumbent" knob.
-    # Accepted improvements usually deserve a tighter next pass.
-    # Rejections usually deserve a wider pass.
     cur_scale = float(state.get("search_scale", search_scale_start) or search_scale_start)
     if accepted:
         next_scale = max(search_scale_min, cur_scale * search_scale_shrink)
@@ -1008,25 +1118,30 @@ def pick_next_incumbent(
         next_scale = min(search_scale_max, cur_scale * search_scale_expand)
     state["search_scale"] = float(np.clip(next_scale, search_scale_min, search_scale_max))
 
-    # If we have not finished the planned refine rounds for this block,
-    # keep searching the same block.
-    # Otherwise rotate to the next block and reset the local refine counter.
     if refine_idx + 1 < refine_rounds:
         state["block_refine_idx"] = refine_idx + 1
-        state["active_block"] = active_block
     else:
         state["block_refine_idx"] = 0
         if block_order:
+            current_block_idx = 0
+            try:
+                current_block_idx = block_order.index(active_block)
+            except Exception:
+                current_block_idx = int(state.get("block_idx", 0) or 0) % len(block_order)
+
             next_block_idx = current_block_idx + 1
             if next_block_idx >= len(block_order):
-                state["cycle_idx"] = int(state.get("cycle_idx", 0) or 0) + 1
                 next_block_idx = 0
+                state["cycle_idx"] = int(state.get("cycle_idx", 0) or 0) + 1
+
             state["block_idx"] = next_block_idx
             state["active_block"] = block_order[next_block_idx]
         else:
             state["cycle_idx"] = int(state.get("cycle_idx", 0) or 0) + 1
             state["block_idx"] = 0
             state["active_block"] = active_block
+
+        state["block_cycle_idx"] = current_block_cycle
 
     state["last_generated"] = {
         "batch_id": None,
@@ -1050,6 +1165,7 @@ def pick_next_incumbent(
         "accepted": accepted,
         "search_scale": float(state["search_scale"]),
         "block_refine_idx": int(state["block_refine_idx"]),
+        "block_cycle_idx": int(state.get("block_cycle_idx", 0) or 0),
         "block_refine_rounds": int(refine_rounds),
         "loss": {
             "candidate": candidate_loss,

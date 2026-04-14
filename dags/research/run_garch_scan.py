@@ -4,8 +4,8 @@ from __future__ import annotations
 import json
 import logging
 import math
-import time
 import os
+import time
 import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -23,6 +23,7 @@ logger = logging.getLogger("airflow.task")
 # ============================================================
 # DB HELPERS
 # ============================================================
+
 
 def build_db_uri_from_env() -> str:
     user = os.getenv("POSTGRES_USER")
@@ -56,6 +57,7 @@ def get_engine_from_env(application_name: str = "garch_qlike_scan") -> Engine:
 # ============================================================
 # BASIC HELPERS
 # ============================================================
+
 
 def _parse_utc_dt(dt_in: Any) -> Optional[pd.Timestamp]:
     if dt_in is None:
@@ -122,7 +124,8 @@ def compute_log_returns(close_arr: np.ndarray) -> np.ndarray:
 
     rets = np.diff(np.log(close_arr))
 
-    # Better numerical stability for GARCH on crypto.
+    # Keep internal units stable for GARCH fit on BTC.
+    # Everything in this module uses pct returns and pct^2 variance.
     rets = rets * 100.0
     rets = np.clip(rets, -25.0, 25.0)
     rets = rets[np.isfinite(rets)]
@@ -130,9 +133,42 @@ def compute_log_returns(close_arr: np.ndarray) -> np.ndarray:
     return rets.astype(np.float64, copy=False)
 
 
+def align_price_to_returns(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Convert a close series into a return-aligned frame.
+
+    Output columns:
+      - time_ns: timestamp of the return observation, aligned to the right edge
+      - close: close at that timestamp
+      - ret: log return in percent from previous close to current close
+    """
+    if df.is_empty():
+        return pl.DataFrame(schema={"time_ns": pl.Int64, "close": pl.Float64, "ret": pl.Float64})
+
+    out = (
+        df.select(
+            pl.col("time_ns").cast(pl.Int64),
+            pl.col("close").cast(pl.Float64),
+        )
+        .sort("time_ns")
+        .with_columns(
+            pl.col("close")
+            .log()
+            .diff()
+            .mul(100.0)
+            .clip(-25.0, 25.0)
+            .alias("ret")
+        )
+        .drop_nulls(["ret"])
+    )
+
+    return out.select("time_ns", "close", "ret")
+
+
 # ============================================================
 # DATA LOAD / CACHE
 # ============================================================
+
 
 def load_close_df_for_grid(
     engine: Engine,
@@ -188,7 +224,7 @@ def resample_close_to_timeframe(df_5m: pd.DataFrame, timeframe_min: int) -> pd.D
 
     out = df_5m.copy()
     out["dt"] = pd.to_datetime(out["time_ns"], unit="ns", utc=True)
-    out = out.set_index("dt")[["close"]]
+    out = out.set_index("dt")[ ["close"] ]
 
     resampled = out.resample(f"{int(timeframe_min)}min").last().dropna()
 
@@ -223,6 +259,8 @@ def prepare_timeframe_cache(
     base_df = load_close_df_for_grid(engine, pair, market_type, grid_start_date, grid_end_date)
     logger.info("📦 Base rows loaded: %d", int(base_df.shape[0]))
 
+    base_pl = pl.from_pandas(base_df) if not base_df.empty else pl.DataFrame(schema={"time_ns": pl.Int64, "close": pl.Float64})
+
     manifest = {
         "pair": pair,
         "market_type": market_type,
@@ -242,18 +280,36 @@ def prepare_timeframe_cache(
             )
             continue
 
-        tf_df = resample_close_to_timeframe(base_df, tf_min)
-        if tf_df.empty:
+        if tf_min == 5:
+            tf_df = base_pl.clone()
+        else:
+            tf_df = (
+                base_pl
+                .with_columns(
+                    pl.from_epoch(pl.col("time_ns"), time_unit="ns")
+                    .dt.truncate(f"{int(tf_min)}m")
+                    .alias("dt")
+                )
+                .group_by("dt", maintain_order=True)
+                .agg(
+                    pl.col("close").last().alias("close")
+                )
+                .sort("dt")
+                .with_columns(pl.col("dt").cast(pl.Int64).alias("time_ns"))
+                .select("time_ns", "close")
+            )
+
+        if tf_df.is_empty():
             logger.warning("⚠️ Resample returned no rows for %dm", tf_min)
             manifest["timeframes"].append(
                 {"timeframe_min": int(tf_min), "cache_path": str(cache_path), "rows": 0}
             )
             continue
 
-        pl.from_pandas(tf_df).write_parquet(cache_path)
-        logger.info("💾 Wrote cache: %s (%d rows)", cache_path.name, int(tf_df.shape[0]))
+        tf_df.write_parquet(cache_path)
+        logger.info("💾 Wrote cache: %s (%d rows)", cache_path.name, int(tf_df.height))
         manifest["timeframes"].append(
-            {"timeframe_min": int(tf_min), "cache_path": str(cache_path), "rows": int(tf_df.shape[0])}
+            {"timeframe_min": int(tf_min), "cache_path": str(cache_path), "rows": int(tf_df.height)}
         )
 
     manifest_path = session_dir / "garch_cache_manifest.json"
@@ -269,6 +325,7 @@ def prepare_timeframe_cache(
 # ============================================================
 # GARCH(1,1)
 # ============================================================
+
 
 def _garch11_neg_loglik(params: np.ndarray, resid: np.ndarray) -> float:
     omega, alpha, beta = float(params[0]), float(params[1]), float(params[2])
@@ -388,6 +445,20 @@ def fit_garch11(returns: np.ndarray) -> Optional[Dict[str, Any]]:
     }
 
 
+def garch_step_variance(
+    omega: float,
+    alpha: float,
+    beta: float,
+    last_sigma2: float,
+    last_resid2: float,
+) -> float:
+    """One-step-ahead conditional variance."""
+    val = float(omega) + float(alpha) * float(last_resid2) + float(beta) * float(last_sigma2)
+    if not np.isfinite(val) or val <= 0.0:
+        return np.nan
+    return float(val)
+
+
 def garch_cum_forecast_variance(
     omega: float,
     alpha: float,
@@ -396,32 +467,52 @@ def garch_cum_forecast_variance(
     last_resid2: float,
     horizon: int,
 ) -> float:
+    """
+    Cumulative expected variance over a horizon of h bars.
+
+    Uses the closed-form expectation for multi-step GARCH(1,1):
+        E[sigma^2_{t+h}] = omega * (1 - a^h) / (1 - a) + a^h * sigma^2_{t+1}
+    where a = alpha + beta and sigma^2_{t+1} is the one-step forecast.
+
+    Returns sum_{h=1..H} E[sigma^2_{t+h}].
+    """
     horizon = int(horizon)
     if horizon <= 0:
         return np.nan
 
-    a = float(alpha)
-    b = float(beta)
+    a = float(alpha) + float(beta)
     w = float(omega)
-
-    f = w + a * float(last_resid2) + b * float(last_sigma2)
-    if not np.isfinite(f) or f <= 0.0:
+    s1 = garch_step_variance(omega, alpha, beta, last_sigma2, last_resid2)
+    if not np.isfinite(s1) or s1 <= 0.0:
         return np.nan
 
-    total = 0.0
-    ab = a + b
+    if a < 0.0 or a >= 0.999999:
+        return np.nan
 
-    for _ in range(horizon):
-        total += f
-        f = w + ab * f
-        if not np.isfinite(f) or f <= 0.0:
+    if abs(1.0 - a) < 1e-12:
+        # Near-integrated case; use recursion to avoid blowups.
+        total = 0.0
+        f = s1
+        for _ in range(horizon):
+            if not np.isfinite(f) or f <= 0.0:
+                return np.nan
+            total += f
+            f = w + a * f
+        return float(total)
+
+    total = 0.0
+    for h in range(1, horizon + 1):
+        exp_sigma2 = w * (1.0 - a**h) / (1.0 - a) + (a**h) * s1
+        if not np.isfinite(exp_sigma2) or exp_sigma2 <= 0.0:
             return np.nan
+        total += exp_sigma2
 
     return float(total)
 
 
 def ewma_last_variance(resid: np.ndarray, lam: float = 0.94) -> Tuple[float, float]:
     resid = np.asarray(resid, dtype=np.float64)
+    resid = resid[np.isfinite(resid)]
     if resid.size < 2:
         return np.nan, np.nan
 
@@ -439,6 +530,7 @@ def ewma_last_variance(resid: np.ndarray, lam: float = 0.94) -> Tuple[float, flo
 # ============================================================
 # JOB BUILDING
 # ============================================================
+
 
 def build_scan_jobs(
     session_dir: str,
@@ -483,6 +575,7 @@ def build_scan_jobs(
         horizon_bars_list = [max(1, int(round(h * 60 / float(timeframe_min)))) for h in horizons_hours]
         max_horizon_bars = max(horizon_bars_list)
 
+        # Need enough bars to train and enough bars after each origin to score every horizon.
         start_origin = train_window_bars
         end_origin = n_rows - max_horizon_bars - 1
 
@@ -505,6 +598,7 @@ def build_scan_jobs(
                     "refit_every_days": refit_every_days,
                     "horizons_hours": horizons_hours,
                     "progress_every": int(run_cfg.get("garch_progress_every", 500)),
+                    "score_every_bar": bool(run_cfg.get("garch_score_every_bar", False)),
                 }
             )
 
@@ -518,6 +612,15 @@ def build_scan_jobs(
 # ============================================================
 # JOB RUNNER
 # ============================================================
+
+
+def _make_baseline_row(realized_var: float, forecast_var: float, prefix: str) -> Dict[str, float]:
+    q = qlike_loss(realized_var, forecast_var)
+    return {
+        f"{prefix}_var": float(forecast_var),
+        f"qlike_{prefix}": float(q),
+    }
+
 
 def run_scan_job(
     job: Dict[str, Any],
@@ -536,25 +639,34 @@ def run_scan_job(
     refit_every_days = int(job["refit_every_days"])
     horizons_hours = [int(x) for x in job["horizons_hours"]]
     progress_every = max(1, int(job.get("progress_every", 500)))
+    score_every_bar = bool(job.get("score_every_bar", False))
 
     logger.info(
         "🧵 START job=%s tf=%dm origin=[%d,%d] cache=%s",
-        job_id, timeframe_min, origin_start, origin_end, cache_path.name,
+        job_id,
+        timeframe_min,
+        origin_start,
+        origin_end,
+        cache_path.name,
     )
 
-    tf_df = pl.read_parquet(cache_path).to_pandas().sort_values("time_ns").reset_index(drop=True)
-    close = tf_df["close"].to_numpy(dtype=np.float64)
-    time_ns = tf_df["time_ns"].to_numpy(dtype=np.int64)
+    tf_df = pl.read_parquet(cache_path).sort("time_ns")
+    if tf_df.is_empty():
+        logger.warning("⚠️ job=%s empty cache", job_id)
+        return {"job_id": job_id, "rows": 0, "part_path": "", "timeframe_min": timeframe_min}
 
-    returns = compute_log_returns(close)
+    aligned = align_price_to_returns(tf_df)
+    if aligned.height < 100:
+        logger.warning("⚠️ job=%s insufficient rows after return alignment", job_id)
+        return {"job_id": job_id, "rows": 0, "part_path": "", "timeframe_min": timeframe_min}
+
+    time_ns = aligned.get_column("time_ns").to_numpy()
+    close = aligned.get_column("close").to_numpy()
+    returns = aligned.get_column("ret").to_numpy()
+
     if returns.size < 100:
         logger.warning("⚠️ job=%s insufficient returns after preprocessing", job_id)
-        return {
-            "job_id": job_id,
-            "rows": 0,
-            "part_path": "",
-            "timeframe_min": timeframe_min,
-        }
+        return {"job_id": job_id, "rows": 0, "part_path": "", "timeframe_min": timeframe_min}
 
     bars_per_day = int(round((24 * 60) / float(timeframe_min)))
     train_window_bars = int(train_window_days * bars_per_day)
@@ -562,40 +674,46 @@ def run_scan_job(
     horizon_bars_list = [max(1, int(round(h * 60 / float(timeframe_min)))) for h in horizons_hours]
     max_horizon_bars = max(horizon_bars_list)
 
-    max_possible_origin = len(close) - max_horizon_bars - 1
+    # Returns are aligned so returns[i] ends at time_ns[i + 1]
+    max_origin = len(returns) - max_horizon_bars - 1
     origin_start = max(origin_start, train_window_bars)
-    origin_end = min(origin_end, max_possible_origin)
+    origin_end = min(origin_end, max_origin)
 
     if origin_end <= origin_start:
         logger.warning("⚠️ job=%s empty effective origin range", job_id)
-        return {
-            "job_id": job_id,
-            "rows": 0,
-            "part_path": "",
-            "timeframe_min": timeframe_min,
-        }
+        return {"job_id": job_id, "rows": 0, "part_path": "", "timeframe_min": timeframe_min}
 
     logger.info(
-        "📈 job=%s tf=%dm train_bars=%d refit_bars=%d horizons=%s returns=%d",
-        job_id, timeframe_min, train_window_bars, refit_every_bars, horizons_hours, int(returns.size),
+        "📈 job=%s tf=%dm train_bars=%d refit_bars=%d horizons=%s returns=%d aligned_rows=%d",
+        job_id,
+        timeframe_min,
+        train_window_bars,
+        refit_every_bars,
+        horizons_hours,
+        int(returns.size),
+        int(aligned.height),
     )
 
     rows: List[Dict[str, Any]] = []
     fit_attempts = 0
     fit_success = 0
     fit_fail = 0
+    skipped_no_future = 0
 
-    origin_count = 0
     total_origins = ((origin_end - origin_start) // refit_every_bars) + 1
     last_fit_log_ts = 0.0
+    cached_fit: Optional[Dict[str, Any]] = None
+    cached_fit_origin: Optional[int] = None
 
     for idx, origin in enumerate(range(origin_start, origin_end + 1, refit_every_bars), start=1):
-        origin_count += 1
-
         if idx == 1 or idx % progress_every == 0:
             logger.info(
                 "🔄 job=%s progress %d/%d origin=%d rows=%d",
-                job_id, idx, total_origins, origin, len(rows),
+                job_id,
+                idx,
+                total_origins,
+                origin,
+                len(rows),
             )
 
         train_start = origin - train_window_bars
@@ -608,7 +726,9 @@ def run_scan_job(
             if idx == 1 or idx % progress_every == 0:
                 logger.warning(
                     "⚠️ job=%s skipped origin=%d because train_ret too small (%d)",
-                    job_id, origin, int(train_ret.size),
+                    job_id,
+                    origin,
+                    int(train_ret.size),
                 )
             continue
 
@@ -630,19 +750,27 @@ def run_scan_job(
 
         if fit is None:
             fit_fail += 1
+            cached_fit = None
+            cached_fit_origin = None
             if idx == 1 or idx % progress_every == 0:
                 logger.warning(
                     "⚠️ job=%s fit failed origin=%d took=%.2fs",
-                    job_id, origin, fit_sec,
+                    job_id,
+                    origin,
+                    fit_sec,
                 )
             continue
 
         fit_success += 1
+        cached_fit = fit
+        cached_fit_origin = origin
 
         if idx == 1 or idx % progress_every == 0 or fit_sec >= 10.0:
             logger.info(
                 "✅ job=%s fit ok origin=%d took=%.2fs",
-                job_id, origin, fit_sec,
+                job_id,
+                origin,
+                fit_sec,
             )
 
         mu = float(fit["mu"])
@@ -654,15 +782,26 @@ def run_scan_job(
 
         last_sigma2 = float(sigma2_train[-1])
         last_resid2 = float(resid_train[-1] ** 2)
-
-        ewma_sigma2, _ = ewma_last_variance(resid_train, lam=0.94)
         sample_var = float(np.var(resid_train, ddof=1))
 
-        future_slice = returns[origin: origin + max_horizon_bars]
+        # Fair EWMA baseline: same training slice, same origin, same forecast horizon logic.
+        ewma_sigma2, _ = ewma_last_variance(resid_train, lam=0.94)
+
+        # This origin corresponds to returns[origin] ending at time_ns[origin + 1].
+        # So use time_ns[origin + 1] as the timestamp of the latest observed return.
+        origin_time_idx = min(origin + 1, len(time_ns) - 1)
+        origin_time_ns = int(time_ns[origin_time_idx])
+
+        # Future realized variance starts at the next return after the origin.
+        future_slice = returns[origin + 1 : origin + 1 + max_horizon_bars]
         if future_slice.size < max_horizon_bars:
+            skipped_no_future += 1
             continue
 
-        origin_time_ns = int(time_ns[min(origin, len(time_ns) - 1)])
+        # Optional score-every-bar mode: if true, use current fit for all bars until next refit.
+        # Here the job itself advances by refit_every_bars, so the default is sparse scoring.
+        # This hook is kept for later extension.
+        _ = score_every_bar
 
         for h_bars, h_hours in zip(horizon_bars_list, horizons_hours):
             future_h = future_slice[:h_bars]
@@ -683,6 +822,10 @@ def run_scan_job(
             if not np.isfinite(garch_var) or garch_var <= 0.0:
                 continue
 
+            q_garch = qlike_loss(realized_var, garch_var)
+            q_ewma = qlike_loss(realized_var, ewma_cum_var)
+            q_sample = qlike_loss(realized_var, sample_cum_var)
+
             rows.append(
                 {
                     "job_id": job_id,
@@ -696,17 +839,19 @@ def run_scan_job(
                     "garch_var": float(garch_var),
                     "ewma_var": float(ewma_cum_var),
                     "sample_var": float(sample_cum_var),
-                    "qlike_garch": qlike_loss(realized_var, garch_var),
-                    "qlike_ewma": qlike_loss(realized_var, ewma_cum_var),
-                    "qlike_sample": qlike_loss(realized_var, sample_cum_var),
-                    "garch_better_than_ewma": int(qlike_loss(realized_var, garch_var) < qlike_loss(realized_var, ewma_cum_var)),
-                    "garch_better_than_sample": int(qlike_loss(realized_var, garch_var) < qlike_loss(realized_var, sample_cum_var)),
+                    "qlike_garch": q_garch,
+                    "qlike_ewma": q_ewma,
+                    "qlike_sample": q_sample,
+                    "garch_better_than_ewma": int(q_garch < q_ewma),
+                    "garch_better_than_sample": int(q_garch < q_sample),
                     "mu": mu,
                     "omega": omega,
                     "alpha": alpha,
                     "beta": beta,
                     "last_sigma2": last_sigma2,
                     "last_resid2": last_resid2,
+                    "sample_var_train": sample_var,
+                    "cached_fit_origin": int(cached_fit_origin if cached_fit_origin is not None else origin),
                 }
             )
 
@@ -714,8 +859,15 @@ def run_scan_job(
         if idx == 1 or idx % progress_every == 0 or (now_ts - last_fit_log_ts) > 120.0:
             last_fit_log_ts = now_ts
             logger.info(
-                "📌 job=%s status: origins_done=%d/%d rows=%d fits=%d ok=%d fail=%d",
-                job_id, idx, total_origins, len(rows), fit_attempts, fit_success, fit_fail,
+                "📌 job=%s status: origins_done=%d/%d rows=%d fits=%d ok=%d fail=%d skipped_future=%d",
+                job_id,
+                idx,
+                total_origins,
+                len(rows),
+                fit_attempts,
+                fit_success,
+                fit_fail,
+                skipped_no_future,
             )
 
     if rows:
@@ -723,8 +875,14 @@ def run_scan_job(
         part_path = parts_dir / f"{job_id}.parquet"
         part_df.write_parquet(part_path)
         logger.info(
-            "✅ DONE job=%s rows=%d fit_attempts=%d success=%d fail=%d -> %s",
-            job_id, len(rows), fit_attempts, fit_success, fit_fail, part_path.name,
+            "✅ DONE job=%s rows=%d fit_attempts=%d success=%d fail=%d skipped_future=%d -> %s",
+            job_id,
+            len(rows),
+            fit_attempts,
+            fit_success,
+            fit_fail,
+            skipped_no_future,
+            part_path.name,
         )
         return {
             "job_id": job_id,
@@ -734,8 +892,12 @@ def run_scan_job(
         }
 
     logger.info(
-        "ℹ️ DONE job=%s rows=0 fit_attempts=%d success=%d fail=%d",
-        job_id, fit_attempts, fit_success, fit_fail,
+        "ℹ️ DONE job=%s rows=0 fit_attempts=%d success=%d fail=%d skipped_future=%d",
+        job_id,
+        fit_attempts,
+        fit_success,
+        fit_fail,
+        skipped_no_future,
     )
     return {
         "job_id": job_id,
@@ -746,8 +908,9 @@ def run_scan_job(
 
 
 # ============================================================
-# COMBINE
+# COMBINE / SUMMARIZE
 # ============================================================
+
 
 def summarize_scan(detail_df: pd.DataFrame) -> pd.DataFrame:
     if detail_df.empty:

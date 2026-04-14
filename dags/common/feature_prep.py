@@ -1,6 +1,16 @@
 # common/feature_prep.py
-# Keep the above .py filename for reference, but this is not a standalone script. It's meant to be imported and used by other code in the research/live ingest pipeline for backtesting trading signals.
 
+"""Feature cache builder for multi-timeframe signal families.
+
+This module precomputes reusable signal columns on the base price series and on
+higher timeframe series, then aligns them back to the base rows.
+
+Design goals:
+- stable column names
+- backward compatible config parsing
+- each signal family can use its own timeframe list
+- one cache can support many CCD cycles
+"""
 from __future__ import annotations
 
 import hashlib
@@ -12,17 +22,9 @@ from typing import Any, Optional, Tuple
 import numpy as np
 import polars as pl
 
+from common.timeframes import timeframe_bars, timeframe_minutes
+from common.feature_helpers import build_signal_manifest, timeframe_to_polars_every, timeframe_to_minutes
 from common.schema import enforce_schema
-from common.feature_helpers import (
-    _as_bool,
-    _as_int,
-    _as_float,
-    _as_str,
-    _as_int_list,
-    _as_float_list,
-    _as_threshold_pairs,
-    _as_ma_type_list,
-)
 
 FEATURE_CACHE_DIR = Path(
     os.getenv(
@@ -31,36 +33,17 @@ FEATURE_CACHE_DIR = Path(
     )
 )
 
-# Bump this when feature definitions or naming rules change.
-FEATURE_CACHE_VERSION = 3
-
-
-def _ordered_unique_ints(values: Any) -> list[int]:
-    out: list[int] = []
-    seen: set[int] = set()
-    for x in _as_int_list(values):
-        if x > 0 and x not in seen:
-            seen.add(x)
-            out.append(x)
-    return out
+FEATURE_CACHE_VERSION = 1
 
 
 def _hash_json(obj: Any) -> str:
-    payload = json.dumps(
-        obj,
-        sort_keys=True,
-        separators=(",", ":"),
-        default=str,
-    ).encode("utf8")
+    payload = json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str).encode("utf8")
     return hashlib.sha1(payload).hexdigest()
 
 
 def _file_fingerprint(path: Path) -> dict:
     st = path.stat()
-    return {
-        "size": int(st.st_size),
-        "mtime_ns": int(st.st_mtime_ns),
-    }
+    return {"size": int(st.st_size), "mtime_ns": int(st.st_mtime_ns)}
 
 
 def _float_token(value: float) -> str:
@@ -143,7 +126,6 @@ def _compute_ma_np(values: np.ndarray, ma_type: str, period: int) -> np.ndarray:
 
         return out
 
-    # default = sma
     if period == 1:
         return arr.copy()
 
@@ -153,110 +135,229 @@ def _compute_ma_np(values: np.ndarray, ma_type: str, period: int) -> np.ndarray:
     return out
 
 
-def _build_ma_specs(run_cfg: dict, modifier: int) -> list[dict]:
-    periods = [int(x) for x in _as_int_list(run_cfg.get("ma_periods", [])) if int(x) > 0]
-    if not periods:
-        return []
+def _dedupe_columns(df: pl.DataFrame) -> pl.DataFrame:
+    if df is None or df.is_empty():
+        return df
+    pdf = df.to_pandas() if hasattr(df, "to_pandas") else None
+    if pdf is not None:
+        pdf = pdf.loc[:, ~pdf.columns.duplicated()].copy()
+        return pl.from_pandas(pdf)
+    return df
 
-    types = _as_ma_type_list(run_cfg.get("ma_types", None), len(periods))
-    specs: list[dict] = []
 
-    for idx, (period, ma_type) in enumerate(zip(periods, types)):
-        ma_type = (ma_type or "sma").strip().lower()
-        eff = max(1, int(period) * int(modifier))
-        specs.append(
-            {
-                "slot": int(idx),
-                "type": ma_type,
-                "period": int(period),
-                "effective_window": int(eff),
-                "col": f"ma_{idx:02d}_{ma_type}_{eff}",
-            }
+def _resample_ohlcv(df: pl.DataFrame, every: str) -> pl.DataFrame:
+    if df is None or df.is_empty():
+        return pl.DataFrame()
+    if "time" not in df.columns:
+        raise RuntimeError("df_main missing required 'time' column")
+
+    agg_exprs = []
+    if "open" in df.columns:
+        agg_exprs.append(pl.first("open").alias("open"))
+    if "high" in df.columns:
+        agg_exprs.append(pl.max("high").alias("high"))
+    if "low" in df.columns:
+        agg_exprs.append(pl.min("low").alias("low"))
+    if "close" in df.columns:
+        agg_exprs.append(pl.last("close").alias("close"))
+    if "volume" in df.columns:
+        agg_exprs.append(pl.sum("volume").alias("volume"))
+    if "spread" in df.columns:
+        agg_exprs.append(pl.mean("spread").alias("spread"))
+    if "funding_rate" in df.columns:
+        agg_exprs.append(pl.mean("funding_rate").alias("funding_rate"))
+    if "time_ns" in df.columns:
+        agg_exprs.append(pl.last("time_ns").alias("time_ns"))
+
+    return (
+        df.sort("time")
+        .group_by_dynamic(
+            index_column="time",
+            every=every,
+            period=every,
+            closed="right",
+            label="right",
+        )
+        .agg(agg_exprs)
+        .sort("time")
+    )
+
+
+def _join_features(base_df: pl.DataFrame, tf_df: pl.DataFrame, feature_cols: list[str]) -> pl.DataFrame:
+    if base_df is None or base_df.is_empty() or tf_df is None or tf_df.is_empty():
+        return base_df
+    if not feature_cols:
+        return base_df
+    join_df = tf_df.select(["time"] + [c for c in feature_cols if c in tf_df.columns]).sort("time")
+    return base_df.join_asof(join_df, on="time", strategy="backward")
+
+
+def _add_ma_features(tf_df: pl.DataFrame, specs: list[dict]) -> pl.DataFrame:
+    if tf_df is None or tf_df.is_empty() or not specs:
+        return tf_df
+    if "close" not in tf_df.columns:
+        return tf_df
+
+    close_arr = (
+        tf_df["close"]
+        .fill_nan(np.nan)
+        .fill_null(np.nan)
+        .to_numpy()
+        .astype(np.float64, copy=False)
+    )
+
+    for spec in specs:
+        col = spec["col"]
+        arr = _compute_ma_np(close_arr, spec["type"], int(spec["period"]))
+        tf_df = tf_df.with_columns(pl.Series(col, arr.astype(np.float32, copy=False)))
+    return tf_df
+
+
+def _add_stoch_features(tf_df: pl.DataFrame, specs: list[dict]) -> pl.DataFrame:
+    if tf_df is None or tf_df.is_empty() or not specs:
+        return tf_df
+    if "close" not in tf_df.columns:
+        return tf_df
+
+    close = pl.col("close")
+
+    for spec in specs:
+        k = max(1, int(spec["k"]))
+        d = max(1, int(spec["d"]))
+        s = max(1, int(spec["s"]))
+        col_name = spec["col"]
+
+        low_k = close.rolling_min(k, min_periods=1)
+        high_k = close.rolling_max(k, min_periods=1)
+        denom = high_k - low_k
+
+        tf_df = (
+            tf_df.with_columns(
+                (
+                    pl.when(denom != 0)
+                    .then(100.0 * (close - low_k) / denom)
+                    .otherwise(50.0)
+                    .fill_nan(50.0)
+                    .fill_null(50.0)
+                    .ewm_mean(span=s, adjust=False)
+                    .alias("_stoch_k_smooth")
+                )
+            )
+            .with_columns(
+                pl.col("_stoch_k_smooth")
+                .ewm_mean(span=d, adjust=False)
+                .clip(0, 100)
+                .alias(col_name)
+            )
+            .drop(["_stoch_k_smooth"])
         )
 
-    return specs
+    return tf_df
 
 
-def build_feature_manifest(run_cfg: dict) -> dict:
-    base_min = _as_int(run_cfg.get("BASE_MINUTES", 5), 5)
-    modifier = max(1, _as_int(run_cfg.get("signal_timeframe_modifier", 3), 3))
+def _add_lookback_features(tf_df: pl.DataFrame, specs: list[dict]) -> pl.DataFrame:
+    if tf_df is None or tf_df.is_empty() or not specs:
+        return tf_df
+    if not all(c in tf_df.columns for c in ("high", "low", "close")):
+        return tf_df
 
-    ma_specs = _build_ma_specs(run_cfg, modifier)
+    close = pl.col("close")
+    high = pl.col("high")
+    low = pl.col("low")
 
-    stoch_specs = []
-    if _as_bool(run_cfg.get("use_stochastic", False), False):
-        ks = _ordered_unique_ints(run_cfg.get("stoch_k", [12])) or [12]
-        ds = _ordered_unique_ints(run_cfg.get("stoch_d", [3])) or [3]
-        ss = _ordered_unique_ints(run_cfg.get("stoch_s", [3])) or [3]
-        for k in ks:
-            for d in ds:
-                for s in ss:
-                    stoch_specs.append(
-                        {
-                            "k": int(k),
-                            "d": int(d),
-                            "s": int(s),
-                            "col": f"stoch_k{k}_d{d}_s{s}",
-                        }
-                    )
+    for spec in specs:
+        units = max(1, int(spec["units"]))
+        col_name = spec["col"]
 
-    lookback_units = _ordered_unique_ints(run_cfg.get("entry_lookback_units", []))
+        prior_high = high.rolling_max(units).shift(1)
+        prior_low = low.rolling_min(units).shift(1)
 
-    bbw_specs = []
-    if _as_bool(run_cfg.get("use_bbw", False), False):
-        periods = _ordered_unique_ints(run_cfg.get("bbw_periods", [])) or [96]
-        stds = _as_float_list(run_cfg.get("bbw_std", [2.5])) or [2.5]
-        for p in periods:
-            for s in stds:
-                bbw_specs.append(
-                    {
-                        "period": int(p),
-                        "std": float(s),
-                        "col": f"bbw_p{p}_s{_float_token(s)}",
-                    }
-                )
+        tf_df = tf_df.with_columns(
+            pl.when((close > prior_high) & prior_high.is_not_null())
+            .then(1.0)
+            .when((close < prior_low) & prior_low.is_not_null())
+            .then(0.0)
+            .otherwise(0.5)
+            .cast(pl.Float32)
+            .alias(col_name)
+        )
+    return tf_df
 
-    manifest = {
-        "feature_version": FEATURE_CACHE_VERSION,
-        "BASE_MINUTES": base_min,
-        "signal_timeframe_modifier": modifier,
-        "ma_specs": ma_specs,
-        "stoch_specs": stoch_specs,
-        "lookback_units": lookback_units,
-        "bbw_specs": bbw_specs,
-        "ma_cols": [x["col"] for x in ma_specs],
-        "stoch_cols": [x["col"] for x in stoch_specs],
-        "bbw_cols": [x["col"] for x in bbw_specs],
-    }
-    manifest["cache_key"] = _hash_json(manifest)
-    return manifest
 
+def _add_bbw_features(tf_df: pl.DataFrame, specs: list[dict]) -> pl.DataFrame:
+    if tf_df is None or tf_df.is_empty() or not specs:
+        return tf_df
+    if "close" not in tf_df.columns:
+        return tf_df
+
+    close = pl.col("close")
+
+    for spec in specs:
+        period = max(1, int(spec["period"]))
+        std = float(spec["std"])
+        col_name = spec["col"]
+
+        rolling_mean = close.rolling_mean(period)
+        rolling_std = close.rolling_std(period, ddof=0)
+        raw_bbw = pl.when(rolling_mean != 0).then((2 * std * rolling_std) / rolling_mean).otherwise(0.0)
+
+        norm_window = max(50, period * 3)
+        b_min = raw_bbw.rolling_min(window_size=norm_window)
+        b_max = raw_bbw.rolling_max(window_size=norm_window)
+        den = b_max - b_min
+
+        tf_df = tf_df.with_columns(
+            pl.when(den != 0)
+            .then(100 * (raw_bbw - b_min) / den)
+            .otherwise(50.0)
+            .fill_nan(50)
+            .fill_null(50)
+            .clip(0, 100)
+            .cast(pl.Float32)
+            .alias(col_name)
+        )
+    return tf_df
 
 def _build_lookback_map(run_cfg: dict, manifest: dict) -> dict[str, int]:
+    """
+    Runtime metadata only.
+
+    This is not a surrogate feature. It tells the worker roughly how much
+    historical warmup is needed for each era, using the same timeframe logic
+    used everywhere else.
+    """
     base_min = int(manifest["BASE_MINUTES"])
-    modifier = int(manifest["signal_timeframe_modifier"])
+    max_bars = 0
 
-    max_ma = max([x["effective_window"] for x in manifest["ma_specs"]], default=0)
-    max_stoch = max(
-        [
-            max(int(x["k"]), int(x["d"]), int(x["s"])) * modifier
-            for x in manifest["stoch_specs"]
-        ],
-        default=0,
-    )
-    max_lb = max([int(x) for x in manifest["lookback_units"]], default=0) * modifier
-    max_bbw = max([int(x["period"]) * modifier for x in manifest["bbw_specs"]], default=0)
+    def _tf(spec: dict) -> str:
+        return str(spec.get("tf") or spec.get("timeframe") or "5m")
 
-    absolute_max_units = max(max_ma, max_stoch, max_lb, max_bbw)
-    required_hours = int(np.ceil((absolute_max_units * base_min) / 60.0)) + 2
+    for spec in manifest.get("ma_specs", []):
+        bars = timeframe_bars(_tf(spec), base_min)
+        max_bars = max(max_bars, bars * max(1, int(spec.get("period", 1))))
 
-    start_str = _as_str(run_cfg.get("grid_start_date", ""))
-    end_str = _as_str(run_cfg.get("grid_end_date", ""))
+    for spec in manifest.get("stoch_specs", []):
+        bars = timeframe_bars(_tf(spec), base_min)
+        max_bars = max(max_bars, bars * max(1, int(spec.get("k", 1)), int(spec.get("d", 1)), int(spec.get("s", 1))))
+
+    for spec in manifest.get("lookback_specs", []):
+        bars = timeframe_bars(_tf(spec), base_min)
+        max_bars = max(max_bars, bars * max(1, int(spec.get("units", 1))))
+
+    for spec in manifest.get("bbw_specs", []):
+        bars = timeframe_bars(_tf(spec), base_min)
+        max_bars = max(max_bars, bars * max(1, int(spec.get("period", 1))))
+
+    required_minutes = max_bars * base_min
+    required_hours = int(np.ceil(required_minutes / 60.0)) + 2
+
+    start_str = str(run_cfg.get("grid_start_date", "") or "")
+    end_str = str(run_cfg.get("grid_end_date", "") or "")
     if not start_str or not end_str:
         return {}
 
     try:
-        interval = f"{_as_int(run_cfg.get('sl_tp_interval_months', 6), 6)}mo"
+        interval = f"{int(run_cfg.get('sl_tp_interval_months', 6) or 6)}mo"
         start_dt = pl.select(pl.lit(start_str).str.to_datetime(time_zone="UTC")).item()
         end_dt = pl.select(pl.lit(end_str).str.to_datetime(time_zone="UTC")).item()
     except Exception:
@@ -281,161 +382,73 @@ def precompute_all_possible_features(
         run_cfg["lookback_map"] = {}
         run_cfg["ma_cols"] = []
         run_cfg["stoch_cols"] = []
+        run_cfg["lookback_cols"] = []
         run_cfg["bbw_cols"] = []
         return df, run_cfg
 
     if manifest is None:
-        manifest = build_feature_manifest(run_cfg)
+        manifest = build_signal_manifest(run_cfg)
 
-    df = df.clone()
+    # --- FIX: inject base timeframe invariant ---
+    if "BASE_MINUTES" not in manifest:
+        base_tf = run_cfg.get("base_timeframe", "5m")
+        manifest["BASE_MINUTES"] = timeframe_to_minutes(base_tf)
 
-    close_arr = (
-        df["close"]
-        .fill_nan(0.0)
-        .fill_null(0.0)
-        .to_numpy()
-        .astype(np.float64, copy=False)
-    )
+    df = df.clone().sort("time")
 
-    # 1) Moving averages
-    for spec in manifest["ma_specs"]:
-        arr = _compute_ma_np(close_arr, spec["type"], spec["effective_window"])
-        df = df.with_columns(pl.Series(spec["col"], arr.astype(np.float32, copy=False)))
+    if "time" not in df.columns:
+        raise RuntimeError("df_main missing required 'time' column")
+    if "close" not in df.columns:
+        raise RuntimeError("df_main missing required 'close' column")
+    if "high" not in df.columns or "low" not in df.columns:
+        raise RuntimeError("df_main missing required 'high'/'low' columns")
 
-    # 2) Stochastic (exponential version)
-    if manifest["stoch_specs"]:
-        for spec in manifest["stoch_specs"]:
-            k = int(spec["k"])
-            d = int(spec["d"])
-            s = int(spec["s"])
-            col_name = spec["col"]
+    if "time_ns" not in df.columns:
+        df = df.with_columns(pl.col("time").cast(pl.Datetime("ns")).cast(pl.Int64).alias("time_ns"))
+    else:
+        df = df.with_columns(pl.col("time_ns").cast(pl.Int64))
 
-            modifier = int(manifest["signal_timeframe_modifier"])
-            k_mod = max(1, k * modifier)
-            s_mod = max(1, s * modifier)
-            d_mod = max(1, d * modifier)
-
-            s_min = pl.col("close").rolling_min(k_mod, min_periods=1)
-            s_max = pl.col("close").rolling_max(k_mod, min_periods=1)
-            denom = s_max - s_min
-
-            df = (
-                df.with_columns(
-                    (
-                        pl.when(denom != 0)
-                        .then(100.0 * (pl.col("close") - s_min) / denom)
-                        .otherwise(50.0)
-                        .fill_nan(50.0)
-                        .fill_null(50.0)
-                        .ewm_mean(span=s_mod, adjust=False)
-                        .alias("_smoothed_k")
-                    )
-                )
-                .with_columns(
-                    pl.col("_smoothed_k")
-                    .ewm_mean(span=d_mod, adjust=False)
-                    .alias(col_name)
-                )
-                .drop(["_smoothed_k"])
-            )
-
-    # 3) Lookback breakout columns
-    for lb_units in manifest["lookback_units"]:
-        if lb_units < 0:
-            continue
-
-        periods = max(1, int(lb_units) * manifest["signal_timeframe_modifier"])
-        prior_high = pl.col("high").rolling_max(periods).shift(1)
-        prior_low = pl.col("low").rolling_min(periods).shift(1)
-
-        if lb_units == 0:
-            df = df.with_columns([pl.lit(1.0).cast(pl.Float32).alias("breakout_0u")])
-        else:
-            df = df.with_columns(
-                [
-                    pl.when((pl.col("close") > prior_high) & prior_high.is_not_null())
-                    .then(1.0)
-                    .when((pl.col("close") < prior_low) & prior_low.is_not_null())
-                    .then(0.0)
-                    .otherwise(0.5)
-                    .cast(pl.Float32)
-                    .alias(f"breakout_{lb_units}u")
-                ]
-            )
-
-    # 4) BBW columns
-    for spec in manifest["bbw_specs"]:
-        n = max(1, int(spec["period"]) * manifest["signal_timeframe_modifier"])
-        s = float(spec["std"])
-        col_name = spec["col"]
-
-        rolling_mean = pl.col("close").rolling_mean(n)
-        rolling_std = pl.col("close").rolling_std(n, ddof=0)
-
-        raw_bbw = pl.when(rolling_mean != 0).then((2 * s * rolling_std) / rolling_mean).otherwise(0.0)
-
-        norm_window = max(50, n * 3)
-        b_min = raw_bbw.rolling_min(window_size=norm_window)
-        b_max = raw_bbw.rolling_max(window_size=norm_window)
-        den = b_max - b_min
-
-        df = df.with_columns(
-            [
-                pl.when(den != 0)
-                .then(100 * (raw_bbw - b_min) / den)
-                .otherwise(50.0)
-                .fill_nan(50)
-                .fill_null(50)
-                .clip(0, 100)
-                .cast(pl.Float32)
-                .alias(col_name)
-            ]
-        )
-
-    # 5) Regime amplitude columns
-    base_min = int(manifest["BASE_MINUTES"])
-    modifier = int(manifest["signal_timeframe_modifier"])
-    effective_min = max(1, base_min * modifier)
-
-    amp_windows = {
-        "regime_amp_index_24h": int(round((24 * 60) / effective_min)),
-        "regime_amp_index_72h": int(round((72 * 60) / effective_min)),
-        "regime_amp_index_1w": int(round((7 * 24 * 60) / effective_min)),
-        "regime_amp_index_1m": int(round((30 * 24 * 60) / effective_min)),
-    }
-
-    exprs = []
-    for new_name, win in amp_windows.items():
-        win = max(1, int(win))
-        rolling_min = pl.col("close").rolling_min(window_size=win, min_periods=win)
-        rolling_max = pl.col("close").rolling_max(window_size=win, min_periods=win)
-        den = rolling_min
-        raw = (
-            pl.when(den > 0)
-            .then((rolling_max - rolling_min) / den)
-            .otherwise(0.0)
-            .fill_nan(0.0)
-            .fill_null(0.0)
-            .cast(pl.Float32)
-        )
-        exprs.append(raw.alias(new_name))
-
-    df = df.with_columns(exprs)
     df = df.with_columns(
         [
-            pl.col("regime_amp_index_24h").alias("rng_24h"),
-            pl.col("regime_amp_index_72h").alias("rng_72h"),
-            pl.col("regime_amp_index_1w").alias("rng_1w"),
-            pl.col("regime_amp_index_1m").alias("rng_1m"),
+            pl.col("open").cast(pl.Float32).alias("open") if "open" in df.columns else pl.lit(None).cast(pl.Float32).alias("open"),
+            pl.col("high").cast(pl.Float32).alias("high"),
+            pl.col("low").cast(pl.Float32).alias("low"),
+            pl.col("close").cast(pl.Float32).alias("close"),
+            pl.col("volume").fill_null(0.0).cast(pl.Float32).alias("volume") if "volume" in df.columns else pl.lit(0.0).cast(pl.Float32).alias("volume"),
+            pl.col("spread").fill_null(0.0).cast(pl.Float32).alias("spread") if "spread" in df.columns else pl.lit(0.0).cast(pl.Float32).alias("spread"),
+            pl.col("funding_rate").fill_null(0.0).cast(pl.Float32).alias("funding_rate") if "funding_rate" in df.columns else pl.lit(0.0).cast(pl.Float32).alias("funding_rate"),
         ]
     )
 
-    # 6) Loadable runtime metadata
+    for tf in manifest["signal_timeframes"]:
+        every = timeframe_to_polars_every(tf)
+        tf_df = _resample_ohlcv(df, every)
+        if tf_df is None or tf_df.is_empty():
+            continue
+
+        tf_ma_specs = [x for x in manifest["ma_specs"] if x["tf"] == tf]
+        tf_stoch_specs = [x for x in manifest["stoch_specs"] if x["tf"] == tf]
+        tf_lookback_specs = [x for x in manifest["lookback_specs"] if x["tf"] == tf]
+        tf_bbw_specs = [x for x in manifest["bbw_specs"] if x["tf"] == tf]
+
+        tf_df = _add_ma_features(tf_df, tf_ma_specs)
+        tf_df = _add_stoch_features(tf_df, tf_stoch_specs)
+        tf_df = _add_lookback_features(tf_df, tf_lookback_specs)
+        tf_df = _add_bbw_features(tf_df, tf_bbw_specs)
+
+        feature_cols = [
+            c
+            for c in tf_df.columns
+            if c not in {"time", "open", "high", "low", "close", "volume", "spread", "funding_rate", "time_ns"}
+        ]
+        df = _join_features(df, tf_df, feature_cols)
+
     run_cfg["feature_manifest"] = manifest
     run_cfg["feature_cache_key"] = manifest["cache_key"]
-    run_cfg["ma_cols"] = [x["col"] for x in manifest["ma_specs"]]
-    run_cfg["stoch_cols"] = [x["col"] for x in manifest["stoch_specs"]]
-    run_cfg["bbw_cols"] = [x["col"] for x in manifest["bbw_specs"]]
+    run_cfg["ma_cols"] = list(manifest.get("ma_cols", []))
+    run_cfg["stoch_cols"] = list(manifest.get("stoch_cols", []))
+    run_cfg["lookback_cols"] = list(manifest.get("lookback_cols", []))
+    run_cfg["bbw_cols"] = list(manifest.get("bbw_cols", []))
     run_cfg["lookback_map"] = _build_lookback_map(run_cfg, manifest)
 
     return df, run_cfg
@@ -467,28 +480,25 @@ def prepare_feature_cache(
     if not base_path.exists():
         raise RuntimeError(f"Base data file not found at {base_path}")
 
-    manifest = build_feature_manifest(run_cfg)
+    manifest = build_signal_manifest(run_cfg)
     out_path, ref_path = _cache_paths(base_path, manifest)
 
     if out_path.exists() and ref_path.exists() and not force_rebuild:
         try:
             cached_ref = json.loads(ref_path.read_text(encoding="utf8"))
-            if (
-                cached_ref.get("manifest_key") == manifest["cache_key"]
-                and cached_ref.get("feature_version") == FEATURE_CACHE_VERSION
-            ):
+            if cached_ref.get("manifest_key") == manifest["cache_key"] and cached_ref.get("feature_version") == FEATURE_CACHE_VERSION:
                 run_cfg["feature_manifest"] = manifest
                 run_cfg["feature_cache_key"] = manifest["cache_key"]
-                run_cfg["ma_cols"] = [x["col"] for x in manifest["ma_specs"]]
-                run_cfg["stoch_cols"] = [x["col"] for x in manifest["stoch_specs"]]
-                run_cfg["bbw_cols"] = [x["col"] for x in manifest["bbw_specs"]]
+                run_cfg["ma_cols"] = list(manifest.get("ma_cols", []))
+                run_cfg["stoch_cols"] = list(manifest.get("stoch_cols", []))
+                run_cfg["lookback_cols"] = list(manifest.get("lookback_cols", []))
+                run_cfg["bbw_cols"] = list(manifest.get("bbw_cols", []))
                 run_cfg["lookback_map"] = cached_ref.get("lookback_map", {})
                 return out_path, manifest
         except Exception:
             pass
 
-    df = pl.read_parquet(str(base_path))
-    df = df.sort("time")
+    df = pl.read_parquet(str(base_path)).sort("time")
 
     norm_exprs = []
     if "time" in df.columns:
@@ -498,42 +508,22 @@ def prepare_feature_cache(
     else:
         norm_exprs.append(pl.col("time").cast(pl.Datetime("ns")).cast(pl.Int64).alias("time_ns"))
 
-    if "close" not in df.columns:
-        raise RuntimeError("df_main missing required 'close' column")
-    if "high" not in df.columns or "low" not in df.columns:
-        raise RuntimeError("df_main missing required 'high'/'low' columns")
-
     norm_exprs += [
-        pl.col("open").cast(pl.Float32).alias("open")
-        if "open" in df.columns
-        else pl.lit(None).cast(pl.Float32).alias("open"),
+        pl.col("open").cast(pl.Float32).alias("open") if "open" in df.columns else pl.lit(None).cast(pl.Float32).alias("open"),
         pl.col("high").cast(pl.Float32).alias("high"),
         pl.col("low").cast(pl.Float32).alias("low"),
         pl.col("close").cast(pl.Float32).alias("close"),
-        pl.col("volume").fill_null(0.0).cast(pl.Float32).alias("volume")
-        if "volume" in df.columns
-        else pl.lit(0.0).cast(pl.Float32).alias("volume"),
-        pl.col("spread").fill_null(0.0).cast(pl.Float32).alias("spread")
-        if "spread" in df.columns
-        else pl.lit(0.0).cast(pl.Float32).alias("spread"),
-        pl.col("funding_rate").fill_null(0.0).cast(pl.Float32).alias("funding_rate")
-        if "funding_rate" in df.columns
-        else pl.lit(0.0).cast(pl.Float32).alias("funding_rate"),
+        pl.col("volume").fill_null(0.0).cast(pl.Float32).alias("volume") if "volume" in df.columns else pl.lit(0.0).cast(pl.Float32).alias("volume"),
+        pl.col("spread").fill_null(0.0).cast(pl.Float32).alias("spread") if "spread" in df.columns else pl.lit(0.0).cast(pl.Float32).alias("spread"),
+        pl.col("funding_rate").fill_null(0.0).cast(pl.Float32).alias("funding_rate") if "funding_rate" in df.columns else pl.lit(0.0).cast(pl.Float32).alias("funding_rate"),
     ]
 
     df = df.with_columns(norm_exprs).with_row_index("idx").with_columns(pl.col("idx").cast(pl.Int64))
 
     df, run_cfg = precompute_all_possible_features(df, run_cfg, manifest=manifest)
 
-    # Keep only a single normalization step
     df = enforce_schema(df, "df_main", strict=False)
-    df = df.with_columns(
-        [
-            pl.col(c).cast(pl.Float32)
-            for c in df.columns
-            if df.schema[c] in (pl.Float64, pl.Float32)
-        ]
-    )
+    df = df.with_columns([pl.col(c).cast(pl.Float32) for c in df.columns if df.schema[c] in (pl.Float32, pl.Float64)])
 
     df.write_parquet(str(out_path), compression="snappy")
 
@@ -544,6 +534,7 @@ def prepare_feature_cache(
         "lookback_map": run_cfg.get("lookback_map", {}),
         "ma_cols": run_cfg.get("ma_cols", []),
         "stoch_cols": run_cfg.get("stoch_cols", []),
+        "lookback_cols": run_cfg.get("lookback_cols", []),
         "bbw_cols": run_cfg.get("bbw_cols", []),
     }
     ref_path.write_text(json.dumps(ref_payload, indent=2), encoding="utf8")
@@ -570,7 +561,8 @@ def load_prepared_feature_ref(session_dir: Path) -> dict:
 
 
 __all__ = [
-    "build_feature_manifest",
+    "FEATURE_CACHE_VERSION",
+    "build_signal_manifest",
     "precompute_all_possible_features",
     "prepare_feature_cache",
     "load_prepared_feature_ref",

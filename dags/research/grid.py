@@ -16,6 +16,7 @@ import pandas as pd
 import pyarrow.parquet as pq
 import secrets
 from itertools import product
+import hashlib
 
 import numba as _numba
 from numba import njit
@@ -68,7 +69,7 @@ from research.master_io_utils import (
 
 from common.profiling import maybe_profile
 
-from research.grid_row_builders import _make_master_row, build_trade_ml_rows_from_backtest
+from research.grid_row_builders import _make_master_row
 
 from research.ccd_surrogate import make_ccd_eval_row, stage_ccd_eval_rows
 
@@ -123,6 +124,39 @@ def _get_memory_guard_mb() -> float:
         return float(psutil.virtual_memory().total) / (1024.0 * 1024.0)
     except Exception:
         return 0.0
+
+def _stable_json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _signal_cache_fingerprint(run_cfg: dict, regime_cfg: dict, regime_id: int) -> str:
+    keys = [
+        "ma_int",
+        "ma_reversion",
+        "entry_lookback_units",
+        "use_stochastic",
+        "stoch_key",
+        "stoch_k",
+        "stoch_d",
+        "stoch_s",
+        "stoch_thresholds",
+        "stoch_lower",
+        "stoch_upper",
+        "use_bbw",
+        "bbw_periods",
+        "bbw_std",
+        "bbw_thresholds",
+        "signal_timeframes",
+        "signal_structure",
+    ]
+
+    payload = {
+        "regime_id": int(regime_id),
+        "feature_cache_key": run_cfg.get("feature_cache_key"),
+        "base_minutes": run_cfg.get("BASE_MINUTES"),
+        "signal_keys": {k: regime_cfg.get(k, run_cfg.get(k)) for k in keys},
+    }
+    return hashlib.sha1(_stable_json(payload).encode("utf8")).hexdigest()[:16]
 
 def _split_period_windows_from_pl(
     df: pl.DataFrame,
@@ -456,9 +490,11 @@ def _get_or_generate_global_signals(
     force_rebuild_cache = bool(run_cfg.get("force_rebuild_cache", False))
     df_main: pl.DataFrame = data_ctx["df_main"]
 
+    cache_tag = _signal_cache_fingerprint(run_cfg, regime_cfg, regime_id)
+
     if not force_rebuild_cache:
         try:
-            cached = load_global_signals_cached(months, str(regime_id))
+            cached = load_global_signals_cached(months, f"{regime_id}_{cache_tag}")
             if cached is not None and not cached.is_empty():
                 cached = enforce_schema(cached, "signals", strict=False)
                 return cached, {
@@ -480,7 +516,7 @@ def _get_or_generate_global_signals(
         try:
             signals_for_cache = signals.select(["idx", "time_ns", "side", "regime_id"])
             signals_for_cache = enforce_schema(signals_for_cache, "signals", strict=True)
-            stage_global_signals(months, str(regime_id), signals_for_cache)
+            stage_global_signals(months, f"{regime_id}_{cache_tag}", signals_for_cache)
         except Exception as e:
             logger.debug("stage_for_flush(global signals) failed cfg=%s: %s", regime_id, e)
 
@@ -764,7 +800,7 @@ def process_era_combos(
                             int(row.get("trailing_sl_interval", 0)),
                             int(bool(row.get("trailing_sl_stop_at_pos", True))),
                             int(bool(row.get("use_limit_entry", True))),
-                            int(row.get("limit_order_expiry_h", 0)),
+                            int(row.get("limit_order_expiry_bars", 0)),
                             int(row.get("trade_window_interval", 0)),
                         )
                         bucket_map[key] = row
@@ -812,7 +848,7 @@ def process_era_combos(
     empty_rows_written = 0
 
     use_limit_entry = bool(regime_cfg.get("use_limit_entry", True))
-    limit_order_expiry_h = int(regime_cfg.get("limit_order_expiry_h", 0) or 0)
+    limit_order_expiry_bars = int(regime_cfg.get("limit_order_expiry_bars", 0) or 0)
     trade_window_interval = int(regime_cfg.get("trade_window_interval", 0) or 0)
 
     for sl_val, tp_val in combos:
@@ -830,6 +866,7 @@ def process_era_combos(
                         sl_val=sl_val,
                         tp_val=tp_val,
                         regime_cfg=regime_cfg,
+                        run_cfg=run_cfg,
                     )
                     buffer_master_row(results_dir, batch_id, master_row_raw)
                     era_master_rows_written[era_label] += 1
@@ -848,7 +885,7 @@ def process_era_combos(
                     tp=float(tp_val),
                     sl_tp_in_pct=bool(run_cfg.get("sl_tp_in_pct", True)),
                     exit_window_h=int(regime_cfg.get("exit_window_h", 0)),
-                    limit_order_expiry_h=limit_order_expiry_h,
+                    limit_order_expiry_bars=limit_order_expiry_bars,
                     trade_window_interval=trade_window_interval,
                     base_minutes=int(run_cfg.get("BASE_MINUTES", 5)),
                     spread=float(run_cfg.get("BTC_SETTINGS", {}).get("spread", 0.0)),
@@ -897,6 +934,7 @@ def process_era_combos(
                         sl_val=sl_val,
                         tp_val=tp_val,
                         regime_cfg=regime_cfg,
+                        run_cfg=run_cfg,
                     )
                     buffer_master_row(results_dir, batch_id, master_row_raw)
                     era_master_rows_written[era_label] += 1
@@ -930,6 +968,7 @@ def process_era_combos(
                         sl_val=sl_val,
                         tp_val=tp_val,
                         regime_cfg=regime_cfg,
+                        run_cfg=run_cfg,
                     )
                     buffer_master_row(results_dir, batch_id, master_row_raw)
                     era_master_rows_written[era_label] += 1
@@ -957,7 +996,7 @@ def process_era_combos(
                     int(regime_cfg.get("trailing_sl_interval", 0)),
                     int(bool(regime_cfg.get("trailing_sl_stop_at_pos", True))),
                     int(use_limit_entry),
-                    int(limit_order_expiry_h),
+                    int(limit_order_expiry_bars),
                     int(trade_window_interval),
                 )
 
@@ -1004,6 +1043,7 @@ def process_era_combos(
                             sl_val=sl_val,
                             tp_val=tp_val,
                             regime_cfg=regime_cfg,
+                            run_cfg=run_cfg,
                         )
                         buffer_master_row(results_dir, batch_id, master_row_raw)
                         era_master_rows_written[era_label] += 1
@@ -1034,7 +1074,7 @@ def process_era_combos(
                                 "trailing_sl_interval": [int(regime_cfg.get("trailing_sl_interval", 0))],
                                 "trailing_sl_stop_at_pos": [bool(regime_cfg.get("trailing_sl_stop_at_pos", True))],
                                 "use_limit_entry": [bool(use_limit_entry)],
-                                "limit_order_expiry_h": [int(limit_order_expiry_h)],
+                                "limit_order_expiry_bars": [int(limit_order_expiry_bars)],
                                 "trade_window_interval": [int(trade_window_interval)],
                                 "entry_idx": pl.Series([entry_idx], dtype=pl.List(pl.Int64)),
                                 "entry_price": pl.Series([entry_price_arr], dtype=pl.List(pl.Float32)),
@@ -1057,6 +1097,7 @@ def process_era_combos(
                         sl_val=sl_val,
                         tp_val=tp_val,
                         regime_cfg=regime_cfg,
+                        run_cfg=run_cfg,
                     )
                     buffer_master_row(results_dir, batch_id, master_row_raw)
                     era_master_rows_written[era_label] += 1
@@ -1073,6 +1114,7 @@ def process_era_combos(
                         sl_val=sl_val,
                         tp_val=tp_val,
                         regime_cfg=regime_cfg,
+                        run_cfg=run_cfg,
                     )
                     buffer_master_row(results_dir, batch_id, master_row_raw)
                     era_master_rows_written[era_label] += 1
@@ -1126,6 +1168,7 @@ def process_era_combos(
                         max_dd=current_max_dd,
                         max_consecutive_losses=compute_max_consecutive_losses(pnl_pct_arr),
                         regime_cfg=regime_cfg,
+                        run_cfg=run_cfg,
                         sl_hit=avg_sl_hit,
                         tp_hit=avg_tp_hit,
                     )
@@ -1164,6 +1207,7 @@ def process_era_combos(
                     max_dd=max_dd,
                     max_consecutive_losses=compute_max_consecutive_losses(closed_rets),
                     regime_cfg=regime_cfg,
+                    run_cfg=run_cfg,
                     sl_hit=avg_sl_hit,
                     tp_hit=avg_tp_hit,
                 )
@@ -1318,25 +1362,13 @@ def compute_config_and_save(batch_path: str, session_dir: str, compute_backtest:
             except Exception:
                 logger.debug("regime_id not int-convertible: %s", regime_cfg.get("regime_id"))
 
-            regime_cfg["ma_int"] = int(regime_cfg.get("ma_int", 0) or 0)
-            regime_cfg["ma_reversion"] = bool(regime_cfg.get("ma_reversion", False))
-            lb_val = regime_cfg.get("entry_lookback_units", 0)
-            regime_cfg["entry_lookback_units"] = lb_val if isinstance(lb_val, list) else int(lb_val or 0)
-            regime_cfg["exit_window_h"] = int(regime_cfg.get("exit_window_h", 0) or 0)
-            regime_cfg["use_stochastic"] = bool(regime_cfg.get("use_stochastic", False))
-
-            regime_cfg["bbw_periods"] = int(regime_cfg.get("bbw_periods", 0) or 0)
-            regime_cfg["bbw_std"] = float(regime_cfg.get("bbw_std", 0.0) or 0.0)
-            regime_cfg["use_bbw"] = bool(regime_cfg.get("use_bbw", False))
-            regime_cfg["bbw_thresholds"] = int(regime_cfg.get("bbw_thresholds", 0) or 0)
-
             regime_cfg["use_trailing_sl"] = bool(regime_cfg.get("use_trailing_sl", False))
             regime_cfg["trailing_sl_pct"] = float(regime_cfg.get("trailing_sl_pct", 0.0) or 0.0)
             regime_cfg["trailing_sl_interval"] = int(regime_cfg.get("trailing_sl_interval", 0) or 0)
             regime_cfg["trailing_sl_stop_at_pos"] = bool(regime_cfg.get("trailing_sl_stop_at_pos", True))
 
             regime_cfg["use_limit_entry"] = bool(regime_cfg.get("use_limit_entry", True))
-            regime_cfg["limit_order_expiry_h"] = int(regime_cfg.get("limit_order_expiry_h", 0) or 0)
+            regime_cfg["limit_order_expiry_bars"] = int(regime_cfg.get("limit_order_expiry_bars", 0) or 0)
             regime_cfg["trade_window_interval"] = int(regime_cfg.get("trade_window_interval", 0) or 0)
 
             regime_id = regime_cfg.get("regime_id")

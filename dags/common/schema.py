@@ -21,22 +21,11 @@ _LOG = logging.getLogger(__name__)
 # Canonical schemas (polars dtypes)
 # -------------------------
 MASTER_SCHEMA: Dict[str, pl.DataType] = {
-    # 1. Identifiers & Temporal Context
     "regime_id": pl.Int32,
     "era_int": pl.Int64,
     "side": pl.Int8,
 
-    # 2. Strategy Hyperparameters
-    "ma_int": pl.Int32,
-    "ma_reversion": pl.Boolean,
-    "entry_lookback_units": pl.Int32,
     "exit_window_h": pl.Int32,
-    "use_stochastic": pl.Boolean,
-    "stoch_key": pl.String,   # "12-3-3 (20/80)" (Easy for Humans)
-    "use_bbw": pl.Boolean,
-    "bbw_periods": pl.Int32,
-    "bbw_std": pl.Float32,
-    "bbw_thresholds": pl.Int32,
     "SL": pl.Float32,
     "TP": pl.Float32,
     "SL_hit": pl.Float32,
@@ -48,16 +37,16 @@ MASTER_SCHEMA: Dict[str, pl.DataType] = {
     "trailing_sl_stop_at_pos": pl.Boolean,
 
     "use_limit_entry": pl.Boolean,
-    "limit_order_expiry_h": pl.Int32,
-
+    "limit_order_expiry_bars": pl.Int32,
     "trade_window_interval": pl.Int32,
 
-    # 4. Performance Metrics
     "total_pos": pl.Int32,
     "win_pos": pl.Int32,
     "balance": pl.Float32,
     "max_drawdown": pl.Float32,
     "max_consecutive_losses": pl.Int32,
+
+    "signal_json": pl.String,
 }
 
 EQUITY_SCHEMA: Dict[str, pl.DataType] = {
@@ -83,7 +72,7 @@ TRADE_ML_SCHEMA: Dict[str, pl.DataType] = {
     "TP_hit": pl.Float32,
 
     "use_limit_entry": pl.Boolean,
-    "limit_order_expiry_h": pl.Int32,
+    "limit_order_expiry_bars": pl.Int32,
     "trade_window_interval": pl.Int32,
 
     "signal_idx": pl.Int64,
@@ -142,7 +131,7 @@ CCD_EVAL_SCHEMA: Dict[str, pl.DataType] = {
     "trailing_sl_interval": pl.Int32,
     "trailing_sl_stop_at_pos": pl.Boolean,
     "use_limit_entry": pl.Boolean,
-    "limit_order_expiry_h": pl.Int32,
+    "limit_order_expiry_bars": pl.Int32,
     "trade_window_interval": pl.Int32,
 
     # winner score / scalarized target
@@ -184,7 +173,7 @@ CACHE_BACKTEST_SCHEMA: Dict[str, pl.DataType] = {
     "trailing_sl_interval": pl.Int32,
     "trailing_sl_stop_at_pos": pl.Boolean,
     "use_limit_entry": pl.Boolean,
-    "limit_order_expiry_h": pl.Int32,
+    "limit_order_expiry_bars": pl.Int32,
 }
 
 DF_MAIN_SCHEMA: Dict[str, pl.DataType] = {

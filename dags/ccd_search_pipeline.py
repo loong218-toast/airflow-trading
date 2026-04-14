@@ -19,7 +19,7 @@ DATA_LAKE_ROOT = Variable.get(
     "DATA_LAKE_ROOT",
     default=os.getenv("DATA_LAKE_ROOT", "/opt/airflow/airflow-trading/data_lake"),
 )
-CCD_RESUME_IF_POSSIBLE = Variable.get("GRID_RESUME_IF_POSSIBLE", default="true").lower() == "true"
+CCD_RESUME_IF_POSSIBLE = Variable.get("CCD_RESUME_IF_POSSIBLE", default="false").lower() == "true"
 
 PERF_LOCAL_PATH = Path("/opt/airflow/airflow-trading/performance_config_local.json")
 PERF_CLOUD_PATH = Path("/opt/airflow/airflow-trading/cloud_performance_config_cloud.json")
@@ -57,6 +57,75 @@ def apply_performance_and_run_config() -> dict:
 
     run_cfg["search_mode"] = str(run_cfg.get("search_mode", "cyclic_coordinate_descent"))
     return run_cfg
+
+def _build_next_cycle_payload(
+    *,
+    session_dir: Path,
+    current_cycle: int,
+    max_cycles: int,
+    current_run_id: str,
+    dag_conf: dict,
+    run_cfg: dict,
+    result: dict,
+    state: dict,
+    cycle_seconds: float,
+    avg_cycle_seconds: float,
+) -> dict:
+    fatal_reasons = {
+        "empty_master_df",
+        "no_pending_batches",
+        "no_candidate_keys_for_block",
+        "max_cycles_reached",
+    }
+
+    reason = str(result.get("reason", "") or "")
+    next_cycle = int(current_cycle) + 1
+    next_cycle_exists = next_cycle < int(max_cycles)
+
+    should_trigger_next = next_cycle_exists and reason not in fatal_reasons
+    if reason == "no_incumbent_found":
+        should_trigger_next = next_cycle_exists
+
+    progress = dict(state.get("progress") or {})
+    remaining_cycles = max(0, int(max_cycles) - next_cycle)
+    eta_seconds = float(avg_cycle_seconds) * remaining_cycles
+
+    ts = datetime.now().strftime("%H%M%S")
+    next_run_id = f"ccd_search__{session_dir.name}__cycle_{next_cycle:04d}__{ts}"
+
+    next_conf = {
+        "session_dir": str(session_dir),
+        "cycle_idx": next_cycle,
+        "max_cycles": int(max_cycles),
+        "root_run_id": str(dag_conf.get("root_run_id") or current_run_id),
+        "parent_run_id": current_run_id,
+        "search_mode": str(run_cfg.get("search_mode", "cyclic_coordinate_descent")),
+        "bootstrap": False,
+    }
+
+    return {
+        "cycle_idx": int(current_cycle),
+        "cycle_display": int(current_cycle) + 1,
+        "max_cycles": int(max_cycles),
+        "max_cycle_display": int(max_cycles),
+        "done": True,
+        "selected": bool(result.get("selected", False)),
+        "cycle_seconds": float(cycle_seconds),
+        "avg_cycle_seconds": float(avg_cycle_seconds),
+        "remaining_cycles": int(remaining_cycles),
+        "eta_seconds": float(eta_seconds),
+        "loss_delta": progress.get("loss_delta"),
+        "candidate_loss": progress.get("candidate_loss"),
+        "incumbent_loss_before": progress.get("incumbent_loss_before"),
+        "best_seen_loss": progress.get("best_seen_loss"),
+        "active_block": state.get("active_block"),
+        "block_refine_idx": state.get("block_refine_idx"),
+        "search_scale": state.get("search_scale"),
+        "should_trigger_next": bool(should_trigger_next),
+        "next_run_id": next_run_id if should_trigger_next else None,
+        "next_conf": next_conf if should_trigger_next else None,
+        "reason": reason,
+    }
 
 
 @dag(
@@ -222,7 +291,7 @@ def ccd_search_pipeline():
         cleanup_old_ccd_batch_masters(Path(session_dir))
         return session_dir
 
-    @task(multiple_outputs=True, pool="heavy_compute_pool")
+    @task(pool="heavy_compute_pool")
     def run_ccd_loop_task(session_dir: str):
         """
         Single CCD cycle executor.
@@ -232,10 +301,10 @@ def ccd_search_pipeline():
         next run payload when additional cycles remain.
         """
         from research.ccd import (
-            ensure_coord_descent_state,
-            load_compact_master_metrics,
-            pick_next_incumbent,
-            save_coord_descent_state,
+        ensure_coord_descent_state,
+        load_compact_master_metrics,
+        pick_next_incumbent,
+        save_coord_descent_state,
         )
         from research.ccd_config import generate_configs, list_pending_config_paths
         from research.ccd_maintenance import (
@@ -256,12 +325,20 @@ def ccd_search_pipeline():
 
         state = ensure_coord_descent_state(session_dir, run_cfg)
 
-        cycle_idx = int(state.get("cycle_idx", 0) or 0)
-        if cycle_idx >= max_cycles:
-            logger.info("CCD stop | cycle_idx=%d reached max_cycles=%d", cycle_idx, max_cycles)
+        # DAG payload is the source of truth for the current cycle.
+        current_cycle = int(dag_conf.get("cycle_idx", state.get("cycle_idx", 0)) or 0)
+
+        # Keep persisted state aligned with the DAG run before heavy work starts.
+        state["cycle_idx"] = current_cycle
+        save_coord_descent_state(session_dir, state)
+
+        if current_cycle >= max_cycles:
+            logger.info("CCD stop | cycle_idx=%d reached max_cycles=%d", current_cycle, max_cycles)
             return {
-                "cycle_idx": cycle_idx,
+                "cycle_idx": current_cycle,
+                "cycle_display": current_cycle + 1,
                 "max_cycles": max_cycles,
+                "max_cycle_display": max_cycles,
                 "done": True,
                 "should_trigger_next": False,
                 "next_run_id": None,
@@ -271,37 +348,49 @@ def ccd_search_pipeline():
 
         cycle_start = time.monotonic()
 
-        # Shared batch masters are cleared at the cycle boundary.
+        logger.info("CCD cycle start | cycle_idx=%d/%d | active_block=%s | resume=%s",
+                    current_cycle, max_cycles - 1, state.get("active_block"), bool(CCD_RESUME_IF_POSSIBLE))
+
         cleanup_old_ccd_batch_masters(session_dir)
         cleanup_ccd_cycle_artifacts(session_dir, dry_run=False)
 
-        # Candidate files are generated for the current active block.
+        logger.info("CCD step | generating configs")
         generate_configs(session_dir, run_cfg)
+
         pending_batches = list_pending_config_paths(session_dir)
+        logger.info("CCD step | pending_batches=%d", len(pending_batches))
+
         if not pending_batches:
             logger.warning("CCD cycle produced no pending batches.")
             return {
-                "cycle_idx": cycle_idx,
+                "cycle_idx": current_cycle,
+                "cycle_display": current_cycle + 1,
                 "max_cycles": max_cycles,
-                "done": False,
+                "max_cycle_display": max_cycles,
+                "done": True,
                 "should_trigger_next": False,
                 "next_run_id": None,
                 "next_conf": None,
                 "reason": "no_pending_batches",
             }
 
-        # Batch backtests remain isolated by batch file and batch id.
         for cfg_path in pending_batches:
+            logger.info("CCD step | computing %s", Path(cfg_path).name)
             compute_config_and_save(cfg_path, str(session_dir))
+            logger.info("CCD step | finished %s", Path(cfg_path).name)
 
-        # Single merge path for the cycle.
+        logger.info("CCD step | merging batch masters")
         combine_results_to_master(session_dir)
 
         merged_master = session_dir / "master_metrics.parquet"
         master_df = load_compact_master_metrics(session_dir, master_path=merged_master)
 
+        logger.info("CCD step | picking next incumbent")
         result = pick_next_incumbent(session_dir=session_dir, run_cfg=run_cfg, master_df=master_df)
         state = result.get("state", state)
+
+        # Keep the state aligned with the latest cycle number before saving.
+        state["cycle_idx"] = current_cycle
         save_coord_descent_state(session_dir, state)
 
         cycle_seconds = time.monotonic() - cycle_start
@@ -314,62 +403,46 @@ def ccd_search_pipeline():
         ]
         avg_cycle_seconds = sum(cycle_durations) / len(cycle_durations) if cycle_durations else cycle_seconds
 
-        progress = dict(state.get("progress") or {})
-        current_cycle = int(state.get("cycle_idx", 0) or 0)
-        remaining_cycles = max(0, max_cycles - current_cycle)
-        eta_seconds = avg_cycle_seconds * remaining_cycles
-
-        ts = datetime.now().strftime("%H%M%S")
-        next_run_id = f"ccd_search__{session_dir.name}__cycle_{current_cycle:04d}__{ts}"
-        next_conf = {
-            "session_dir": str(session_dir),
-            "cycle_idx": current_cycle,
-            "max_cycles": max_cycles,
-            "root_run_id": str(dag_conf.get("root_run_id") or current_run_id),
-            "parent_run_id": current_run_id,
-            "search_mode": str(run_cfg.get("search_mode", "cyclic_coordinate_descent")),
-            "bootstrap": False,
-        }
+        payload = _build_next_cycle_payload(
+            session_dir=session_dir,
+            current_cycle=current_cycle,
+            max_cycles=max_cycles,
+            current_run_id=current_run_id,
+            dag_conf=dag_conf,
+            run_cfg=run_cfg,
+            result=result,
+            state=state,
+            cycle_seconds=cycle_seconds,
+            avg_cycle_seconds=avg_cycle_seconds,
+        )
 
         logger.info(
             "CCD cycle %d/%d | active_block=%s | refine=%s/%s | scale=%.3f | selected=%s | loss_delta=%s | best_seen_loss=%s | remaining=%d | avg_cycle=%.1fs | eta=%.1fs",
-            current_cycle,
-            max_cycles,
+            payload["cycle_display"],
+            payload["max_cycle_display"],
             state.get("active_block"),
             state.get("block_refine_idx"),
             state.get("block_refine_rounds"),
             state.get("search_scale"),
             bool(result.get("selected", False)),
-            progress.get("loss_delta"),
-            progress.get("best_seen_loss"),
-            remaining_cycles,
+            payload["loss_delta"],
+            payload["best_seen_loss"],
+            payload["remaining_cycles"],
             avg_cycle_seconds,
-            eta_seconds,
+            payload["eta_seconds"],
         )
 
-        should_trigger_next = bool(state.get("incumbent", {}).get("regime_id") is not None) and current_cycle < max_cycles
+        logger.info(
+            "CCD decision debug | cycle=%s | reason=%s | selected=%s | incumbent_regime_id=%s | should_trigger_next=%s | next_cycle_exists=%s",
+            current_cycle,
+            payload["reason"],
+            bool(result.get("selected", False)),
+            state.get("incumbent", {}).get("regime_id"),
+            payload["should_trigger_next"],
+            (current_cycle + 1) < max_cycles,
+        )
 
-        return {
-            "cycle_idx": current_cycle,
-            "max_cycles": max_cycles,
-            "done": True,
-            "selected": bool(result.get("selected", False)),
-            "cycle_seconds": cycle_seconds,
-            "avg_cycle_seconds": avg_cycle_seconds,
-            "remaining_cycles": remaining_cycles,
-            "eta_seconds": eta_seconds,
-            "loss_delta": progress.get("loss_delta"),
-            "candidate_loss": progress.get("candidate_loss"),
-            "incumbent_loss_before": progress.get("incumbent_loss_before"),
-            "best_seen_loss": progress.get("best_seen_loss"),
-            "active_block": state.get("active_block"),
-            "block_refine_idx": state.get("block_refine_idx"),
-            "search_scale": state.get("search_scale"),
-            "should_trigger_next": should_trigger_next,
-            "next_run_id": next_run_id if should_trigger_next else None,
-            "next_conf": next_conf if should_trigger_next else None,
-            "state": state,
-        }
+        return payload
 
     @task.branch
     def choose_cycle_branch(cycle_result: dict) -> str:
@@ -462,7 +535,6 @@ def ccd_search_pipeline():
     trigger_next_cycle_task = TriggerDagRunOperator(
         task_id="trigger_next_cycle_task",
         trigger_dag_id="ccd_search",
-        # Use the | default filter to avoid None errors during parsing
         trigger_run_id="{{ (task_instance.xcom_pull(task_ids='run_ccd_loop_task') or {}).get('next_run_id', 'next_run_placeholder') }}",
         conf="{{ (task_instance.xcom_pull(task_ids='run_ccd_loop_task') or {}).get('next_conf', {}) | tojson }}",
         wait_for_completion=False,
