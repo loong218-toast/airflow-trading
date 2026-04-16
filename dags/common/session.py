@@ -50,21 +50,36 @@ def _any_parquet_with_rows_under(dirpath: Path) -> bool:
 
 def is_session_finished(session_dir: Path) -> bool:
     """
-    Checks if the final consolidation has completed.
-    In the streaming architecture, master_metrics.parquet is the final artifact.
+    A session is finished only when the final incumbent has been selected
+    and the final equity artifact exists.
     """
+    session_dir = Path(session_dir)
     master_path = session_dir / "master_metrics.parquet"
-    
-    # If the master file exists and isn't a 0-byte ghost file, we are done.
-    if master_path.exists():
-        try:
-            if pq.ParquetFile(str(master_path)).metadata.num_rows > 0:
-                return True
-        except Exception:
-            # If the file is corrupted or currently being written, don't skip yet
-            return False
+    state_path = session_dir / "coord_descent_state.json"
+    final_equity_dir = session_dir / "equity_partitioned"
 
-    return False
+    if not master_path.exists():
+        return False
+
+    try:
+        if pq.ParquetFile(str(master_path)).metadata.num_rows <= 0:
+            return False
+    except Exception:
+        return False
+
+    if not state_path.exists():
+        return False
+
+    try:
+        state = json.loads(state_path.read_text(encoding="utf8"))
+    except Exception:
+        return False
+
+    incumbent = dict(state.get("incumbent") or {})
+    if incumbent.get("regime_id") is None:
+        return False
+
+    return _any_parquet_with_rows_under(final_equity_dir)
 
 def prune_old_sessions(base_root: Optional[str] = None, keep: int = 10) -> Dict[str, Any]:
     """
@@ -164,8 +179,8 @@ def prepare_base_data(session_dir: str, db_uri: str, run_cfg: Dict[str, Any], fo
         try:
             if _parquet_has_rows(target_base_file):
                 logger.info("Reusing existing base file: %s", target_base_file)
-                df_main = pl.read_parquet(str(target_base_file))
-                return {"status": "reused", "path": str(target_base_file), "rows": int(df_main.height)}
+                meta = pq.ParquetFile(str(target_base_file)).metadata
+                return {"status": "reused", "path": str(target_base_file), "rows": int(meta.num_rows)}
         except Exception as e:
             logger.debug("Base file exists but could not be read: %s (will rebuild)", e)
 
@@ -215,8 +230,12 @@ def prepare_base_data(session_dir: str, db_uri: str, run_cfg: Dict[str, Any], fo
     logger.info("Enforcing chronological sort order on df_main...")
     df_main = df_main.sort("time")
 
-    # atomically write the global base file
-    atomic_write_parquet(df_main, global_base_file)
+    # atomically write the chosen base file
+    atomic_write_parquet(df_main, target_base_file)
+
+    # optionally mirror the full build to the global lake if requested
+    if make_full and target_base_file != global_base_file:
+        atomic_write_parquet(df_main, global_base_file)
 
     actual_start = df_main["time"][0]
     actual_end = df_main["time"][-1]

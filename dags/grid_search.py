@@ -1,3 +1,5 @@
+# grid_search.py
+
 import logging
 from airflow.sdk import Variable, dag, task
 import pendulum
@@ -232,20 +234,16 @@ def grid_search_pipeline():
         from research.grid import compute_config_and_save
         from airflow.sdk import get_current_context
 
-        # --- GET WORKER IDENTITY ---
         context = get_current_context()
-        ti = context['ti']
+        ti = context["ti"]
         worker_id = getattr(ti, "map_index", -1)
-        
-        # Set environment variables so the cache system can see them
+
         os.environ["AIRFLOW_MAP_INDEX"] = str(worker_id)
         os.environ["TOTAL_WORKER_COUNT"] = str(total_count)
-        
-        logger.info(f"🧵 Worker {worker_id}/{total_count} processing {cfg_path}")
-        
-        # This calls the actual logic in research/grid.py
-        # Ensure compute_config_and_save uses the unique-part logic we discussed
-        return compute_config_and_save(cfg_path, session_dir)
+
+        logger.info("🧵 Worker %s/%s processing %s", worker_id + 1, total_count, cfg_path)
+
+        return compute_config_and_save(cfg_path, session_dir, total_batches=total_count)
 
     @task()
     def combine_results_task(session_dir: str, dependencies):
@@ -259,6 +257,14 @@ def grid_search_pipeline():
         logger.info(f"🧹 Combining equity parts for {session_dir}...")
         outputs = combine_all_equity_parts(session_dir)
         logger.info("✅ Equity merge complete: %d era files", len(outputs))
+        return [str(p) for p in outputs]
+
+    @task()
+    def combine_trade_ml_task(session_dir: str, dependencies):
+        from research.trade_ml_io_utils import combine_all_trade_ml_parts
+        logger.info(f"🧹 Combining trade_ml parts for {session_dir}...")
+        outputs = combine_all_trade_ml_parts(session_dir)
+        logger.info("✅ Trade ML merge complete: %d era files", len(outputs))
         return [str(p) for p in outputs]
 
     # --- EXECUTION FLOW ---
@@ -287,5 +293,6 @@ def grid_search_pipeline():
 
     combine_master = combine_results_task(s_path, dependencies=compute_results)
     combine_equity = combine_equity_task(s_path, dependencies=combine_master)
+    combine_trade_ml = combine_trade_ml_task(s_path, dependencies=combine_equity)
 
 grid_search_dag = grid_search_pipeline()

@@ -21,22 +21,11 @@ _LOG = logging.getLogger(__name__)
 # Canonical schemas (polars dtypes)
 # -------------------------
 MASTER_SCHEMA: Dict[str, pl.DataType] = {
-    # 1. Identifiers & Temporal Context
     "regime_id": pl.Int32,
     "era_int": pl.Int64,
     "side": pl.Int8,
 
-    # 2. Strategy Hyperparameters
-    "ma_int": pl.Int32,
-    "ma_reversion": pl.Boolean,
-    "entry_lookback_units": pl.Int32,
     "exit_window_h": pl.Int32,
-    "use_stochastic": pl.Boolean,
-    "stoch_key": pl.String,   # "12-3-3 (20/80)" (Easy for Humans)
-    "use_bbw": pl.Boolean,
-    "bbw_periods": pl.Int32,
-    "bbw_std": pl.Float32,
-    "bbw_thresholds": pl.Int32,
     "SL": pl.Float32,
     "TP": pl.Float32,
 
@@ -46,16 +35,16 @@ MASTER_SCHEMA: Dict[str, pl.DataType] = {
     "trailing_sl_stop_at_pos": pl.Boolean,
 
     "use_limit_entry": pl.Boolean,
-    "limit_order_expiry_h": pl.Int32,
-
+    "limit_order_expiry_bars": pl.Int32,
     "trade_window_interval": pl.Int32,
 
-    # 4. Performance Metrics
     "total_pos": pl.Int32,
     "win_pos": pl.Int32,
     "balance": pl.Float32,
     "max_drawdown": pl.Float32,
     "max_consecutive_losses": pl.Int32,
+
+    "signal_json": pl.String,
 }
 
 EQUITY_SCHEMA: Dict[str, pl.DataType] = {
@@ -77,9 +66,11 @@ TRADE_ML_SCHEMA: Dict[str, pl.DataType] = {
     "side": pl.Int8,
     "SL": pl.Float32,
     "TP": pl.Float32,
+    "SL_hit": pl.Float32,
+    "TP_hit": pl.Float32,
 
     "use_limit_entry": pl.Boolean,
-    "limit_order_expiry_h": pl.Int32,
+    "limit_order_expiry_bars": pl.Int32,
     "trade_window_interval": pl.Int32,
 
     "signal_idx": pl.Int64,
@@ -103,11 +94,6 @@ TRADE_ML_SCHEMA: Dict[str, pl.DataType] = {
 
     "fill_delay_bars": pl.Int32,
     "pnl_pct": pl.Float32,
-
-    "rng_24h_entry": pl.Float32,
-    "rng_72h_entry": pl.Float32,
-    "rng_1w_entry": pl.Float32,
-    "rng_1m_entry": pl.Float32,
 }
 
 CACHE_SIGNAL_SCHEMA: Dict[str, pl.DataType] = {
@@ -137,7 +123,7 @@ CACHE_BACKTEST_SCHEMA: Dict[str, pl.DataType] = {
     "trailing_sl_interval": pl.Int32,
     "trailing_sl_stop_at_pos": pl.Boolean,
     "use_limit_entry": pl.Boolean,
-    "limit_order_expiry_h": pl.Int32,
+    "limit_order_expiry_bars": pl.Int32,
 }
 
 DF_MAIN_SCHEMA: Dict[str, pl.DataType] = {
@@ -160,6 +146,7 @@ DF_MAIN_SCHEMA: Dict[str, pl.DataType] = {
 SCHEMA_REGISTRY: Dict[str, Dict[str, pl.DataType]] = {
     "master": MASTER_SCHEMA,
     "equity": EQUITY_SCHEMA,
+    "trade_ml": TRADE_ML_SCHEMA,
     "signals": CACHE_SIGNAL_SCHEMA,
     "backtest": CACHE_BACKTEST_SCHEMA,
     "df_main": DF_MAIN_SCHEMA,
@@ -169,17 +156,18 @@ CLEAN_SCHEMA = DF_MAIN_SCHEMA
 
 # Optional per-schema metadata (single place to adjust behavior)
 SCHEMA_METADATA: Dict[str, Dict[str, Any]] = {
-    # you can change key_columns in future if you want a different detection rule
     "equity": {
         "key_columns": ["time_ns", "pnl_pct", "equity"],
-        # the fraction of non-null values (per-column) required to consider the fragment as trade-like
         "min_non_null_fraction": 0.01,
     },
     "master": {
-        # master-specific columns used to detect master-like files accidentally written into equity
         "key_columns": ["balance", "total_pos", "max_drawdown"],
     },
-    # other schemas may add metadata later...
+   "trade_ml": {
+        "key_columns": ["signal_idx", "entry_idx", "exit_idx", "pnl_pct"],
+        "min_non_null_fraction": 0.01,
+    },
+
 }
 
 
