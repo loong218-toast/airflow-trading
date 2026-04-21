@@ -6,6 +6,8 @@ import json
 import logging
 import math
 import os
+import re
+import time
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -24,8 +26,14 @@ from common.cache import (
     load_global_signals_cached,
     stage_for_flush,
     stage_global_signals,
+    build_scope_cache_id
 )
-from common.feature_helpers import generate_filtered_signals
+from common.feature_helpers import (
+    build_signal_json,
+    generate_filtered_signals,
+    signal_scope_text,
+)
+
 from common.feature_prep import (
     load_prepared_feature_ref,
     precompute_all_possible_features,
@@ -35,21 +43,20 @@ from common.profiling import maybe_profile
 from common.schema import cast_to_schema, classify_fragment, enforce_schema, get_schema
 from etl.transform import build_df_main_from_5m_polars, load_candles_from_db_polars
 from research.backtest import (
-    _numba_pnl_from_actual_exits,
     backtest_signals_sl_tp_rets,
     compute_max_consecutive_losses,
     fast_compound_equity_gate,
 )
 from research.grid_row_builders import (
-    _build_signal_json,
     _make_empty_master_row,
     _make_master_row,
     build_trade_ml_rows_from_backtest,
 )
 from research.io_utils import FULL_LAKE_DIR
 from research.master_io_utils import _flush_master_rows_buffer, buffer_master_row
-from research.trade_ml_io_utils import stage_trade_ml_part, _stage_trade_ml_era_rows
+from research.trade_ml_stager import TradeMLStager
 from research.merge_utils import combine_cache, combine_results_to_master, merge_batch_master_parts
+from research.equitystager import EquityStager, compute_equity_preview, stage_equity_from_preview
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -177,131 +184,6 @@ def _split_period_windows_from_pl(
 
     return windows
 
-class EquityStager:
-    """
-    One temp parquet per (partition_key, batch_id, worker_id).
-    Appends row groups to the same file instead of creating many files.
-    """
-
-    def __init__(
-        self,
-        equity_part_base: Path,
-        batch_id: int,
-        flush_rows: int,
-        partition_by: str,
-        max_total_rows: int = 200_000,
-        max_partitions: int = 128,
-        tmp_dir: Optional[Path] = None,
-    ):
-        self.base = Path(equity_part_base)
-        self.batch_id = int(batch_id)
-        self.flush_rows = int(flush_rows)
-        self.partition_by = str(partition_by)
-
-        self.max_total_rows = int(max_total_rows)
-        self.max_partitions = int(max_partitions)
-
-        self._tmp_dir = Path(tmp_dir) if tmp_dir is not None else (self.base / "_tmp")
-        self._tmp_dir.mkdir(parents=True, exist_ok=True)
-        self.base.mkdir(parents=True, exist_ok=True)
-
-        # Open writer per partition key and keep it open until flush_all()
-        self._writers: Dict[str, pq.ParquetWriter] = {}
-        self._paths: Dict[str, Path] = {}
-
-    def _worker_id(self) -> str:
-        return os.getenv("AIRFLOW_MAP_INDEX", "0")
-
-    def _part_path(self, part_key: str) -> Path:
-        worker_id = self._worker_id()
-        return self._tmp_dir / (
-            f"equity_{self.partition_by}={part_key}"
-            f"_batch={self.batch_id}"
-            f"_task={worker_id}.parquet"
-        )
-
-    def _ensure_writer(self, part_key: str, first_table: Optional[pl.DataFrame] = None) -> pq.ParquetWriter:
-        writer = self._writers.get(part_key)
-        if writer is not None:
-            return writer
-
-        out_path = self._part_path(part_key)
-        self._paths[part_key] = out_path
-
-        # Fresh run or stale partial file: overwrite cleanly
-        if out_path.exists():
-            try:
-                out_path.unlink()
-            except Exception:
-                pass
-
-        if first_table is None or first_table.height == 0:
-            raise RuntimeError(f"Cannot open ParquetWriter for empty equity batch: part_key={part_key}")
-
-        arrow_table = first_table.to_arrow()
-        writer = pq.ParquetWriter(
-            str(out_path),
-            arrow_table.schema,
-            compression="snappy",
-        )
-        self._writers[part_key] = writer
-        return writer
-
-    def _append_df(self, part_key: str, df_chunk: pl.DataFrame):
-        if df_chunk is None or df_chunk.height == 0:
-            return
-
-        writer = self._ensure_writer(part_key, df_chunk)
-        writer.write_table(df_chunk.to_arrow())
-
-
-    def stage(self, part_key: str, df_small: pl.DataFrame):
-        """
-        Append equity rows immediately, chunked by flush_rows to keep memory low.
-        """
-        if df_small is None or df_small.height == 0:
-            return
-
-        try:
-            df_canonical = enforce_schema(df_small, "equity", strict=True)
-        except Exception:
-            logger.exception("EquityStager.stage: enforce_schema failed for part %s; skipping fragment", part_key)
-            return
-
-        if df_canonical.height == 0:
-            return
-
-        n = int(df_canonical.height)
-        step = max(1, int(self.flush_rows))
-
-        for start in range(0, n, step):
-            chunk = df_canonical.slice(start, step)
-            try:
-                self._append_df(part_key, chunk)
-            except Exception:
-                logger.exception("EquityStager.stage: write failed for part %s", part_key)
-                raise
-
-    def flush(self, part_key: str):
-        """
-        No buffer to flush because writes are immediate.
-        Kept as a no-op interface method.
-        """
-        return
-
-    def flush_all(self):
-        """
-        Close all open Parquet writers.
-        """
-        for part_key, writer in list(self._writers.items()):
-            try:
-                writer.close()
-            except Exception:
-                logger.exception("EquityStager.flush_all: failed to close writer for %s", part_key)
-
-        self._writers = {}
-        self._paths = {}
-
 # SL/TP helpers (unchanged)
 def _expand_sl_tp(run_cfg: Dict) -> Tuple[List[float], List[float]]:
     def _get_vals(key):
@@ -419,35 +301,45 @@ def prepare_worker_data(session_dir: Path, run_cfg: dict):
         "main_funding_arr": _to_numpy_ensure(df_main["funding_rate"], np.float32),
     }
 
+def _scope_cache_id(regime_id: int, signal_layer: int, signal_scope_id: str) -> str:
+    scope = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(signal_scope_id or "")).strip("_") or "all"
+    return f"{int(regime_id)}__l{int(signal_layer)}__{scope}"
+
+
 def _get_or_generate_global_signals(
     regime_id: int,
     regime_cfg: dict,
     run_cfg: dict,
     data_ctx: dict,
     months: int,
+    signal_layer: int,
+    signal_scope_id: str,
 ) -> pl.DataFrame:
     """
     Build one global signal set for the full date range of the regime.
-    Cache it under era_label='GLOBAL' so it reuses your existing cache layout.
+    Cache it under a scope-aware key so single-slot, pair-slot, and full-scope
+    regimes do not collide.
     """
     force_rebuild_cache = bool(run_cfg.get("force_rebuild_cache", False))
     df_main: pl.DataFrame = data_ctx["df_main"]
 
+    cache_id = _scope_cache_id(regime_id, signal_layer, signal_scope_id)
+
     if not force_rebuild_cache:
         try:
-            cached = load_global_signals_cached(months, str(regime_id))
+            cached = load_global_signals_cached(months, cache_id)
             if cached is not None and not cached.is_empty():
                 cached = enforce_schema(cached, "signals", strict=False)
                 logger.info(
                     "global_signals cache hit cfg=%s rows=%d buys=%d sells=%d",
-                    regime_id,
+                    cache_id,
                     cached.height,
                     int(cached.filter(pl.col("side") == 1).height),
                     int(cached.filter(pl.col("side") == -1).height),
                 )
                 return cached
         except Exception as e:
-            logger.debug("global signal cache read failed cfg=%s: %s", regime_id, e)
+            logger.debug("global signal cache read failed cfg=%s: %s", cache_id, e)
 
     df_signals, stats = generate_filtered_signals(
         df_main,
@@ -458,7 +350,7 @@ def _get_or_generate_global_signals(
 
     logger.info(
         "global_signals stats cfg=%s input=%d final=%d buys=%d sells=%d ma=%s stoch=%s lookback=%s bbw=%s",
-        regime_id,
+        cache_id,
         int(stats.get("input_rows", 0)),
         int(stats.get("final_total_signals", 0)),
         int(stats.get("final_buy_signals", 0)),
@@ -473,12 +365,11 @@ def _get_or_generate_global_signals(
         try:
             signals_for_cache = df_signals.select(["idx", "time_ns", "side", "regime_id"])
             signals_for_cache = enforce_schema(signals_for_cache, "signals", strict=True)
-            stage_global_signals(months, str(regime_id), signals_for_cache)
+            stage_global_signals(months, cache_id, signals_for_cache)
         except Exception as e:
-            logger.debug("stage_for_flush(global signals) failed cfg=%s: %s", regime_id, e)
+            logger.debug("stage_for_flush(global signals) failed cfg=%s: %s", cache_id, e)
 
     return enforce_schema(df_signals, "signals", strict=False) if not df_signals.is_empty() else pl.DataFrame([], schema=get_schema("signals"))
-
 
 def _build_era_registry(
     windows,
@@ -531,128 +422,6 @@ def _build_era_registry(
 
     return out
 
-def compute_equity_preview(
-    closed_entry_prices_arr: np.ndarray,
-    closed_exit_prices_arr: np.ndarray,
-    closed_entry_idxs: np.ndarray,
-    closed_exit_idxs: np.ndarray,
-    main_close_arr: np.ndarray,
-    main_time_ns_arr: np.ndarray,
-    main_spread_arr: np.ndarray,
-    main_funding_arr: np.ndarray,
-    sl_val: float,
-    tp_val: float,
-    side_flag: int,
-    run_cfg: dict,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]:
-    """
-    Convert closed-trade exits into equity curve inputs.
-
-    This stays execution-consistent with the backtest kernel:
-    - spread can be percent or absolute depending on run_cfg
-    - funding can be per-period or per-hour depending on run_cfg
-    - risk sizing is applied here, not in the kernel
-    """
-    pnl_pct_arr = _numba_pnl_from_actual_exits(
-        entry_prices=np.asarray(closed_entry_prices_arr, dtype=np.float64),
-        exit_prices=np.asarray(closed_exit_prices_arr, dtype=np.float64),
-        spread_arr=np.asarray(main_spread_arr[closed_entry_idxs], dtype=np.float64)
-        if main_spread_arr is not None else np.zeros(closed_entry_idxs.shape[0], dtype=np.float64),
-        funding_raw=np.asarray(main_funding_arr[closed_entry_idxs], dtype=np.float64)
-        if main_funding_arr is not None else np.zeros(closed_entry_idxs.shape[0], dtype=np.float64),
-        entry_idxs=np.asarray(closed_entry_idxs, dtype=np.int64),
-        exit_idxs=np.asarray(closed_exit_idxs, dtype=np.int64),
-        main_time_ns=np.asarray(main_time_ns_arr, dtype=np.int64),
-        side_flag=int(side_flag),
-        risk_pct=float(run_cfg.get("risk_pct", 0.005)),
-        sl_val=float(sl_val),
-        sl_tp_in_pct=bool(run_cfg.get("sl_tp_in_pct", True)),
-        spread_is_percent=bool(run_cfg.get("spread_is_percent", True)),
-        funding_period_hours=int(run_cfg.get("funding_period_hours", 8)),
-        funding_is_per_hour_bool=bool(run_cfg.get("funding_is_per_hour", False)),
-        trading_fee_rate=float(run_cfg.get("trading_fees", 0.0004) or 0.0004),
-    )
-
-    if pnl_pct_arr is None or pnl_pct_arr.size == 0:
-        return (
-            np.empty(0, dtype=np.float64),
-            np.empty(0, dtype=np.int64),
-            np.empty(0, dtype=np.float64),
-            0.0,
-            False,
-        )
-
-    pnl_pct_arr = np.nan_to_num(pnl_pct_arr, nan=0.0, posinf=1e37, neginf=-1e37)
-    max_dd_threshold = float(run_cfg.get("max_dd_threshold", 0.5))
-    equity_arr, max_dd, breached = fast_compound_equity_gate(pnl_pct_arr, 100.0, max_dd_threshold)
-    equity_arr = np.nan_to_num(equity_arr, nan=0.0, posinf=1e37, neginf=-1e37)
-
-    exit_times_ns = np.asarray(main_time_ns_arr[closed_exit_idxs], dtype=np.int64)
-    return pnl_pct_arr, exit_times_ns, equity_arr, float(max_dd), bool(breached)
-    
-def stage_equity_from_preview(
-    pnl_pct_arr: np.ndarray,
-    exit_times_ns: np.ndarray,
-    equity_arr: np.ndarray,
-    closed_entry_idxs: np.ndarray,
-    closed_exit_idxs: np.ndarray,
-    sl_val: float,
-    tp_val: float,
-    regime_id: int,
-    era_int: int,
-    side_flag: int,
-    stager,
-    max_dd: float,
-) -> Tuple[float, int, float]:
-    """
-    Stage equity rows only after the DD gate already passed.
-    Returns final_balance, win_pos, max_dd.
-    """
-    if equity_arr is None or equity_arr.size == 0:
-        return 100.0, 0, float(max_dd)
-
-    pnl_pct_arr = np.nan_to_num(pnl_pct_arr, nan=0.0, posinf=1e37, neginf=-1e37)
-    equity_arr = np.nan_to_num(equity_arr, nan=0.0, posinf=1e37, neginf=-1e37)
-
-    win_pos = int(np.count_nonzero(pnl_pct_arr > 0.0))
-    final_balance = float(equity_arr[-1]) if equity_arr.size else 100.0
-
-    equity_data = {
-        "regime_id": int(regime_id),
-        "era_int": int(era_int),
-        "side": int(side_flag),
-        "SL": float(sl_val),
-        "TP": float(tp_val),
-        "time_ns": exit_times_ns.astype(np.int64),
-        "entry_idx": closed_entry_idxs.astype(np.int64),
-        "exit_idx": closed_exit_idxs.astype(np.int64),
-        "pnl_pct": pnl_pct_arr.astype(np.float32),
-        "equity": equity_arr.astype(np.float32),
-    }
-
-    try:
-        equity_df = cast_to_schema(equity_data, "equity")
-    except Exception as e:
-        logger.exception("stage_equity_from_preview: failed to build equity DataFrame: %s", e)
-        return final_balance, win_pos, float(max_dd)
-
-    meta = classify_fragment(equity_df, "equity")
-    if not meta.get("is_like", False):
-        logger.error(
-            "stage_equity_from_preview: refusing to stage fragment; not equity-like. meta=%s sample=%s",
-            meta,
-            equity_df.head(1).to_dicts() if equity_df.height else None,
-        )
-        return final_balance, win_pos, float(max_dd)
-
-    partition_val = str(regime_id) if getattr(stager, "partition_by", "") == "regime_id" else str(era_int)
-    try:
-        stager.stage(partition_val, equity_df)
-    except Exception:
-        logger.exception("stage_equity_from_preview: stager.stage failed for partition %s", partition_val)
-
-    return final_balance, win_pos, float(max_dd)
-
 def _backtest_cache_key(
     sig_n: int,
     sig_min_ns: int,
@@ -668,6 +437,10 @@ def _backtest_cache_key(
     use_limit_entry: bool,
     limit_order_expiry_bars: int,
     trade_window_interval: int,
+    trade_overlap: bool,
+    trade_flip_on_entry: bool,
+    signal_layer: int,
+    signal_scope_id: str,
 ) -> tuple:
     # This key must match the cached backtest parquet row shape exactly.
     # If any parameter changes, the cache entry should miss and recompute.
@@ -686,6 +459,10 @@ def _backtest_cache_key(
         int(bool(use_limit_entry)),
         int(limit_order_expiry_bars),
         int(trade_window_interval),
+        int(bool(trade_overlap)),
+        int(bool(trade_flip_on_entry)),
+        int(signal_layer),
+        str(signal_scope_id or ""),
     )
 
 def process_era_combos(
@@ -697,6 +474,8 @@ def process_era_combos(
     results_dir: Path,
     batch_id: int,
     stager,
+    signal_layer: int,
+    signal_scope_id: str,
     max_dd_threshold: float,
     current_idx: int,
     total_in_batch: int,
@@ -740,6 +519,21 @@ def process_era_combos(
     main_spread_arr: np.ndarray = data_ctx["main_spread_arr"]
     main_funding_arr: np.ndarray = data_ctx["main_funding_arr"]
 
+    signal_layer = int(signal_layer)
+    signal_scope_id = str(signal_scope_id or regime_cfg.get("signal_scope_id") or "").strip().lower()
+    if signal_scope_id.startswith("baseline:") and signal_layer != 0:
+        logger.warning(
+            "process_era_combos: forcing baseline regime to signal_layer=0 cfg=%s scope=%s",
+            regime_id,
+            signal_scope_id,
+        )
+        signal_layer = 0
+
+    if not signal_scope_id and signal_layer == 0:
+        signal_scope_id = "baseline:all_buy"
+
+    cache_id = _scope_cache_id(regime_id, signal_layer, signal_scope_id)
+
     months = int(run_cfg["sl_tp_interval_months"])
     grid_start = pd.to_datetime(run_cfg["grid_start_date"]).to_pydatetime()
     grid_end = pd.to_datetime(run_cfg["grid_end_date"]).to_pydatetime()
@@ -763,6 +557,8 @@ def process_era_combos(
         run_cfg=run_cfg,
         data_ctx=data_ctx,
         months=months,
+        signal_layer=signal_layer,
+        signal_scope_id=signal_scope_id,
     )
 
     if global_signals is None or global_signals.is_empty():
@@ -791,7 +587,7 @@ def process_era_combos(
             era_label = era["era_label"]
             bucket_map = {}
             try:
-                bucket_df = load_backtest_cached(months, era_label, str(regime_id))
+                bucket_df = load_backtest_cached(months, era_label, cache_id)
                 if bucket_df is not None and not bucket_df.is_empty():
                     for row in bucket_df.iter_rows(named=True):
                         key = _backtest_cache_key(
@@ -809,6 +605,10 @@ def process_era_combos(
                             use_limit_entry=bool(row.get("use_limit_entry", True)),
                             limit_order_expiry_bars=int(row.get("limit_order_expiry_bars", 0)),
                             trade_window_interval=int(row.get("trade_window_interval", 0)),
+                            trade_overlap=bool(row.get("trade_overlap", True)),
+                            trade_flip_on_entry=bool(row.get("trade_flip_on_entry", False)),
+                            signal_layer=signal_layer,
+                            signal_scope_id=signal_scope_id,
                         )
                         bucket_map[key] = row
             except Exception as e:
@@ -856,6 +656,8 @@ def process_era_combos(
     empty_rows_written = 0
 
     use_limit_entry = bool(regime_cfg.get("use_limit_entry", True))
+    trade_flip_on_entry = bool(regime_cfg.get("trade_flip_on_entry", False))
+    trade_overlap = bool(regime_cfg.get("trade_overlap", True))
     limit_order_expiry_bars = int(regime_cfg.get("limit_order_expiry_bars", 0) or 0)
     trade_window_interval = int(regime_cfg.get("trade_window_interval", 0) or 0)
 
@@ -869,6 +671,7 @@ def process_era_combos(
                     era_label = era["era_label"]
                     master_row_raw = _make_empty_master_row(
                         regime_id=regime_id,
+                        signal_layer=signal_layer,
                         era_int=era["era_int"],
                         side_flag=side_flag,
                         sl_val=sl_val,
@@ -901,6 +704,8 @@ def process_era_combos(
                     conservative_sl_first=bool(run_cfg.get("conservative_sl_first", True)),
                     side_flag=side_flag,
                     use_limit_entry=use_limit_entry,
+                    trade_overlap=trade_overlap,
+                    trade_flip_on_entry=trade_flip_on_entry,
                     use_trailing_sl=bool(regime_cfg.get("use_trailing_sl", False)),
                     trailing_sl_pct=float(regime_cfg.get("trailing_sl_pct", 0.0)),
                     trailing_sl_interval=int(regime_cfg.get("trailing_sl_interval", 0)),
@@ -945,6 +750,7 @@ def process_era_combos(
                     era_label = era["era_label"]
                     master_row_raw = _make_empty_master_row(
                         regime_id=regime_id,
+                        signal_layer=signal_layer,
                         era_int=era["era_int"],
                         side_flag=side_flag,
                         sl_val=sl_val,
@@ -983,6 +789,7 @@ def process_era_combos(
                 if sig_n == 0:
                     master_row_raw = _make_empty_master_row(
                         regime_id=regime_id,
+                        signal_layer=signal_layer,
                         era_int=era["era_int"],
                         side_flag=side_flag,
                         sl_val=sl_val,
@@ -998,7 +805,7 @@ def process_era_combos(
 
                 # This writes SL_hit / TP_hit into trade_ml partitions for later analysis.
                 try:
-                    staged_trade_ml += _stage_trade_ml_era_rows(
+                    stager.stage_era_rows(
                         df_main=df_main,
                         main_close_arr=main_close_arr,
                         main_high_arr=main_high_arr,
@@ -1012,6 +819,7 @@ def process_era_combos(
                         sl_val=sl_val,
                         tp_val=tp_val,
                         use_limit_entry=use_limit_entry,
+                        trade_flip_on_entry=trade_flip_on_entry,
                         limit_order_expiry_bars=limit_order_expiry_bars,
                         trade_window_interval=trade_window_interval,
                         regime_id=regime_id,
@@ -1019,7 +827,6 @@ def process_era_combos(
                         backtest_res=res,
                         regime_cfg=regime_cfg,
                         run_cfg=run_cfg,
-                        session_dir=session_dir,
                         batch_id=batch_id,
                     )
                 except Exception as e:
@@ -1046,8 +853,12 @@ def process_era_combos(
                     trailing_sl_interval=int(regime_cfg.get("trailing_sl_interval", 0)),
                     trailing_sl_stop_at_pos=bool(regime_cfg.get("trailing_sl_stop_at_pos", True)),
                     use_limit_entry=use_limit_entry,
+                    trade_overlap=trade_overlap,
+                    trade_flip_on_entry=trade_flip_on_entry,
                     limit_order_expiry_bars=limit_order_expiry_bars,
                     trade_window_interval=trade_window_interval,
+                    signal_layer=signal_layer,
+                    signal_scope_id=signal_scope_id,
                 )
 
                 hit = bucket_map.get(key)
@@ -1104,6 +915,7 @@ def process_era_combos(
                         )
                         master_row_raw = _make_empty_master_row(
                             regime_id=regime_id,
+                            signal_layer=signal_layer,
                             era_int=era["era_int"],
                             side_flag=side_flag,
                             sl_val=sl_val,
@@ -1151,13 +963,14 @@ def process_era_combos(
                             }
                         ).pipe(enforce_schema, "backtest", strict=True)
 
-                        stage_for_flush("backtest", months, era_label, str(regime_id), res_df)
+                        stage_for_flush("backtest", months, era_label, cache_id, res_df)
                     except Exception as e:
                         logger.error("Backtest cache write failed cfg=%s era=%s: %s", regime_id, era_label, e)
 
                 if entry_idx is None or entry_idx.size == 0:
                     master_row_raw = _make_empty_master_row(
                         regime_id=regime_id,
+                        signal_layer=signal_layer,
                         era_int=era["era_int"],
                         side_flag=side_flag,
                         sl_val=sl_val,
@@ -1183,6 +996,7 @@ def process_era_combos(
                     )
                     master_row_raw = _make_empty_master_row(
                         regime_id=regime_id,
+                        signal_layer=signal_layer,
                         era_int=era["era_int"],
                         side_flag=side_flag,
                         sl_val=sl_val,
@@ -1225,6 +1039,7 @@ def process_era_combos(
 
                     master_row_raw = _make_master_row(
                         regime_id=regime_id,
+                        signal_layer=signal_layer,
                         era_int=era["era_int"],
                         side_flag=side_flag,
                         sl_val=sl_val,
@@ -1253,6 +1068,7 @@ def process_era_combos(
                     sl_val=float(sl_val),
                     tp_val=float(tp_val),
                     regime_id=regime_id,
+                    signal_layer=signal_layer,
                     era_int=era["era_int"],
                     side_flag=side_flag,
                     stager=stager,
@@ -1262,6 +1078,7 @@ def process_era_combos(
 
                 master_row_raw = _make_master_row(
                     regime_id=regime_id,
+                    signal_layer=signal_layer,
                     era_int=era["era_int"],
                     side_flag=side_flag,
                     sl_val=sl_val,
@@ -1320,37 +1137,29 @@ def _normalize_regime_cfg_for_grid(regime_cfg: dict, run_cfg: dict) -> dict:
     """
     out = deepcopy(regime_cfg or {})
 
-    # Rebuild nested signal_structure from signal_json only when needed.
-    if not isinstance(out.get("signal_structure"), dict):
-        signal_json = out.get("signal_json")
-        if isinstance(signal_json, (str, dict)):
-            try:
-                payload = json.loads(signal_json) if isinstance(signal_json, str) else dict(signal_json)
-            except Exception:
-                payload = {}
+    signal_scope_id = str(out.get("signal_scope_id") or "").strip().lower()
+    signal_structure = out.get("signal_structure")
 
-            signals = payload.get("signals", {})
-            if isinstance(signals, dict) and signals:
-                signal_structure = {}
-                for family_name, family_payload in signals.items():
-                    if not isinstance(family_payload, dict):
-                        continue
-                    signal_structure[family_name] = {
-                        "enabled": True,
-                        "combine": "all",
-                        "by_timeframe": {},
-                    }
-                    for tf, tf_cfg in family_payload.items():
-                        if not isinstance(tf_cfg, dict):
-                            continue
-                        clean = dict(tf_cfg)
-                        clean.pop("timeframe", None)
-                        signal_structure[family_name]["by_timeframe"][str(tf)] = clean
-                if signal_structure:
-                    out["signal_structure"] = signal_structure
+    if signal_scope_id.startswith("baseline:"):
+        out["signal_layer"] = 0
+        if not isinstance(signal_structure, dict) or not signal_structure:
+            signal_structure = deepcopy(run_cfg.get("signal_structure") or {})
+            out["signal_structure"] = signal_structure
+    else:
+        if not isinstance(signal_structure, dict) or not signal_structure:
+            raise ValueError(
+                "signal_structure is required in grid search regimes. "
+                "Legacy flat signal keys are no longer supported."
+            )
 
-    if isinstance(out.get("signal_structure"), dict) and not out.get("signal_json"):
-        out["signal_json"] = _build_signal_json(out["signal_structure"])
+    out.pop("signal_scope", None)
+
+    if not signal_scope_id:
+        if int(out.get("signal_layer", 0) or 0) == 0:
+            signal_scope_id = "baseline:all_buy"
+        else:
+            signal_scope_id = ""
+    out["signal_scope_id"] = signal_scope_id
 
     out["pair"] = str(out.get("pair", run_cfg.get("pair", "")) or "")
     out["BASE_MINUTES"] = int(out.get("BASE_MINUTES", run_cfg.get("BASE_MINUTES", 5)) or 5)
@@ -1362,6 +1171,8 @@ def _normalize_regime_cfg_for_grid(regime_cfg: dict, run_cfg: dict) -> dict:
     out["SL"] = float(out.get("SL", run_cfg.get("SL", 0.2)) or 0.2)
     out["TP"] = float(out.get("TP", run_cfg.get("TP", 6.0)) or 6.0)
 
+    out["trade_overlap"] = bool(out.get("trade_overlap", True))
+    out["trade_flip_on_entry"] = bool(out.get("trade_flip_on_entry", False))
     out["use_trailing_sl"] = bool(out.get("use_trailing_sl", False))
     out["trailing_sl_pct"] = float(out.get("trailing_sl_pct", 0.0) or 0.0)
     out["trailing_sl_interval"] = int(out.get("trailing_sl_interval", 0) or 0)
@@ -1372,8 +1183,6 @@ def _normalize_regime_cfg_for_grid(regime_cfg: dict, run_cfg: dict) -> dict:
     out["trade_window_interval"] = int(out.get("trade_window_interval", 0) or 0)
 
     out["exit_window_h"] = int(out.get("exit_window_h", 24) or 24)
-    out["signal_json"] = out.get("signal_json")
-
     return out
 
 
@@ -1404,7 +1213,7 @@ def compute_config_and_save(
         run_cfg = json.load(f)
 
     if isinstance(run_cfg.get("signal_structure"), dict) and not run_cfg.get("signal_json"):
-        run_cfg["signal_json"] = _build_signal_json(run_cfg["signal_structure"])
+        run_cfg["signal_json"] = build_signal_json(run_cfg)
 
     results_dir = session_dir / "results"
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -1492,6 +1301,13 @@ def compute_config_and_save(
                 )
 
             regime_cfg = _normalize_regime_cfg_for_grid(regime_cfg, run_cfg)
+            signal_layer = int(regime_cfg.get("signal_layer", 0) or 0)
+            signal_scope_id = str(regime_cfg.get("signal_scope_id") or "").strip().lower()
+            if not signal_scope_id and signal_layer == 0:
+                signal_scope_id = "baseline:all_buy"
+
+            regime_cfg["signal_layer"] = signal_layer
+            regime_cfg["signal_scope_id"] = signal_scope_id
 
             try:
                 regime_cfg["regime_id"] = int(regime_cfg.get("regime_id"))
@@ -1514,6 +1330,8 @@ def compute_config_and_save(
                     results_dir=results_dir,
                     batch_id=batch_id,
                     stager=stager,
+                    signal_layer=signal_layer,
+                    signal_scope_id=signal_scope_id,
                     max_dd_threshold=max_dd_threshold,
                     current_idx=idx,
                     total_in_batch=total_in_batch,

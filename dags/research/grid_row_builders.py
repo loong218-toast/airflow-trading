@@ -1,4 +1,4 @@
-# research/grid_row_builders.py
+# grid_row_builders.py
 
 from __future__ import annotations
 
@@ -9,7 +9,11 @@ from typing import Any, Dict, Optional
 import numpy as np
 import polars as pl
 
-from common.feature_helpers import normalize_timeframe
+from common.feature_helpers import (
+    build_signal_json,
+    compact_json,
+    signal_scope_text,
+)
 from common.schema import enforce_schema
 
 from common.casting import (
@@ -26,77 +30,14 @@ from common.casting import (
     _as_str,
 )
 
-def _single_value(value: Any) -> Any:
-    if isinstance(value, (list, tuple)) and len(value) == 1:
-        return value[0]
-    return value
-
-def _json_compact(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
-
-
-def _signal_structure_source(regime_cfg: dict) -> dict:
-    signal_block = regime_cfg.get("signal_structure")
-    if isinstance(signal_block, dict) and signal_block:
-        return deepcopy(signal_block)
-    return {}
-
-def _scalarize(value: Any) -> Any:
+def _scalar(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
-        if not value:
-            return None
-        return value[0]
+        return value[0] if value else None
     return value
-
-def _build_signal_json(regime_cfg: dict, run_cfg: Optional[dict] = None) -> dict:
-    """
-    Compact nested payload used by master rows, analysis, and surrogate-free
-    debugging.
-
-    This is intentionally the same signal contract consumed by feature_prep.py
-    and live signal filtering.
-    """
-    signal_block = _signal_structure_source(regime_cfg)
-    out: dict = {
-        "version": 3,
-        "signals": {},
-    }
-
-    if not isinstance(signal_block, dict):
-        return out
-
-    for signal_name, signal_cfg in signal_block.items():
-        if not isinstance(signal_cfg, dict):
-            continue
-
-        enabled = signal_cfg.get("enabled", True)
-        enabled = _single_value(enabled)
-        if isinstance(enabled, (list, tuple)):
-            enabled = enabled[0] if enabled else True
-        enabled = _as_bool(enabled, True)
-        if not enabled:
-            continue
-
-        tf_map = signal_cfg.get("by_timeframe", {})
-        if not isinstance(tf_map, dict):
-            continue
-
-        signal_out: dict = {}
-        for tf, tf_cfg in tf_map.items():
-            if not isinstance(tf_cfg, dict):
-                continue
-            cfg = deepcopy(tf_cfg)
-            cfg["timeframe"] = normalize_timeframe(tf)
-            signal_out[cfg["timeframe"]] = cfg
-
-        if signal_out:
-            out["signals"][signal_name] = signal_out
-
-    return out
-
 
 def _make_empty_master_row(
     regime_id: int,
+    signal_layer: int,
     era_int: int,
     side_flag: int,
     sl_val: float,
@@ -110,33 +51,39 @@ def _make_empty_master_row(
     This must match common/schema.py -> MASTER_SCHEMA exactly, so downstream
     code never has to branch on "empty trade set" special cases.
     """
-    signal_json = _build_signal_json(regime_cfg, run_cfg=run_cfg)
+    signal_json = build_signal_json(regime_cfg, run_cfg=run_cfg)
+    signal_scope_id = signal_scope_text(regime_cfg.get("signal_structure", {}))
 
     return {
         "regime_id": int(regime_id),
+        "signal_layer": int(signal_layer),
+        "signal_scope_id": signal_scope_id,
         "era_int": int(era_int),
         "side": int(side_flag),
-        "exit_window_h": int(_scalarize(regime_cfg.get("exit_window_h", 0)) or 0),
+        "exit_window_h": int(_scalar(regime_cfg.get("exit_window_h", 0)) or 0),
         "SL": float(sl_val),
         "TP": float(tp_val),
-        "use_trailing_sl": bool(_as_bool(_scalarize(regime_cfg.get("use_trailing_sl", False)), False)),
-        "trailing_sl_pct": float(_scalarize(regime_cfg.get("trailing_sl_pct", 0.0)) or 0.0),
-        "trailing_sl_interval": int(_scalarize(regime_cfg.get("trailing_sl_interval", 0)) or 0),
-        "trailing_sl_stop_at_pos": bool(_as_bool(_scalarize(regime_cfg.get("trailing_sl_stop_at_pos", True)), True)),
-        "use_limit_entry": bool(_as_bool(_scalarize(regime_cfg.get("use_limit_entry", True)), True)),
-        "limit_order_expiry_bars": int(_scalarize(regime_cfg.get("limit_order_expiry_bars", 0)) or 0),
-        "trade_window_interval": int(_scalarize(regime_cfg.get("trade_window_interval", 0)) or 0),
+        "use_trailing_sl": bool(_as_bool(_scalar(regime_cfg.get("use_trailing_sl", False)), False)),
+        "trailing_sl_pct": float(_scalar(regime_cfg.get("trailing_sl_pct", 0.0)) or 0.0),
+        "trailing_sl_interval": int(_scalar(regime_cfg.get("trailing_sl_interval", 0)) or 0),
+        "trailing_sl_stop_at_pos": bool(_as_bool(_scalar(regime_cfg.get("trailing_sl_stop_at_pos", True)), True)),
+        "use_limit_entry": bool(_as_bool(_scalar(regime_cfg.get("use_limit_entry", True)), True)),
+        "limit_order_expiry_bars": int(_scalar(regime_cfg.get("limit_order_expiry_bars", 0)) or 0),
+        "trade_overlap": bool(_as_bool(_scalar(regime_cfg.get("trade_overlap", True)), True)),
+        "trade_flip_on_entry": bool(_as_bool(_scalar(regime_cfg.get("trade_flip_on_entry", False)), False)),
+        "trade_window_interval": int(_scalar(regime_cfg.get("trade_window_interval", 0)) or 0),
         "total_pos": 0,
         "win_pos": 0,
         "balance": 100.0,
         "max_drawdown": 0.0,
         "max_consecutive_losses": 0,
-        "signal_json": _json_compact(signal_json),
+        "signal_json": compact_json(signal_json),
     }
 
 
 def _make_master_row(
     regime_id: int,
+    signal_layer: int,
     era_int: int,
     side_flag: int,
     sl_val: float,
@@ -151,16 +98,10 @@ def _make_master_row(
 ) -> dict:
     """
     Populated master row.
-
-    The downstream master table uses:
-    - regime selection
-    - era-level analysis
-    - time-bucket analysis
-    - survival/robustness checks
-    - future signal_json reconstruction
     """
     row = _make_empty_master_row(
         regime_id=regime_id,
+        signal_layer=signal_layer,
         era_int=era_int,
         side_flag=side_flag,
         sl_val=sl_val,
@@ -181,10 +122,6 @@ def _make_master_row(
     return row
 
 
-def _empty_range_array(n: int) -> np.ndarray:
-    return np.full(n, np.nan, dtype=np.float32)
-
-
 def build_trade_ml_rows_from_backtest(
     df_main: pl.DataFrame,
     main_close_arr: np.ndarray,
@@ -203,6 +140,8 @@ def build_trade_ml_rows_from_backtest(
     backtest_res: Dict,
     regime_cfg: dict,
     run_cfg: dict,
+    signal_layer: int = 0,
+    signal_scope_id: str = "",
 ) -> pl.DataFrame:
     """
     Build trade-level training rows from a completed backtest.
@@ -214,10 +153,15 @@ def build_trade_ml_rows_from_backtest(
     sig_idxs = np.asarray(sig_idxs, dtype=np.int64)
     n = sig_idxs.shape[0]
 
+    signal_scope_id = str(signal_scope or "")
+    signal_layer = int(signal_layer)
+
     if n == 0:
         return pl.DataFrame(
             {
                 "regime_id": pl.Series([], dtype=pl.Int32),
+                "signal_layer": pl.Series([], dtype=pl.Int8),
+                "signal_scope_id": pl.Series([], dtype=pl.String),
                 "era_int": pl.Series([], dtype=pl.Int64),
                 "side": pl.Series([], dtype=pl.Int8),
                 "SL": pl.Series([], dtype=pl.Float32),
@@ -318,6 +262,8 @@ def build_trade_ml_rows_from_backtest(
     df = pl.DataFrame(
         {
             "regime_id": np.full(n, int(regime_id), dtype=np.int32),
+            "signal_layer": np.full(n, int(signal_layer), dtype=np.int8),
+            "signal_scope_id": np.full(n, signal_scope_id, dtype=object),
             "era_int": np.full(n, int(era_int), dtype=np.int64),
             "side": np.full(n, int(side_flag), dtype=np.int8),
             "SL": np.full(n, float(sl_val), dtype=np.float32),

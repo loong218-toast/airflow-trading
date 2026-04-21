@@ -140,6 +140,16 @@ def _positive_ints(value: Any) -> list[int]:
             out.append(v)
 
     return out
+
+def _as_positive_int_list(value: Any) -> list[int]:
+    out: list[int] = []
+    seen: set[int] = set()
+    for x in _as_list(value):
+        v = _as_int(x, 0)
+        if v > 0 and v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
     
 def _as_str(value: Any, default: str = "") -> str:
     value = _unwrap_singleton(value)

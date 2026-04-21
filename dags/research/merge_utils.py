@@ -17,11 +17,6 @@ from common.schema import enforce_schema, get_schema
 
 _LOG = logging.getLogger(__name__)
 
-_EQUITY_SHARD_RE = re.compile(
-    r"^equity_era_int=(?P<era>\d+)_batch=(?P<batch>\d+)_(?:worker|task)=(?P<unit>\d+)\.parquet$"
-)
-
-
 # ---------------------------------------------------------------------
 # small filesystem helpers
 # ---------------------------------------------------------------------
@@ -56,12 +51,6 @@ def _worker_parts_for_config(kind: str, months: int, era_label: str, regime_id: 
     tmp = _tmp_dir()
     pattern = f"{kind}_config_{regime_id}_era_{era_label}_batch_*.parquet"
     return sorted(tmp.glob(pattern))
-
-
-def _equity_tmp_dir(session_dir: Path) -> Path:
-    tmp_dir = session_dir / "equity_partitioned" / "_tmp"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    return tmp_dir
 
 
 def _cleanup_path(path: Path) -> None:
@@ -245,134 +234,6 @@ def combine_cache(kind: str, months: int, era_label: str, regime_id: str) -> Opt
         kind, regime_id, era_label, result["merged_files"], result["skipped_files"]
     )
     return target
-
-
-# ---------------------------------------------------------------------
-# Equity merge
-# ---------------------------------------------------------------------
-def _equity_parts_for_partition(session_dir: Path, partition_key: str, batch_id: Optional[int] = None) -> List[Path]:
-    tmp_dir = _equity_tmp_dir(session_dir)
-    if batch_id is None:
-        candidates = sorted(tmp_dir.glob(f"equity_era_int={partition_key}_batch=*.parquet"))
-    else:
-        candidates = sorted(tmp_dir.glob(f"equity_era_int={partition_key}_batch={int(batch_id)}_*.parquet"))
-
-    parts: List[Path] = []
-    for p in candidates:
-        if _EQUITY_SHARD_RE.match(p.name):
-            parts.append(p)
-    return parts
-
-
-def _append_parquet_file(writer: pq.ParquetWriter, path: Path) -> bool:
-    try:
-        pf = pq.ParquetFile(str(path))
-        for batch in pf.iter_batches():
-            writer.write_table(batch.to_table())
-        return True
-    except Exception as e:
-        _LOG.error("Skipping corrupt parquet shard: %s | %s", path, e)
-        return False
-
-
-def combine_equity_parts(session_dir: Path, partition_key: str, batch_id: Optional[int] = None) -> Optional[Path]:
-    parts = _equity_parts_for_partition(session_dir, partition_key, batch_id=batch_id)
-    if not parts:
-        return None
-
-    total_parts = len(parts)
-    _LOG.info("Starting merge of %d shards for era %s", total_parts, partition_key)
-
-    final_dir = session_dir / "equity_partitioned" / f"era_int={partition_key}"
-    final_dir.mkdir(parents=True, exist_ok=True)
-    final_path = final_dir / f"equity_era_int={partition_key}.parquet"
-    tmp_path = final_path.with_suffix(".tmp.parquet")
-
-    _cleanup_path(final_path)
-    _cleanup_path(tmp_path)
-    writer = None
-    merged = 0
-
-    try:
-        for idx, p in enumerate(parts):
-            if idx % 25 == 0 and idx > 0:
-                _LOG.info("[%s] Merged %d/%d shards...", partition_key, idx, total_parts)
-            try:
-                pf = pq.ParquetFile(str(p))
-            except Exception as e:
-                _LOG.error("Skipping corrupt parquet shard: %s | %s", p, e)
-                continue
-
-            if writer is None:
-                writer = pq.ParquetWriter(str(final_path.with_suffix(".tmp.parquet")), pf.schema_arrow, compression="snappy")
-
-            try:
-                for batch in pf.iter_batches():
-                    # Wrap the single batch in a list to create a Table
-                    table = pa.Table.from_batches([batch]) 
-                    writer.write_table(table)
-                merged += 1
-            except Exception as e:
-                _LOG.error("Skipping bad parquet shard during merge: %s | %s", p, e)
-                continue
-
-        if writer is None or merged == 0:
-            return None
-
-        writer.close()
-        os.replace(str(final_path.with_suffix(".tmp.parquet")), str(final_path))
-
-        manifest = {
-            "parts": [str(p) for p in parts],
-            "final": str(final_path),
-            "merged_files": merged,
-        }
-        final_path.with_suffix(".manifest.json").write_text(json.dumps(manifest, indent=2))
-
-        for p in parts:
-            try:
-                p.unlink(missing_ok=True)
-            except Exception:
-                pass
-
-        return final_path
-
-    except Exception:
-        try:
-            if writer is not None:
-                writer.close()
-        except Exception:
-            pass
-        _cleanup_path(final_path.with_suffix(".tmp.parquet"))
-        raise
-
-
-def combine_all_equity_parts(session_dir: str | Path, batch_id: Optional[int] = None) -> List[Path]:
-    session_dir = Path(session_dir)
-    tmp_dir = _equity_tmp_dir(session_dir)
-
-    if batch_id is None:
-        candidates = sorted(tmp_dir.glob("equity_era_int=*_batch=*.parquet"))
-    else:
-        candidates = sorted(tmp_dir.glob(f"equity_era_int=*_batch={int(batch_id)}_*.parquet"))
-
-    eras: Dict[str, List[Path]] = defaultdict(list)
-    for p in candidates:
-        m = _EQUITY_SHARD_RE.match(p.name)
-        if not m:
-            continue
-        if batch_id is not None and int(m.group("batch")) != int(batch_id):
-            continue
-        eras[m.group("era")].append(p)
-
-    outputs: List[Path] = []
-    for era in sorted(eras.keys()):
-        out = combine_equity_parts(session_dir=session_dir, partition_key=era, batch_id=batch_id)
-        if out is not None:
-            outputs.append(out)
-
-    return outputs
-
 
 # ---------------------------------------------------------------------
 # Master merge

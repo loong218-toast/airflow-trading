@@ -15,21 +15,22 @@
     "max": 5.0,
     "step": 0.5
   },
-
+  
   "exit_windows_h": [4, 24],
+  "trade_flip_on_entry": [false, true],
+  "trade_overlap": [false, true],
   "trade_window_interval": [20],
-  "limit_order_expiry_bars": [6, 12, 24],
+  "limit_order_expiry_bars": [3, 12, 24, 48],
   "use_limit_entry": true,
 
   "use_trailing_sl": [true],
-  "trailing_sl_pct": [0.2, 0.3],
+  "trailing_sl_pct": [0.2, 0.3, 0.4],
   "trailing_sl_interval": [3],
   "trailing_sl_stop_at_pos": [false],
 
   "signal_structure": {
     "ma": {
       "enabled": false,
-      "combine": "all",
       "by_timeframe": {
         "5m": {
           "periods": [96],
@@ -45,12 +46,11 @@
     },
     "stochastic": {
       "enabled": true,
-      "combine": "all",
       "by_timeframe": {
         "5m": {
           "k": [12],
           "d": [8],
-          "s": [4],
+          "s": [8],
           "thresholds": [[30, 70]],
           "threshold_tolerance": 10
         },
@@ -65,22 +65,17 @@
     },
     "lookback": {
       "enabled": true,
-      "combine": "all",
       "by_timeframe": {
         "5m": {
-          "entry_lookback_units": [0, 1, 2]
+          "entry_lookback_units": [1, 2]
         },
         "15m": {
-          "entry_lookback_units": [0, 1, 2]
-        },
-        "1h": {
-          "entry_lookback_units": [0, 1, 2]
+          "entry_lookback_units": [1, 2]
         }
       }
     },
     "bbw": {
       "enabled": false,
-      "combine": "all",
       "by_timeframe": {
         "5m": {
           "periods": [48, 96, 128],

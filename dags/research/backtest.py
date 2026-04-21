@@ -1,15 +1,3 @@
-"""
-Backtest numeric kernels for close/high/low driven simulation.
-
-- Supports direct entry or limit-entry mode.
-- Limit-entry mode:
-  - signal candle only places a pending order
-  - fill happens only on future candles
-  - trade starts at the filled limit price
-- Memory-conscious: accept numpy arrays, use np.asarray for cheap view/cast.
-- Numba kernels compiled with cache.
-"""
-
 from __future__ import annotations
 
 import os
@@ -270,122 +258,61 @@ def fast_compound_equity_gate(pnl_arr, start_equity=100.0, max_dd_threshold=-1.0
 
 
 # -------------------------
-# pnl kernel (numba)
+# stateful pending-order resolver
 # -------------------------
 @njit(cache=True)
-def _numba_pnl_from_actual_exits(
-    entry_prices,
-    exit_prices,
-    spread_arr,
-    funding_raw,
-    entry_idxs,
-    exit_idxs,
-    main_time_ns,
-    side_flag,
-    risk_pct,
-    sl_val,
-    sl_tp_in_pct,
-    spread_is_percent,
-    funding_period_hours,
-    funding_is_per_hour_bool,
-    trading_fee_rate,
-):
-    n = entry_prices.shape[0]
-    pnl_out = np.empty(n, dtype=np.float64)
-
-    risk = float(risk_pct)
-    ns_to_hours = 1.0 / (1e9 * 3600.0)
-    f_period = float(max(1, funding_period_hours))
-    side = 1 if int(side_flag) >= 0 else -1
-
-    per_side_fee = max(0.0, float(trading_fee_rate))
-    round_trip_fee_rate = 2.0 * per_side_fee
-
-    for i in range(n):
-        ep = float(entry_prices[i])
-        xp = float(exit_prices[i])
-        ep_safe = ep if ep != 0.0 else 1.0
-
-        h_hours = (main_time_ns[exit_idxs[i]] - main_time_ns[entry_idxs[i]]) * ns_to_hours
-
-        if funding_is_per_hour_bool:
-            f_fee = float(funding_raw[i]) * h_hours
-        else:
-            f_fee = (float(funding_raw[i]) / f_period) * h_hours
-
-        spread = float(spread_arr[i])
-        if spread_is_percent:
-            spr_pct = spread
-        else:
-            spr_pct = (spread / ep_safe) * 100.0
-
-        if sl_tp_in_pct:
-            raw_sl = float(sl_val)
-        else:
-            raw_sl = (float(sl_val) / ep_safe) * 100.0
-
-        eff_sl = max(raw_sl + spr_pct, 0.01)
-
-        # Notional / equity fraction implied by fixed-risk sizing.
-        notional_frac = risk / (eff_sl / 100.0)
-
-        if side == 1:
-            trade_ret = (xp - ep) / ep_safe
-        else:
-            trade_ret = (ep - xp) / ep_safe
-
-        fee_pct = notional_frac * round_trip_fee_rate
-        pnl = (notional_frac * trade_ret) - fee_pct - f_fee
-
-        if not np.isfinite(pnl):
-            pnl = -1.0
-        if pnl <= -0.999999:
-            pnl = -0.999999
-
-        pnl_out[i] = pnl
-
-    return pnl_out
-
-
-# -------------------------
-# backtest kernel
-# -------------------------
-@njit(cache=True)
-def _backtest_kernel_limit_ohlc(
+def _resolve_entries_stateful(
     close_f64,
     high_f64,
     low_f64,
     signal_idx_i64,
     side_i8,
-    sl_f64,
-    tp_f64,
-    sl_tp_in_pct_bool,
     limit_window_bars_i64,
-    exit_window_bars_i64,
-    spread_f64,
-    spread_is_percent_bool,
-    conservative_sl_first_bool,
     use_limit_entry_bool,
-    use_trailing_sl_bool,
-    trailing_sl_pct_f64,
-    trailing_sl_interval_i64,
-    trailing_sl_stop_at_pos_bool,
 ):
+    """
+    Universal rule:
+      - only one pending limit order can exist at a time
+      - a newer signal cancels the old pending order if it has not filled yet
+
+    If use_limit_entry_bool=False:
+      - direct entry on the signal bar
+      - no pending order logic
+    """
     n_rows = close_f64.shape[0]
     n_signals = signal_idx_i64.shape[0]
 
     signal_out = np.empty(n_signals, dtype=np.int64)
     entry_idx_out = np.empty(n_signals, dtype=np.int64)
     entry_price_out = np.empty(n_signals, dtype=np.float64)
-    exit_idx_out = np.empty(n_signals, dtype=np.int64)
-    exit_price_out = np.empty(n_signals, dtype=np.float64)
-    rets_out = np.empty(n_signals, dtype=np.float64)
-    exit_reason_out = np.empty(n_signals, dtype=np.int8)  # 1=TP, -1=SL, 0=time exit
-    tp_hit_price_out = np.empty(n_signals, dtype=np.float64)
-    sl_hit_price_out = np.empty(n_signals, dtype=np.float64)
     side_out = np.empty(n_signals, dtype=np.int8)
 
     k = 0
+
+    if not use_limit_entry_bool:
+        for i in range(n_signals):
+            signal_idx = int(signal_idx_i64[i])
+            if signal_idx < 0 or signal_idx >= n_rows:
+                continue
+
+            side = int(side_i8[i])
+            if side != 1 and side != -1:
+                continue
+
+            signal_out[k] = signal_idx
+            entry_idx_out[k] = signal_idx
+            entry_price_out[k] = close_f64[signal_idx]
+            side_out[k] = side
+            k += 1
+
+        return signal_out[:k], entry_idx_out[:k], entry_price_out[:k], side_out[:k]
+
+    pending_active = False
+    pending_signal_idx = -1
+    pending_side = 0
+    pending_limit_price = 0.0
+    pending_scan_start = 0
+    pending_expiry_idx = -1
 
     for i in range(n_signals):
         signal_idx = int(signal_idx_i64[i])
@@ -396,47 +323,278 @@ def _backtest_kernel_limit_ohlc(
         if side != 1 and side != -1:
             continue
 
+        # Check whether the current pending order fills before the next signal arrives.
+        # This is the only place where a pending order can become a trade.
+        if pending_active:
+            scan_end = signal_idx - 1
+            if pending_expiry_idx < scan_end:
+                scan_end = pending_expiry_idx
+
+            if scan_end >= pending_scan_start:
+                j = pending_scan_start
+                filled = False
+                fill_idx = -1
+
+                while j <= scan_end:
+                    if pending_side == 1:
+                        if low_f64[j] <= pending_limit_price:
+                            filled = True
+                            fill_idx = j
+                            break
+                    else:
+                        if high_f64[j] >= pending_limit_price:
+                            filled = True
+                            fill_idx = j
+                            break
+                    j += 1
+
+                if filled:
+                    signal_out[k] = pending_signal_idx
+                    entry_idx_out[k] = fill_idx
+                    entry_price_out[k] = pending_limit_price
+                    side_out[k] = pending_side
+                    k += 1
+
+            # New signal always cancels the older pending order.
+            pending_active = False
+
+        # Place the new pending order from this signal candle.
         signal_close = float(close_f64[signal_idx])
+        if side == 1:
+            limit_price = 0.5 * (signal_close + float(low_f64[signal_idx]))
+        else:
+            limit_price = 0.5 * (signal_close + float(high_f64[signal_idx]))
 
-        fill_idx = -1
-        fill_price = 0.0
+        pending_active = True
+        pending_signal_idx = signal_idx
+        pending_side = side
+        pending_limit_price = limit_price
+        pending_scan_start = signal_idx + 1
+        pending_expiry_idx = signal_idx + int(max(0, limit_window_bars_i64))
 
-        if use_limit_entry_bool:
-            if side == 1:
-                limit_price = 0.5 * (signal_close + float(low_f64[signal_idx]))
-            else:
-                limit_price = 0.5 * (signal_close + float(high_f64[signal_idx]))
+    # Flush the last pending order.
+    if pending_active and pending_scan_start < n_rows:
+        scan_end = pending_expiry_idx
+        if scan_end >= n_rows:
+            scan_end = n_rows - 1
 
-            max_limit_j = n_rows - 1
-            if limit_window_bars_i64 >= 0:
-                tmp = signal_idx + int(limit_window_bars_i64)
-                if tmp < max_limit_j:
-                    max_limit_j = tmp
-
-            j = signal_idx + 1
-            while j <= max_limit_j:
-                hi = high_f64[j]
-                lo = low_f64[j]
-
-                if side == 1:
-                    if lo <= limit_price:
-                        fill_idx = j
-                        fill_price = limit_price
+        if scan_end >= pending_scan_start:
+            j = pending_scan_start
+            while j <= scan_end:
+                if pending_side == 1:
+                    if low_f64[j] <= pending_limit_price:
+                        signal_out[k] = pending_signal_idx
+                        entry_idx_out[k] = j
+                        entry_price_out[k] = pending_limit_price
+                        side_out[k] = pending_side
+                        k += 1
                         break
                 else:
-                    if hi >= limit_price:
-                        fill_idx = j
-                        fill_price = limit_price
+                    if high_f64[j] >= pending_limit_price:
+                        signal_out[k] = pending_signal_idx
+                        entry_idx_out[k] = j
+                        entry_price_out[k] = pending_limit_price
+                        side_out[k] = pending_side
+                        k += 1
                         break
-
                 j += 1
 
-            if fill_idx == -1:
-                continue
-        else:
-            fill_idx = signal_idx
-            fill_price = signal_close
+    return signal_out[:k], entry_idx_out[:k], entry_price_out[:k], side_out[:k]
 
+
+# -------------------------
+# overlap / flip mode
+# -------------------------
+@njit(cache=True)
+def _apply_trade_overlap_mode_numba(
+    signal_idx,
+    entry_idx,
+    entry_price,
+    exit_idx,
+    exit_price,
+    rets,
+    exit_reason,
+    tp_hit_price,
+    sl_hit_price,
+    side_out,
+    trade_overlap_bool,
+    trade_flip_on_entry_bool,
+):
+    """
+    trade_overlap=True:
+      - keep current behavior
+      - trades may overlap
+
+    trade_overlap=False and trade_flip_on_entry=False:
+      - hard block
+      - if a trade is still open, later trades do not count until it closes
+
+    trade_overlap=False and trade_flip_on_entry=True:
+      - flip mode
+      - a new filled trade cuts the previous one off at the new entry price
+      - then the new trade becomes the active trade
+    """
+    if trade_overlap_bool or signal_idx.size == 0:
+        return (
+            signal_idx,
+            entry_idx,
+            entry_price,
+            exit_idx,
+            exit_price,
+            rets,
+            exit_reason,
+            tp_hit_price,
+            sl_hit_price,
+            side_out,
+        )
+
+    n = signal_idx.shape[0]
+    keep_signal = np.empty(n, dtype=np.int64)
+    keep_entry_idx = np.empty(n, dtype=np.int64)
+    keep_entry_price = np.empty(n, dtype=np.float64)
+    keep_exit_idx = np.empty(n, dtype=np.int64)
+    keep_exit_price = np.empty(n, dtype=np.float64)
+    keep_rets = np.empty(n, dtype=np.float64)
+    keep_exit_reason = np.empty(n, dtype=np.int8)
+    keep_tp_hit_price = np.empty(n, dtype=np.float64)
+    keep_sl_hit_price = np.empty(n, dtype=np.float64)
+    keep_side_out = np.empty(n, dtype=np.int8)
+
+    k = 0
+    active_open = False
+    active_exit_idx = -1
+
+    for i in range(n):
+        cur_signal_idx = int(signal_idx[i])
+        cur_entry_idx = int(entry_idx[i])
+        cur_entry_price = float(entry_price[i])
+        cur_exit_idx = int(exit_idx[i])
+        cur_exit_price = float(exit_price[i])
+        cur_rets = float(rets[i])
+        cur_exit_reason = int(exit_reason[i])
+        cur_tp_hit_price = float(tp_hit_price[i])
+        cur_sl_hit_price = float(sl_hit_price[i])
+        cur_side = int(side_out[i])
+
+        if cur_entry_idx < 0 or cur_exit_idx < 0:
+            continue
+
+        # First accepted trade or a trade that starts after the active one is already closed.
+        if (not active_open) or (cur_entry_idx > active_exit_idx):
+            keep_signal[k] = cur_signal_idx
+            keep_entry_idx[k] = cur_entry_idx
+            keep_entry_price[k] = cur_entry_price
+            keep_exit_idx[k] = cur_exit_idx
+            keep_exit_price[k] = cur_exit_price
+            keep_rets[k] = cur_rets
+            keep_exit_reason[k] = cur_exit_reason
+            keep_tp_hit_price[k] = cur_tp_hit_price
+            keep_sl_hit_price[k] = cur_sl_hit_price
+            keep_side_out[k] = cur_side
+            active_open = True
+            active_exit_idx = cur_exit_idx
+            k += 1
+            continue
+
+        # Here, the new trade arrives while the active trade is still open.
+        if not trade_flip_on_entry_bool:
+            # Hard block mode: discard the new trade entirely.
+            continue
+
+        # Flip mode:
+        # cut the previous accepted trade at the new entry price and replace it.
+        prev = k - 1
+        prev_side = int(keep_side_out[prev])
+        prev_entry_price = float(keep_entry_price[prev])
+
+        keep_exit_idx[prev] = cur_entry_idx
+        keep_exit_price[prev] = cur_entry_price
+        keep_exit_reason[prev] = 0
+        keep_tp_hit_price[prev] = np.nan
+        keep_sl_hit_price[prev] = np.nan
+
+        if prev_side == 1:
+            keep_rets[prev] = (cur_entry_price - prev_entry_price) / prev_entry_price
+        else:
+            keep_rets[prev] = (prev_entry_price - cur_entry_price) / prev_entry_price
+
+        keep_signal[k] = cur_signal_idx
+        keep_entry_idx[k] = cur_entry_idx
+        keep_entry_price[k] = cur_entry_price
+        keep_exit_idx[k] = cur_exit_idx
+        keep_exit_price[k] = cur_exit_price
+        keep_rets[k] = cur_rets
+        keep_exit_reason[k] = cur_exit_reason
+        keep_tp_hit_price[k] = cur_tp_hit_price
+        keep_sl_hit_price[k] = cur_sl_hit_price
+        keep_side_out[k] = cur_side
+
+        active_open = True
+        active_exit_idx = cur_exit_idx
+        k += 1
+
+    return (
+        keep_signal[:k],
+        keep_entry_idx[:k],
+        keep_entry_price[:k],
+        keep_exit_idx[:k],
+        keep_exit_price[:k],
+        keep_rets[:k],
+        keep_exit_reason[:k],
+        keep_tp_hit_price[:k],
+        keep_sl_hit_price[:k],
+        keep_side_out[:k],
+    )
+
+
+@njit(cache=True)
+def _compute_trade_exits_from_fills(
+    close_f64,
+    high_f64,
+    low_f64,
+    entry_idx_i64,
+    entry_price_f64,
+    side_i8,
+    sl_f64,
+    tp_f64,
+    sl_tp_in_pct_bool,
+    exit_window_bars_i64,
+    spread_f64,
+    spread_is_percent_bool,
+    conservative_sl_first_bool,
+    use_trailing_sl_bool,
+    trailing_sl_pct_f64,
+    trailing_sl_interval_i64,
+    trailing_sl_stop_at_pos_bool,
+):
+    """
+    Independent trade exit simulation from actual fill points.
+    """
+    n_rows = close_f64.shape[0]
+    n = entry_idx_i64.shape[0]
+
+    exit_idx_out = np.empty(n, dtype=np.int64)
+    exit_price_out = np.empty(n, dtype=np.float64)
+    rets_out = np.empty(n, dtype=np.float64)
+    exit_reason_out = np.empty(n, dtype=np.int8)  # 1=TP, -1=SL, 0=time exit
+    tp_hit_price_out = np.empty(n, dtype=np.float64)
+    sl_hit_price_out = np.empty(n, dtype=np.float64)
+
+    for i in range(n):
+        fill_idx = int(entry_idx_i64[i])
+        side = int(side_i8[i])
+        fill_price = float(entry_price_f64[i])
+
+        if fill_idx < 0 or fill_idx >= n_rows or (side != 1 and side != -1) or not np.isfinite(fill_price) or fill_price <= 0.0:
+            exit_idx_out[i] = -1
+            exit_price_out[i] = np.nan
+            rets_out[i] = np.nan
+            exit_reason_out[i] = 0
+            tp_hit_price_out[i] = np.nan
+            sl_hit_price_out[i] = np.nan
+            continue
+
+        # TP/SL setup
         if sl_tp_in_pct_bool:
             if side == 1:
                 tp_price = fill_price * (1.0 + tp_f64 / 100.0)
@@ -589,192 +747,16 @@ def _backtest_kernel_limit_ohlc(
         else:
             ret = (fill_price - exit_price) / fill_price
 
-        signal_out[k] = signal_idx
-        entry_idx_out[k] = fill_idx
-        entry_price_out[k] = fill_price
-        exit_idx_out[k] = exit_at
-        exit_price_out[k] = exit_price
-        rets_out[k] = ret
-        exit_reason_out[k] = exit_reason
-        tp_hit_price_out[k] = tp_hit_price
-        sl_hit_price_out[k] = sl_hit_price
-        side_out[k] = side
-        k += 1
+        exit_idx_out[i] = exit_at
+        exit_price_out[i] = exit_price
+        rets_out[i] = ret
+        exit_reason_out[i] = exit_reason
+        tp_hit_price_out[i] = tp_hit_price
+        sl_hit_price_out[i] = sl_hit_price
 
-    return (
-        signal_out[:k],
-        entry_idx_out[:k],
-        entry_price_out[:k],
-        exit_idx_out[:k],
-        exit_price_out[:k],
-        rets_out[:k],
-        exit_reason_out[:k],
-        tp_hit_price_out[:k],
-        sl_hit_price_out[:k],
-        side_out[:k],
-    )
+    return exit_idx_out, exit_price_out, rets_out, exit_reason_out, tp_hit_price_out, sl_hit_price_out
 
 
-# -------------------------
-# grid kernel
-# -------------------------
-@njit(parallel=False, cache=True)
-def _grid_kernel_numba(
-    closes_f32,
-    n_min_f32,
-    n_max_f32,
-    t_min_ns_i64,
-    t_max_ns_i64,
-    s_vals_f32,
-    t_vals_f32,
-    breakeven_after_f32,
-    min_rr_f32,
-    tie_mode_i32,
-    position_type_i32,
-):
-    n_rows = closes_f32.shape[0]
-    ns = s_vals_f32.shape[0]
-    nt = t_vals_f32.shape[0]
-    good = np.zeros(ns * nt, dtype=np.int32)
-    be = np.zeros(ns * nt, dtype=np.int32)
-
-    for i in range(ns):
-        sl_val = s_vals_f32[i]
-
-        if sl_val <= 0.0001:
-            continue
-
-        min_tp_allowed = sl_val * min_rr_f32
-
-        for j in range(nt):
-            tp_val = t_vals_f32[j]
-            if tp_val < min_tp_allowed:
-                continue
-
-            count_good = 0
-            count_be = 0
-
-            for r in range(n_rows):
-                if t_min_ns_i64[r] < 0:
-                    continue
-
-                cp = closes_f32[r]
-
-                if position_type_i32 == 1:
-                    t_tp = t_max_ns_i64[r]
-                    t_sl = t_min_ns_i64[r]
-                    dist_tp = n_max_f32[r] - cp
-                    dist_sl = cp - n_min_f32[r]
-                else:
-                    t_tp = t_min_ns_i64[r]
-                    t_sl = t_max_ns_i64[r]
-                    dist_tp = cp - n_min_f32[r]
-                    dist_sl = n_max_f32[r] - cp
-
-                hit_tp = dist_tp >= tp_val
-                hit_sl = dist_sl >= sl_val
-
-                tp_wins = False
-                if hit_tp and hit_sl:
-                    if tie_mode_i32 == 1:
-                        tp_wins = (t_tp <= t_sl)
-                    else:
-                        tp_wins = (t_tp < t_sl)
-                elif hit_tp:
-                    tp_wins = True
-
-                if tp_wins:
-                    count_good += 1
-                elif dist_tp >= (tp_val - breakeven_after_f32):
-                    count_be += 1
-
-            idx = i * nt + j
-            good[idx] = count_good
-            be[idx] = count_be
-
-    return good, be
-
-
-# -------------------------
-# precompute windows
-# -------------------------
-@njit(cache=True)
-def _compute_windows_numba(main_close_f64, main_time_ns_i64, entry_idxs_i64, steps_i32):
-    Nsig = entry_idxs_i64.shape[0]
-    n_min = np.empty(Nsig, dtype=np.float64)
-    n_max = np.empty(Nsig, dtype=np.float64)
-    t_min_ns = np.empty(Nsig, dtype=np.int64)
-    t_max_ns = np.empty(Nsig, dtype=np.int64)
-    closes = np.empty(Nsig, dtype=np.float64)
-
-    n_rows = main_close_f64.shape[0]
-    for i in range(Nsig):
-        pos = int(entry_idxs_i64[i])
-        if pos < 0:
-            pos = 0
-        if pos >= n_rows:
-            pos = n_rows - 1
-
-        closes[i] = main_close_f64[pos]
-
-        start = pos + 1
-        end = pos + 1 + int(steps_i32)
-        if start >= n_rows or start >= end:
-            n_min[i] = 0.0
-            n_max[i] = 0.0
-            t_min_ns[i] = -1
-            t_max_ns[i] = -1
-            continue
-
-        if end > n_rows:
-            end = n_rows
-
-        min_val = main_close_f64[start]
-        max_val = main_close_f64[start]
-        min_time = main_time_ns_i64[start]
-        max_time = main_time_ns_i64[start]
-
-        for k in range(start + 1, end):
-            val = main_close_f64[k]
-            t = main_time_ns_i64[k]
-            if val < min_val:
-                min_val = val
-                min_time = t
-            if val > max_val:
-                max_val = val
-                max_time = t
-
-        n_min[i] = min_val
-        n_max[i] = max_val
-        t_min_ns[i] = min_time
-        t_max_ns[i] = max_time
-
-    return closes, n_min, n_max, t_min_ns, t_max_ns
-
-
-def precompute_kernel_arrays(df_main, side_df, exit_window_h: int, base_minutes: int = 5):
-    """
-    Build arrays required by the numba kernel for side signals.
-    """
-    main_close = df_main["close"].to_numpy().astype(np.float64)
-    main_time_ns = df_main["time_ns"].to_numpy().astype(np.int64)
-    sig_time_ns = side_df["time_ns"].to_numpy().astype(np.int64)
-    entry_prices = side_df["close"].to_numpy().astype(np.float64)
-
-    # Keep this aligned with the main backtest logic:
-    # zero means no lookahead window.
-    steps = max(0, int((exit_window_h * 60) / base_minutes))
-
-    entry_idxs = np.searchsorted(main_time_ns, sig_time_ns, side="left")
-    entry_idxs = np.clip(entry_idxs, 0, max(0, main_time_ns.shape[0] - 1)).astype(np.int64)
-
-    cl, mi, ma, t_mi, t_ma = _compute_windows_numba(main_close, main_time_ns, entry_idxs, np.int32(steps))
-    return cl.astype(np.float64), mi.astype(np.float32), ma.astype(np.float32), t_mi, t_ma, entry_prices, entry_idxs
-
-
-# -------------------------
-# low-level array entrypoint
-# -------------------------
 def backtest_from_arrays(
     close: np.ndarray,
     high: np.ndarray,
@@ -792,6 +774,8 @@ def backtest_from_arrays(
     spread_is_percent: bool = True,
     conservative_sl_first: bool = True,
     use_limit_entry: bool = True,
+    trade_overlap: bool = True,
+    trade_flip_on_entry: bool = False,
     use_trailing_sl: bool = False,
     trailing_sl_pct: float = 0.0,
     trailing_sl_interval: int = 0,
@@ -803,10 +787,76 @@ def backtest_from_arrays(
     signal_idx_arr = np.asarray(signal_idx_arr, dtype=np.int64)
     side_arr = np.asarray(side_arr, dtype=np.int8)
 
+    # Keep the signal stream deterministic before any stateful logic.
+    if signal_idx_arr.size:
+        order = np.argsort(signal_idx_arr, kind="mergesort")
+        signal_idx_arr = signal_idx_arr[order]
+        side_arr = side_arr[order]
+
     limit_window_bars = _expiry_to_bars(limit_order_expiry_bars)
     exit_window_bars = _hours_to_bars(exit_window_h, base_minutes)
     trade_window_bars = max(0, _hours_to_bars(trade_window_interval, base_minutes))
 
+    # Step 1: resolve entries from the raw signal stream.
+    # This is where the universal single-pending-order rule lives.
+    signal_idx, entry_idx, entry_price, side_out = _resolve_entries_stateful(
+        close_f64=close,
+        high_f64=high,
+        low_f64=low,
+        signal_idx_i64=signal_idx_arr,
+        side_i8=side_arr,
+        limit_window_bars_i64=int(limit_window_bars),
+        use_limit_entry_bool=bool(use_limit_entry),
+    )
+
+    if signal_idx.size == 0:
+        return {
+            "signal_idx": np.array([], dtype=np.int64),
+            "entry_idx": np.array([], dtype=np.int64),
+            "entry_price": np.array([], dtype=np.float64),
+            "exit_idx": np.array([], dtype=np.int64),
+            "exit_price": np.array([], dtype=np.float64),
+            "rets": np.array([], dtype=np.float64),
+            "exit_reason": np.array([], dtype=np.int8),
+            "side": np.array([], dtype=np.int8),
+            "SL_hit": np.array([], dtype=np.float64),
+            "TP_hit": np.array([], dtype=np.float64),
+            "max_consecutive_losses": 0,
+        }
+
+    # Step 2: compute each trade's natural exit from its actual fill.
+    (
+        exit_idx,
+        exit_price,
+        rets,
+        exit_reason,
+        tp_hit_price,
+        sl_hit_price,
+    ) = _compute_trade_exits_from_fills(
+        close_f64=close,
+        high_f64=high,
+        low_f64=low,
+        entry_idx_i64=entry_idx,
+        entry_price_f64=entry_price,
+        side_i8=side_out,
+        sl_f64=float(sl),
+        tp_f64=float(tp),
+        sl_tp_in_pct_bool=bool(sl_tp_in_pct),
+        exit_window_bars_i64=int(exit_window_bars),
+        spread_f64=float(spread),
+        spread_is_percent_bool=bool(spread_is_percent),
+        conservative_sl_first_bool=bool(conservative_sl_first),
+        use_trailing_sl_bool=bool(use_trailing_sl),
+        trailing_sl_pct_f64=float(trailing_sl_pct),
+        trailing_sl_interval_i64=int(trailing_sl_interval),
+        trailing_sl_stop_at_pos_bool=bool(trailing_sl_stop_at_pos),
+    )
+
+    # Step 3: apply overlap policy.
+    # trade_overlap=True  -> current behavior
+    # trade_overlap=False -> only one active trade at a time
+    #   - trade_flip_on_entry=False: later trades are blocked until the active trade closes
+    #   - trade_flip_on_entry=True : a new filled trade closes the active trade at the new entry
     (
         signal_idx,
         entry_idx,
@@ -818,27 +868,23 @@ def backtest_from_arrays(
         tp_hit_price,
         sl_hit_price,
         side_out,
-    ) = _backtest_kernel_limit_ohlc(
-        close,
-        high,
-        low,
-        signal_idx_arr,
-        side_arr,
-        float(sl),
-        float(tp),
-        bool(sl_tp_in_pct),
-        int(limit_window_bars),
-        int(exit_window_bars),
-        float(spread),
-        bool(spread_is_percent),
-        bool(conservative_sl_first),
-        bool(use_limit_entry),
-        bool(use_trailing_sl),
-        float(trailing_sl_pct),
-        int(trailing_sl_interval),
-        bool(trailing_sl_stop_at_pos),
+    ) = _apply_trade_overlap_mode_numba(
+        signal_idx=signal_idx,
+        entry_idx=entry_idx,
+        entry_price=entry_price,
+        exit_idx=exit_idx,
+        exit_price=exit_price,
+        rets=rets,
+        exit_reason=exit_reason,
+        tp_hit_price=tp_hit_price,
+        sl_hit_price=sl_hit_price,
+        side_out=side_out,
+        trade_overlap_bool=bool(trade_overlap),
+        trade_flip_on_entry_bool=bool(trade_flip_on_entry),
     )
 
+    # Step 4: optional research-style cooldown filter.
+    # This is still post-hoc and separate from trade_overlap.
     if trade_window_bars > 0 and signal_idx.size > 0:
         (
             signal_idx,
@@ -890,9 +936,6 @@ def backtest_from_arrays(
     }
 
 
-# -------------------------
-# public wrapper
-# -------------------------
 def backtest_signals_sl_tp_rets(
     main_close_arr: np.ndarray,
     main_high_arr: np.ndarray,
@@ -911,6 +954,8 @@ def backtest_signals_sl_tp_rets(
     conservative_sl_first: bool = True,
     side_flag: int = 1,
     use_limit_entry: bool = True,
+    trade_overlap: bool = True,
+    trade_flip_on_entry: bool = False,
     use_trailing_sl: bool = False,
     trailing_sl_pct: float = 0.0,
     trailing_sl_interval: int = 0,
@@ -950,6 +995,8 @@ def backtest_signals_sl_tp_rets(
         spread_is_percent=spread_is_percent,
         conservative_sl_first=conservative_sl_first,
         use_limit_entry=use_limit_entry,
+        trade_overlap=trade_overlap,
+        trade_flip_on_entry=trade_flip_on_entry,
         use_trailing_sl=use_trailing_sl,
         trailing_sl_pct=trailing_sl_pct,
         trailing_sl_interval=trailing_sl_interval,

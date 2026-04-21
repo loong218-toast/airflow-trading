@@ -6,7 +6,6 @@ import json
 import logging
 import math
 from copy import deepcopy
-from itertools import product
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -19,241 +18,65 @@ from common.casting import (
     _as_int_list,
     _as_float_list,
     _as_threshold_pairs,
-    _ordered_unique_ints,
     _ordered_unique_floats,
     _ordered_unique_strings,
-    _ordered_unique_nonneg_ints,
-    _as_str,
 )
 
 from common.feature_helpers import (
-    family_enabled,
-    family_tf_cfg,
-    family_timeframes,
+    build_signal_json,
     get_signal_structure,
-    normalize_timeframe,
-    normalize_timeframe_list,
+    signal_scope_variants,
 )
 from research.grid import _expand_sl_tp, _prune_by_min_rr
 
 logger = logging.getLogger(__name__)
 
+
 def _normalize_signal_structure(run_cfg: dict) -> dict:
     """
     Strict signal-structure loader.
 
-    New grid runs should provide nested signal_structure only.
-    Legacy flat config fallback is intentionally disabled so bad configs fail
-    early instead of silently changing the feature set.
+    New grid runs must provide nested signal_structure only.
     """
     signal_block = get_signal_structure(run_cfg)
     if isinstance(signal_block, dict) and signal_block:
         return deepcopy(signal_block)
 
-    flat_legacy_keys = (
-        "ma_periods",
-        "ma_types",
-        "ma_reversion",
-        "ma_timeframe",
-        "use_stochastic",
-        "stoch_k",
-        "stoch_d",
-        "stoch_s",
-        "stoch_thresholds",
-        "stoch_threshold_tolerance",
-        "stoch_timeframe",
-        "entry_lookback_units",
-        "lookback_timeframe",
-        "use_bbw",
-        "bbw_periods",
-        "bbw_std",
-        "bbw_thresholds",
-        "bbw_timeframe",
+    raise ValueError(
+        "signal_structure is required for grid search. "
+        "Legacy flat signal keys are no longer supported."
     )
-    if any(k in run_cfg for k in flat_legacy_keys):
-        raise ValueError(
-            "Legacy flat signal keys detected, but nested signal_structure is missing. "
-            "Please migrate the config to signal_structure."
-        )
 
-    return {}
-
-
-def _concrete_tf_options(family_name: str, tf_cfg: dict) -> list[dict]:
-    """
-    Convert one timeframe config into concrete single-choice configs.
-
-    The output stays compatible with feature_prep.py and live signal logic:
-    single selected values are still represented in the same nested structure.
-    """
-    if not isinstance(tf_cfg, dict):
-        return []
-
-    tf_cfg = deepcopy(tf_cfg)
-
-    if family_name == "ma":
-        periods = _as_int_list(tf_cfg.get("periods", [])) or [96]
-        types = _ordered_unique_strings(tf_cfg.get("types", [])) or ["sma"]
-        reversions = _as_bool_list(tf_cfg.get("reversion", False), False)
-
-        out: list[dict] = []
-        for period, ma_type, reversion in product(periods, types, reversions):
-            out.append(
-                {
-                    "periods": [int(period)],
-                    "types": [str(ma_type).strip().lower() or "sma"],
-                    "reversion": [bool(reversion)],
-                }
-            )
-        return out
-
-    if family_name == "stochastic":
-        ks = _as_int_list(tf_cfg.get("k", [])) or [12]
-        ds = _as_int_list(tf_cfg.get("d", [])) or [3]
-        ss = _as_int_list(tf_cfg.get("s", [])) or [3]
-        thresholds = _as_threshold_pairs(tf_cfg.get("thresholds", [[30, 70]])) or [[30, 70]]
-        tolerances = _as_float_list(tf_cfg.get("threshold_tolerance", 10.0)) or [10.0]
-
-        out: list[dict] = []
-        for k, d, s, th, tol in product(ks, ds, ss, thresholds, tolerances):
-            low, high = float(th[0]), float(th[1])
-            out.append(
-                {
-                    "k": [int(k)],
-                    "d": [int(d)],
-                    "s": [int(s)],
-                    "thresholds": [[low, high]],
-                    "threshold_tolerance": float(tol),
-                }
-            )
-        return out
-
-    if family_name == "lookback":
-        units = _ordered_unique_nonneg_ints(tf_cfg.get("entry_lookback_units", []))
-        if not units:
-            units = [0]
-
-        return [{"entry_lookback_units": [int(u)]} for u in units if int(u) >= 0]
-
-    if family_name == "bbw":
-        periods = _as_int_list(tf_cfg.get("periods", [])) or [96]
-        stds = _as_float_list(tf_cfg.get("std", [])) or [2.5]
-        thresholds = _as_float_list(tf_cfg.get("thresholds", [])) or [50.0]
-
-        out: list[dict] = []
-        for p, s, t in product(periods, stds, thresholds):
-            out.append(
-                {
-                    "periods": [int(p)],
-                    "std": [float(s)],
-                    "thresholds": [float(t)],
-                }
-            )
-        return out
-
-    return [deepcopy(tf_cfg)]
-
-
-def _concrete_family_variants(family_name: str, family_cfg: dict) -> list[dict]:
-    """
-    Expand a family across all of its timeframes.
-
-    Each returned family variant is one concrete, grid-ready selection.
-    """
-    if not isinstance(family_cfg, dict):
-        return []
-
-    enabled = _as_bool(family_cfg.get("enabled", False), False)
-    combine = str(family_cfg.get("combine", "all")).strip().lower()
-    by_tf = family_cfg.get("by_timeframe", {})
-    if not isinstance(by_tf, dict):
-        by_tf = {}
-
-    # Disabled family stays as-is: it does not participate in the grid.
-    if not enabled:
-        return [
-            {
-                "enabled": False,
-                "combine": combine if combine in {"all", "any"} else "all",
-                "by_timeframe": deepcopy(by_tf),
-            }
-        ]
-
-    tfs = family_timeframes({"signal_structure": {family_name: family_cfg}}, family_name, default=list(by_tf.keys()))
-    if not tfs:
-        return [
-            {
-                "enabled": True,
-                "combine": combine if combine in {"all", "any"} else "all",
-                "by_timeframe": deepcopy(by_tf),
-            }
-        ]
-
-    tf_options_by_tf: list[tuple[str, list[dict]]] = []
-    for tf in tfs:
-        raw_tf_cfg = by_tf.get(tf, {})
-        options = _concrete_tf_options(family_name, raw_tf_cfg)
-        if not options:
-            options = [deepcopy(raw_tf_cfg)]
-        tf_options_by_tf.append((tf, options))
-
-    out: list[dict] = []
-    for choice_combo in product(*(opts for _, opts in tf_options_by_tf)):
-        concrete_by_tf: dict = {}
-        single_tf_only = len(tf_options_by_tf) == 1
-
-        for (tf, _), concrete_cfg in zip(tf_options_by_tf, choice_combo):
-            tf_key = normalize_timeframe(tf)
-            concrete_by_tf[tf_key] = dict(concrete_cfg)
-
-            # Only keep timeframe field if it actually varies
-            if not single_tf_only:
-                concrete_by_tf[tf_key]["timeframe"] = tf_key
-
-        out.append(
-            {
-                "enabled": True,
-                "combine": combine if combine in {"all", "any"} else "all",
-                "by_timeframe": concrete_by_tf,
-            }
-        )
-
-    return out
-
-
-def _explicit_signal_variants(run_cfg: dict) -> list[dict]:
+def _explicit_signal_variants(run_cfg: dict) -> list[tuple[int, dict, str]]:
     signal_structure = _normalize_signal_structure(run_cfg)
-    if not signal_structure:
-        return [{}]
 
-    family_order = ["ma", "stochastic", "lookback", "bbw"]
-    variants = [deepcopy(signal_structure)]
+    variants: list[tuple[int, dict, str]] = []
+    seen = set()
 
-    for family_name in family_order:
-        family_cfg = signal_structure.get(family_name)
-        if not isinstance(family_cfg, dict):
+    # Real signal variants only.
+    for layer, scoped_signal_structure, scope in signal_scope_variants(signal_structure):
+        scope_id = str(scope or "").strip().lower()
+
+        # Drop the old empty baseline variants coming from signal_scope_variants().
+        if scope_id in {"all_buy", "all_sell"}:
             continue
 
-        family_variants = _concrete_family_variants(family_name, family_cfg)
-        next_variants = []
+        key = (
+            int(layer),
+            scope_id,
+            json.dumps(scoped_signal_structure, sort_keys=True, separators=(",", ":"), default=str),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        variants.append((int(layer), deepcopy(scoped_signal_structure), scope_id))
 
-        for base in variants:
-            for fv in family_variants:
-                merged = deepcopy(base)
-                merged[family_name] = deepcopy(fv)
-                next_variants.append(merged)
+    # Baseline is its own control case, and it keeps the full signal_structure.
+    for scope_id in ("baseline:all_buy", "baseline:all_sell"):
+        variants.append((0, deepcopy(signal_structure), scope_id))
 
-        variants = next_variants or variants
-
-    unique = []
-    seen = set()
-    for v in variants:
-        key = json.dumps(v, sort_keys=True, separators=(",", ":"), default=str)
-        if key not in seen:
-            seen.add(key)
-            unique.append(v)
-
-    return unique
+    variants.sort(key=lambda x: (x[0], x[2]))
+    return variants
 
 
 def _top_level_axes(run_cfg: dict) -> Dict[str, list]:
@@ -268,6 +91,8 @@ def _top_level_axes(run_cfg: dict) -> Dict[str, list]:
     axes["SL"] = _as_float_list(run_cfg.get("SL", run_cfg.get("sl_range", {}).get("min", 0.2))) or [0.2]
     axes["TP"] = _as_float_list(run_cfg.get("TP", run_cfg.get("tp_range", {}).get("max", 6.0))) or [6.0]
 
+    axes["trade_overlap"] = _as_bool_list(run_cfg.get("trade_overlap", True), True)
+    axes["trade_flip_on_entry"] = _as_bool_list(run_cfg.get("trade_flip_on_entry", False), False)
     axes["use_trailing_sl"] = _as_bool_list(run_cfg.get("use_trailing_sl", False), False)
     axes["trailing_sl_pct"] = _as_float_list(run_cfg.get("trailing_sl_pct", 0.0)) or [0.0]
     axes["trailing_sl_interval"] = _as_int_list(run_cfg.get("trailing_sl_interval", 0)) or [0]
@@ -281,7 +106,6 @@ def _top_level_axes(run_cfg: dict) -> Dict[str, list]:
 
     return axes
 
-
 def _safe_int_regime_id(value: int) -> int:
     try:
         return int(value)
@@ -289,21 +113,12 @@ def _safe_int_regime_id(value: int) -> int:
         return 0
 
 
-def _candidate_count_from_axes(axis_map: Dict[str, list]) -> int:
-    total = 1
-    for vals in axis_map.values():
-        total *= max(1, len(vals))
-    return int(total)
-
-
 def _write_batch(path: Path, batch_id: int, rows: list[dict]) -> None:
     payload = {
         "batch_id": int(batch_id),
-        "search_mode": "grid_search",
         "regimes": rows,
     }
     path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf8")
-
 
 def generate_configs(session_dir: Path, run_cfg: dict) -> list[Path]:
     """
@@ -330,7 +145,7 @@ def generate_configs(session_dir: Path, run_cfg: dict) -> list[Path]:
     all_regimes: list[dict] = []
 
     regime_idx = 0
-    for signal_structure in signal_variants:
+    for signal_layer, signal_structure, signal_scope_id in signal_variants:
         signal_cfg = deepcopy(run_cfg)
         signal_cfg["signal_structure"] = deepcopy(signal_structure)
 
@@ -342,28 +157,38 @@ def generate_configs(session_dir: Path, run_cfg: dict) -> list[Path]:
                             for use_limit_entry in top_axes["use_limit_entry"]:
                                 for limit_order_expiry_bars in top_axes["limit_order_expiry_bars"]:
                                     for trade_window_interval in top_axes["trade_window_interval"]:
-                                        for exit_window_h in top_axes["exit_window_h"]:
-                                            regime = deepcopy(signal_cfg)
+                                        for trade_overlap in top_axes["trade_overlap"]:
+                                            for trade_flip_on_entry in top_axes["trade_flip_on_entry"]:
+                                                for exit_window_h in top_axes["exit_window_h"]:
+                                                    regime = deepcopy(signal_cfg)
 
-                                            regime["regime_id"] = _safe_int_regime_id(regime_idx)
-                                            regime["SL"] = float(sl_val)
-                                            regime["TP"] = float(tp_val)
+                                                    regime["regime_id"] = _safe_int_regime_id(regime_idx)
+                                                    regime["signal_layer"] = int(signal_layer)
+                                                    regime["signal_scope_id"] = str(signal_scope_id)
+                                                    regime.pop("signal_scope", None)
 
-                                            regime["use_trailing_sl"] = bool(use_trailing_sl)
-                                            regime["trailing_sl_pct"] = float(trailing_sl_pct)
-                                            regime["trailing_sl_interval"] = int(trailing_sl_interval)
-                                            regime["trailing_sl_stop_at_pos"] = bool(trailing_sl_stop_at_pos)
+                                                    regime["SL"] = float(sl_val)
+                                                    regime["TP"] = float(tp_val)
 
-                                            regime["use_limit_entry"] = bool(use_limit_entry)
-                                            regime["limit_order_expiry_bars"] = int(limit_order_expiry_bars)
-                                            regime["trade_window_interval"] = int(trade_window_interval)
-                                            regime["exit_window_h"] = int(exit_window_h)
+                                                    regime["use_trailing_sl"] = bool(use_trailing_sl)
+                                                    regime["trailing_sl_pct"] = float(trailing_sl_pct)
+                                                    regime["trailing_sl_interval"] = int(trailing_sl_interval)
+                                                    regime["trailing_sl_stop_at_pos"] = bool(trailing_sl_stop_at_pos)
 
-                                            regime["search_mode"] = "grid_search"
+                                                    regime["use_limit_entry"] = bool(use_limit_entry)
+                                                    regime["limit_order_expiry_bars"] = int(limit_order_expiry_bars)
+                                                    regime["trade_window_interval"] = int(trade_window_interval)
+                                                    regime["trade_overlap"] = bool(trade_overlap)
+                                                    regime["trade_flip_on_entry"] = bool(trade_flip_on_entry)
+                                                    regime["exit_window_h"] = int(exit_window_h)
 
-                                            all_regimes.append(regime)
-                                            regime_idx += 1
+                                                    all_regimes.append(regime)
+                                                    regime_idx += 1
 
+                                                    if max_regimes > 0 and len(all_regimes) >= max_regimes:
+                                                        break
+                                                if max_regimes > 0 and len(all_regimes) >= max_regimes:
+                                                    break
                                             if max_regimes > 0 and len(all_regimes) >= max_regimes:
                                                 break
                                         if max_regimes > 0 and len(all_regimes) >= max_regimes:
