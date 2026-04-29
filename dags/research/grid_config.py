@@ -31,6 +31,41 @@ from research.grid import _expand_sl_tp, _prune_by_min_rr
 
 logger = logging.getLogger(__name__)
 
+def _regime_signature(regime: dict) -> str:
+    """
+    Build a canonical signature for one effective strategy.
+
+    This should change only when the actual strategy changes.
+    Keep this aligned with the fields that define uniqueness.
+    """
+    signal_json = regime.get("signal_json")
+    if not isinstance(signal_json, str) or not signal_json:
+        signal_json = json.dumps(
+            build_signal_json(regime),
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+
+    payload = {
+        "signal_layer": int(regime.get("signal_layer", 0) or 0),
+        "signal_scope_id": str(regime.get("signal_scope_id", "")).strip().lower(),
+        "exit_window_h": int(regime.get("exit_window_h", 0) or 0),
+        "SL": float(regime.get("SL", 0.0) or 0.0),
+        "TP": float(regime.get("TP", 0.0) or 0.0),
+        "use_trailing_sl": bool(regime.get("use_trailing_sl", False)),
+        "trailing_sl_pct": float(regime.get("trailing_sl_pct", 0.0) or 0.0),
+        "trailing_sl_interval": int(regime.get("trailing_sl_interval", 0) or 0),
+        "trailing_sl_stop_at_pos": bool(regime.get("trailing_sl_stop_at_pos", False)),
+        "use_limit_entry": bool(regime.get("use_limit_entry", False)),
+        "limit_order_expiry_bars": int(regime.get("limit_order_expiry_bars", 0) or 0),
+        "trade_overlap": bool(regime.get("trade_overlap", False)),
+        "trade_flip_on_entry": bool(regime.get("trade_flip_on_entry", False)),
+        "trade_window_interval": int(regime.get("trade_window_interval", 0) or 0),
+        "signal_json": signal_json,
+    }
+
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
 
 def _normalize_signal_structure(run_cfg: dict) -> dict:
     """
@@ -124,11 +159,6 @@ def generate_configs(session_dir: Path, run_cfg: dict) -> list[Path]:
     """
     Build grid-search batches.
 
-    Important:
-    - No CCD state.
-    - No surrogate ranking.
-    - No random sampling.
-    - Every regime is a concrete configuration.
     """
     session_dir = Path(session_dir)
     cfg_dir = session_dir / "configs"
@@ -142,9 +172,9 @@ def generate_configs(session_dir: Path, run_cfg: dict) -> list[Path]:
 
     max_regimes = int(run_cfg.get("grid_max_regimes", 0) or 0)
     saved_batch_paths: list[Path] = []
+
     all_regimes: list[dict] = []
 
-    regime_idx = 0
     for signal_layer, signal_structure, signal_scope_id in signal_variants:
         signal_cfg = deepcopy(run_cfg)
         signal_cfg["signal_structure"] = deepcopy(signal_structure)
@@ -162,7 +192,6 @@ def generate_configs(session_dir: Path, run_cfg: dict) -> list[Path]:
                                                 for exit_window_h in top_axes["exit_window_h"]:
                                                     regime = deepcopy(signal_cfg)
 
-                                                    regime["regime_id"] = _safe_int_regime_id(regime_idx)
                                                     regime["signal_layer"] = int(signal_layer)
                                                     regime["signal_scope_id"] = str(signal_scope_id)
                                                     regime.pop("signal_scope", None)
@@ -182,8 +211,15 @@ def generate_configs(session_dir: Path, run_cfg: dict) -> list[Path]:
                                                     regime["trade_flip_on_entry"] = bool(trade_flip_on_entry)
                                                     regime["exit_window_h"] = int(exit_window_h)
 
+                                                    regime["signal_json"] = json.dumps(
+                                                        build_signal_json(regime),
+                                                        sort_keys=True,
+                                                        separators=(",", ":"),
+                                                        default=str,
+                                                    )
+                                                    regime["regime_key"] = _regime_signature(regime)
+
                                                     all_regimes.append(regime)
-                                                    regime_idx += 1
 
                                                     if max_regimes > 0 and len(all_regimes) >= max_regimes:
                                                         break
@@ -209,6 +245,28 @@ def generate_configs(session_dir: Path, run_cfg: dict) -> list[Path]:
                 break
         if max_regimes > 0 and len(all_regimes) >= max_regimes:
             break
+
+
+    # Drop exact duplicates before assigning regime_id.
+    unique_regimes: list[dict] = []
+    seen_keys: set[str] = set()
+
+    for regime in all_regimes:
+        key = str(regime.get("regime_key", "")).strip()
+        if not key or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        unique_regimes.append(regime)
+
+    unique_regimes.sort(key=lambda r: r["regime_key"])
+
+    for new_id, regime in enumerate(unique_regimes):
+        regime["regime_id"] = int(new_id)
+
+    if max_regimes > 0:
+        unique_regimes = unique_regimes[:max_regimes]
+
+    all_regimes = unique_regimes
 
     total_regimes = len(all_regimes)
     batch_size = int(run_cfg.get("BATCH_SIZE", 150) or 150)
@@ -249,8 +307,7 @@ def list_pending_config_paths(session_dir: Path) -> List[str]:
             is_batch_complete = True
 
             for r in regimes:
-                regime_id = r.get("regime_id")
-                result_file = results_dir / f"cfg_{regime_id}_summary.json"
+                result_file = _summary_path_for_regime(results_dir, r)
                 if not result_file.exists():
                     is_batch_complete = False
                     break

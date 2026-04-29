@@ -247,13 +247,33 @@ def grid_search_pipeline():
 
     @task()
     def combine_results_task(session_dir: str, dependencies):
-        from research.merge_utils import combine_results_to_master
+        from research.merge_utils import merge_batch_master_parts, combine_results_to_master
+
         logger.info(f"🧹 Combining results for {session_dir}...")
+        session_dir = Path(session_dir)
+        results_dir = session_dir / "results"
+        master_parts_root = results_dir / "master_parts"
+
+        merged_batches = 0
+        if master_parts_root.exists():
+            for batch_dir in sorted(master_parts_root.glob("batch_*")):
+                if not batch_dir.is_dir():
+                    continue
+                try:
+                    batch_id = int(batch_dir.name.split("_", 1)[1])
+                except Exception:
+                    logger.debug("Skipping unexpected batch dir name: %s", batch_dir.name)
+                    continue
+
+                merge_batch_master_parts(session_dir, batch_id)
+                merged_batches += 1
+
+        logger.info("✅ Merged %d batch master groups", merged_batches)
         return combine_results_to_master(session_dir)
 
     @task()
     def combine_equity_task(session_dir: str, dependencies):
-        from research.merge_utils import combine_all_equity_parts
+        from research.equitystager import combine_all_equity_parts
         logger.info(f"🧹 Combining equity parts for {session_dir}...")
         outputs = combine_all_equity_parts(session_dir)
         logger.info("✅ Equity merge complete: %d era files", len(outputs))
@@ -261,7 +281,7 @@ def grid_search_pipeline():
 
     @task()
     def combine_trade_ml_task(session_dir: str, dependencies):
-        from research.trade_ml_io_utils import combine_all_trade_ml_parts
+        from research.trade_ml_stager import combine_all_trade_ml_parts
         logger.info(f"🧹 Combining trade_ml parts for {session_dir}...")
         outputs = combine_all_trade_ml_parts(session_dir)
         logger.info("✅ Trade ML merge complete: %d era files", len(outputs))

@@ -87,7 +87,7 @@ def _atomic_write_parquet(df: pl.DataFrame, path: Path) -> None:
 
 
 _master_rows_buffer: List[Dict[str, Any]] = []
-_MASTER_FLUSH_ROWS = int(os.getenv("MASTER_ROWS_FLUSH", "2000"))
+_MASTER_FLUSH_ROWS = int(os.getenv("MASTER_ROWS_FLUSH", "1000"))
 _MASTER_LOCK = threading.Lock()
 
 
@@ -117,6 +117,7 @@ def buffer_master_row(results_dir: Path, batch_id: int, row: Dict[str, Any], flu
 
     with _MASTER_LOCK:
         _master_rows_buffer.append(canonical)
+        logger.debug("master buffer size=%d", len(_master_rows_buffer))
         buf_to_flush = None
         if len(_master_rows_buffer) >= _MASTER_FLUSH_ROWS:
             buf_to_flush = list(_master_rows_buffer)

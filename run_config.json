@@ -2,29 +2,29 @@
   "pair": "XXBTZUSD",
   "BASE_MINUTES": 5,
   "sl_tp_in_pct": true,
-  "min_rr": 3.0,
+  "min_rr": 0,
   "sl_tp_interval_months": 3,
 
   "sl_range": {
-    "min": 0.2,
-    "max": 0.2,
+    "min": 0.4,
+    "max": 2.4,
     "step": 0.2
   },
   "tp_range": {
-    "min": 5.0,
-    "max": 5.0,
-    "step": 0.5
+    "min": 0.4,
+    "max": 2.4,
+    "step": 0.2
   },
   
   "exit_windows_h": [4, 24],
-  "trade_flip_on_entry": [false, true],
+  "trade_flip_on_entry": [false],
   "trade_overlap": [false, true],
   "trade_window_interval": [20],
-  "limit_order_expiry_bars": [3, 12, 24, 48],
+  "limit_order_expiry_bars": [12],
   "use_limit_entry": true,
 
-  "use_trailing_sl": [true],
-  "trailing_sl_pct": [0.2, 0.3, 0.4],
+  "use_trailing_sl": [false],
+  "trailing_sl_pct": [0.2],
   "trailing_sl_interval": [3],
   "trailing_sl_stop_at_pos": [false],
 
@@ -47,13 +47,6 @@
     "stochastic": {
       "enabled": true,
       "by_timeframe": {
-        "5m": {
-          "k": [12],
-          "d": [8],
-          "s": [8],
-          "thresholds": [[30, 70]],
-          "threshold_tolerance": 10
-        },
         "15m": {
           "k": [12],
           "d": [8],
@@ -67,9 +60,6 @@
       "enabled": true,
       "by_timeframe": {
         "5m": {
-          "entry_lookback_units": [1, 2]
-        },
-        "15m": {
           "entry_lookback_units": [1, 2]
         }
       }
@@ -92,13 +82,11 @@
   "max_dd_threshold": 0.10,
   "MAX_EMPTY_ERA_STREAK": 80,
   "EQUITY_PARTITION_BY": "era_int",
-  "risk_pct": 0.004,
+  "risk_pct": 0.005,
   "trading_fees": 0.0004,
   "funding_period_hours": 8,
   "funding_rate_unit": "per_period",
   "force_rebuild_cache": false,
   "grid_start_date": "2022-09-01T00:00:00Z",
-  "grid_end_date": "2025-09-15T23:59:59Z",
-
-  "BATCH_SIZE": 150
+  "grid_end_date": "2025-09-15T23:59:59Z"
 }

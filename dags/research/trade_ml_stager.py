@@ -1,3 +1,5 @@
+# trade_ml_stager.py
+
 from __future__ import annotations
 
 import gc
@@ -282,6 +284,7 @@ class TradeMLStager:
                 logger.exception("TradeMLStager.flush_all: failed to close writer for %s", part_key)
         self._writers = {}
         self._paths = {}
+        gc.collect()
 
 
 # -----------------------------------------------------------------------------
@@ -314,7 +317,7 @@ def combine_trade_ml_parts(
     partition_key: str,
     batch_id: Optional[int] = None,
     batch_size: int = 65_536,
-    stage_size: int = 256,
+    stage_size: int = 256,  # kept only for compatibility; not used here
 ) -> Optional[Path]:
     """
     Merge worker trade_ml shards for one era into one final parquet file.
@@ -346,8 +349,6 @@ def combine_trade_ml_parts(
         tmp_path,
         kind="trade_ml",
         batch_size=batch_size,
-        stage_size=stage_size,
-        gc_every_stage=True,
     )
 
     os.replace(str(tmp_path), str(final_path))
@@ -376,7 +377,6 @@ def combine_trade_ml_parts(
         result["skipped_files"],
     )
     return final_path
-
 
 def combine_all_trade_ml_parts(session_dir: str | Path, batch_id: Optional[int] = None) -> List[Path]:
     """

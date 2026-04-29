@@ -1,3 +1,5 @@
+# equitystager.py
+
 from __future__ import annotations
 
 import gc
@@ -7,14 +9,19 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Callable, Any
+import json
 
+from collections import defaultdict
 import numpy as np
 import polars as pl
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 from common.schema import enforce_schema
 
 logger = logging.getLogger(__name__)
+_LOG = logging.getLogger(__name__)
+
 
 _EQUITY_SHARD_RE = re.compile(
     r"^equity_era_int=(?P<era>\d+)_batch=(?P<batch>\d+)_(?:worker|task)=(?P<unit>\d+)\.parquet$"
@@ -24,6 +31,14 @@ def _equity_tmp_dir(session_dir: Path) -> Path:
     tmp_dir = session_dir / "equity_partitioned" / "_tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
     return tmp_dir
+
+def _cleanup_path(path: Path) -> None:
+    try:
+        if path.exists():
+            path.unlink()
+    except Exception:
+        pass
+
 
 # -----------------------------------------------------------------------------
 # Equity staging
@@ -158,6 +173,7 @@ class EquityStager:
 
         self._writers = {}
         self._paths = {}
+        gc.collect()
 
 
 # -----------------------------------------------------------------------------
@@ -230,12 +246,12 @@ def stage_equity_from_preview(
     equity_arr: np.ndarray,
     closed_entry_idxs: np.ndarray,
     closed_exit_idxs: np.ndarray,
+    closed_side_arr: np.ndarray,
     sl_val: float,
     tp_val: float,
     regime_id: int,
     signal_layer: int,
     era_int: int,
-    side_flag: int,
     stager: EquityStager,
     max_dd: float,
     signal_scope: str = "",
@@ -247,27 +263,48 @@ def stage_equity_from_preview(
     if equity_arr is None or equity_arr.size == 0:
         return 100.0, 0, float(max_dd)
 
-    pnl_pct_arr = np.nan_to_num(pnl_pct_arr, nan=0.0, posinf=1e37, neginf=-1e37)
-    equity_arr = np.nan_to_num(equity_arr, nan=0.0, posinf=1e37, neginf=-1e37)
+    pnl_pct_arr = np.asarray(pnl_pct_arr, dtype=np.float64).ravel()
+    exit_times_ns = np.asarray(exit_times_ns, dtype=np.int64).ravel()
+    equity_arr = np.asarray(equity_arr, dtype=np.float64).ravel()
+    closed_entry_idxs = np.asarray(closed_entry_idxs, dtype=np.int64).ravel()
+    closed_exit_idxs = np.asarray(closed_exit_idxs, dtype=np.int64).ravel()
+    closed_side_arr = np.asarray(closed_side_arr, dtype=np.int8).ravel()
+
+    n = min(
+        pnl_pct_arr.size,
+        exit_times_ns.size,
+        equity_arr.size,
+        closed_entry_idxs.size,
+        closed_exit_idxs.size,
+        closed_side_arr.size,
+    )
+    if n == 0:
+        return 100.0, 0, float(max_dd)
+
+    pnl_pct_arr = np.nan_to_num(pnl_pct_arr[:n], nan=0.0, posinf=1e37, neginf=-1e37)
+    exit_times_ns = exit_times_ns[:n]
+    equity_arr = np.nan_to_num(equity_arr[:n], nan=0.0, posinf=1e37, neginf=-1e37)
+    closed_entry_idxs = closed_entry_idxs[:n]
+    closed_exit_idxs = closed_exit_idxs[:n]
+    closed_side_arr = closed_side_arr[:n]
 
     win_pos = int(np.count_nonzero(pnl_pct_arr > 0.0))
     final_balance = float(equity_arr[-1]) if equity_arr.size else 100.0
 
     equity_df = pl.DataFrame(
         {
-            "regime_id": [int(regime_id)],
-            "signal_layer": [int(signal_layer)],
-            "signal_scope": [str(signal_scope or "")],
-            "signal_scope_id": [str(signal_scope or "")],
-            "era_int": [int(era_int)],
-            "side": [int(side_flag)],
-            "SL": [float(sl_val)],
-            "TP": [float(tp_val)],
-            "time_ns": pl.Series([exit_times_ns.astype(np.int64)], dtype=pl.List(pl.Int64)),
-            "entry_idx": pl.Series([closed_entry_idxs.astype(np.int64)], dtype=pl.List(pl.Int64)),
-            "exit_idx": pl.Series([closed_exit_idxs.astype(np.int64)], dtype=pl.List(pl.Int64)),
-            "pnl_pct": pl.Series([pnl_pct_arr.astype(np.float32)], dtype=pl.List(pl.Float32)),
-            "equity": pl.Series([equity_arr.astype(np.float32)], dtype=pl.List(pl.Float32)),
+            "regime_id": np.full(n, int(regime_id), dtype=np.int32),
+            "signal_layer": np.full(n, int(signal_layer), dtype=np.int8),
+            "signal_scope_id": np.full(n, str(signal_scope or ""), dtype=object),
+            "era_int": np.full(n, int(era_int), dtype=np.int64),
+            "side": closed_side_arr.astype(np.int8),
+            "SL": np.full(n, float(sl_val), dtype=np.float32),
+            "TP": np.full(n, float(tp_val), dtype=np.float32),
+            "time_ns": exit_times_ns.astype(np.int64),
+            "entry_idx": closed_entry_idxs.astype(np.int64),
+            "exit_idx": closed_exit_idxs.astype(np.int64),
+            "pnl_pct": pnl_pct_arr.astype(np.float32),
+            "equity": equity_arr.astype(np.float32),
         }
     )
 
@@ -277,11 +314,7 @@ def stage_equity_from_preview(
         logger.exception("stage_equity_from_preview: failed to build equity DataFrame: %s", e)
         return final_balance, win_pos, float(max_dd)
 
-    meta = {
-        "rows": int(equity_df.height),
-        "cols": list(equity_df.columns),
-    }
-    if meta["rows"] == 0:
+    if equity_df.height == 0:
         logger.error("stage_equity_from_preview: refusing to stage empty equity fragment")
         return final_balance, win_pos, float(max_dd)
 

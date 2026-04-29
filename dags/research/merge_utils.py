@@ -4,7 +4,6 @@ import json
 import logging
 import os
 import re
-from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -289,29 +288,33 @@ def combine_results_to_master(session_dir: str) -> Dict[str, Any]:
     for p in batch_files:
         try:
             meta = pq.ParquetFile(str(p)).metadata
-            if meta.num_rows > 0:
+            if meta is not None and meta.num_rows > 0:
                 nonempty.append(p)
         except Exception as e:
             _LOG.error("Skipping corrupted master batch file %s: %s", p.name, e)
 
     if not nonempty:
         df_master = pl.DataFrame([], schema=get_schema("master"))
-        df_master.write_parquet(master_metrics_path)
+        df_master.write_parquet(str(master_metrics_path), compression="snappy")
         _LOG.info("⚠️ No batch data found. Created empty master_metrics.")
-        return {"status": "complete_no_batch_data", "path": str(master_metrics_path), "rows": 0}
+        return {
+            "status": "complete_no_batch_data",
+            "path": str(master_metrics_path),
+            "rows": 0,
+            "merged_files": 0,
+            "skipped_files": 0,
+            "skipped": [],
+        }
 
     _LOG.info("Merging %d batch masters...", len(nonempty))
-    tmp_master = master_metrics_path.with_suffix(".tmp.parquet")
-    _cleanup_path(tmp_master)
+    _cleanup_path(master_metrics_path.with_suffix(".tmp.parquet"))
+
+    result = _merge_parquet_files_skip_bad([str(p) for p in nonempty], master_metrics_path, kind="master")
 
     try:
-        result = _merge_parquet_files_skip_bad([str(p) for p in nonempty], master_metrics_path, kind="master")
+        rows = pq.ParquetFile(str(master_metrics_path)).metadata.num_rows
     except Exception:
-        _cleanup_path(tmp_master)
-        raise
-
-    df_master = pl.read_parquet(master_metrics_path)
-    df_master = enforce_schema(df_master, "master", strict=True)
+        rows = None
 
     _LOG.info(
         "✅ Successfully merged master_metrics: merged=%d skipped=%d",
@@ -321,7 +324,7 @@ def combine_results_to_master(session_dir: str) -> Dict[str, Any]:
     return {
         "status": "complete_master_only",
         "path": str(master_metrics_path),
-        "rows": df_master.height,
+        "rows": rows,
         "merged_files": result["merged_files"],
         "skipped_files": result["skipped_files"],
         "skipped": result["skipped"],

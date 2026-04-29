@@ -9,12 +9,14 @@ from typing import Any, Dict, Optional
 import numpy as np
 import polars as pl
 
+import logging
+
 from common.feature_helpers import (
     build_signal_json,
     compact_json,
     signal_scope_text,
 )
-from common.schema import enforce_schema
+from common.schema import enforce_schema, get_schema
 
 from common.casting import (
     _as_bool,
@@ -39,27 +41,20 @@ def _make_empty_master_row(
     regime_id: int,
     signal_layer: int,
     era_int: int,
-    side_flag: int,
     sl_val: float,
     tp_val: float,
     regime_cfg: dict,
     run_cfg: Optional[dict] = None,
+    signal_scope_id: str = "",
 ) -> dict:
-    """
-    Canonical empty master row.
-
-    This must match common/schema.py -> MASTER_SCHEMA exactly, so downstream
-    code never has to branch on "empty trade set" special cases.
-    """
     signal_json = build_signal_json(regime_cfg, run_cfg=run_cfg)
-    signal_scope_id = signal_scope_text(regime_cfg.get("signal_structure", {}))
+    scope_id = str(signal_scope_id or regime_cfg.get("signal_scope_id") or "").strip().lower()
 
     return {
         "regime_id": int(regime_id),
         "signal_layer": int(signal_layer),
-        "signal_scope_id": signal_scope_id,
+        "signal_scope_id": scope_id,
         "era_int": int(era_int),
-        "side": int(side_flag),
         "exit_window_h": int(_scalar(regime_cfg.get("exit_window_h", 0)) or 0),
         "SL": float(sl_val),
         "TP": float(tp_val),
@@ -85,7 +80,6 @@ def _make_master_row(
     regime_id: int,
     signal_layer: int,
     era_int: int,
-    side_flag: int,
     sl_val: float,
     tp_val: float,
     total_pos: int,
@@ -95,6 +89,7 @@ def _make_master_row(
     max_consecutive_losses: int,
     regime_cfg: dict,
     run_cfg: Optional[dict] = None,
+    signal_scope_id: str = "",
 ) -> dict:
     """
     Populated master row.
@@ -103,11 +98,11 @@ def _make_master_row(
         regime_id=regime_id,
         signal_layer=signal_layer,
         era_int=era_int,
-        side_flag=side_flag,
         sl_val=sl_val,
         tp_val=tp_val,
         regime_cfg=regime_cfg,
         run_cfg=run_cfg,
+        signal_scope_id=signal_scope_id,
     )
 
     row.update(
@@ -121,6 +116,8 @@ def _make_master_row(
     )
     return row
 
+logger = logging.getLogger(__name__)
+
 
 def build_trade_ml_rows_from_backtest(
     df_main: pl.DataFrame,
@@ -129,7 +126,7 @@ def build_trade_ml_rows_from_backtest(
     main_low_arr: np.ndarray,
     main_time_ns_arr: np.ndarray,
     sig_idxs: np.ndarray,
-    side_flag: int,
+    side_arr: Optional[np.ndarray],
     sl_val: float,
     tp_val: float,
     use_limit_entry: bool,
@@ -143,53 +140,21 @@ def build_trade_ml_rows_from_backtest(
     signal_layer: int = 0,
     signal_scope_id: str = "",
 ) -> pl.DataFrame:
-    """
-    Build trade-level training rows from a completed backtest.
-
-    Legacy amp-index logic has been removed on purpose.
-    The range columns remain in the schema, but they are left as NaN so the
-    grid branch stays compatible without carrying hidden feature dependencies.
-    """
     sig_idxs = np.asarray(sig_idxs, dtype=np.int64)
-    n = sig_idxs.shape[0]
+    if side_arr is None:
+        side_arr = np.full(sig_idxs.shape[0], 1, dtype=np.int8)
+    else:
+        side_arr = np.asarray(side_arr, dtype=np.int8)
 
-    signal_scope_id = str(signal_scope or "")
-    signal_layer = int(signal_layer)
-
+    n = min(sig_idxs.shape[0], side_arr.shape[0])
     if n == 0:
-        return pl.DataFrame(
-            {
-                "regime_id": pl.Series([], dtype=pl.Int32),
-                "signal_layer": pl.Series([], dtype=pl.Int8),
-                "signal_scope_id": pl.Series([], dtype=pl.String),
-                "era_int": pl.Series([], dtype=pl.Int64),
-                "side": pl.Series([], dtype=pl.Int8),
-                "SL": pl.Series([], dtype=pl.Float32),
-                "TP": pl.Series([], dtype=pl.Float32),
-                "SL_hit": pl.Series([], dtype=pl.Float32),
-                "TP_hit": pl.Series([], dtype=pl.Float32),
-                "use_limit_entry": pl.Series([], dtype=pl.Boolean),
-                "limit_order_expiry_bars": pl.Series([], dtype=pl.Int32),
-                "trade_window_interval": pl.Series([], dtype=pl.Int32),
-                "signal_idx": pl.Series([], dtype=pl.Int64),
-                "signal_time_ns": pl.Series([], dtype=pl.Int64),
-                "signal_price": pl.Series([], dtype=pl.Float32),
-                "order_idx": pl.Series([], dtype=pl.Int64),
-                "order_time_ns": pl.Series([], dtype=pl.Int64),
-                "order_price": pl.Series([], dtype=pl.Float32),
-                "order_mode": pl.Series([], dtype=pl.Int8),
-                "fill_status": pl.Series([], dtype=pl.Int8),
-                "entry_idx": pl.Series([], dtype=pl.Int64),
-                "entry_time_ns": pl.Series([], dtype=pl.Int64),
-                "entry_price": pl.Series([], dtype=pl.Float32),
-                "exit_idx": pl.Series([], dtype=pl.Int64),
-                "exit_time_ns": pl.Series([], dtype=pl.Int64),
-                "exit_price": pl.Series([], dtype=pl.Float32),
-                "exit_reason": pl.Series([], dtype=pl.Int8),
-                "fill_delay_bars": pl.Series([], dtype=pl.Int32),
-                "pnl_pct": pl.Series([], dtype=pl.Float32),
-            }
-        )
+        return pl.DataFrame(schema=get_schema("trade_ml"))
+
+    sig_idxs = sig_idxs[:n]
+    side_arr = side_arr[:n]
+
+    signal_scope_id = str(signal_scope_id or "")
+    signal_layer = int(signal_layer)
 
     signal_time_ns = np.asarray(main_time_ns_arr[sig_idxs], dtype=np.int64)
     signal_price = np.asarray(main_close_arr[sig_idxs], dtype=np.float64)
@@ -197,10 +162,20 @@ def build_trade_ml_rows_from_backtest(
     order_mode = np.full(n, 1 if use_limit_entry else 0, dtype=np.int8)
 
     if use_limit_entry:
-        if int(side_flag) == 1:
-            order_price = 0.5 * (signal_price + np.asarray(main_low_arr[sig_idxs], dtype=np.float64))
-        else:
-            order_price = 0.5 * (signal_price + np.asarray(main_high_arr[sig_idxs], dtype=np.float64))
+        order_price = signal_price.copy()
+        buy_mask = side_arr == 1
+        sell_mask = side_arr == -1
+
+        if np.any(buy_mask):
+            order_price[buy_mask] = 0.5 * (
+                signal_price[buy_mask]
+                + np.asarray(main_low_arr[sig_idxs[buy_mask]], dtype=np.float64)
+            )
+        if np.any(sell_mask):
+            order_price[sell_mask] = 0.5 * (
+                signal_price[sell_mask]
+                + np.asarray(main_high_arr[sig_idxs[sell_mask]], dtype=np.float64)
+            )
     else:
         order_price = signal_price.copy()
 
@@ -219,22 +194,59 @@ def build_trade_ml_rows_from_backtest(
     sl_hit = np.full(n, np.nan, dtype=np.float64)
     tp_hit = np.full(n, np.nan, dtype=np.float64)
 
-    filled_signal_idx = np.asarray(backtest_res.get("signal_idx", []), dtype=np.int64)
+    filled_signal_idx = np.asarray(
+        backtest_res.get("signal_idx", backtest_res.get("signal_idxs", backtest_res.get("signal_index", []))),
+        dtype=np.int64,
+    )
+    filled_side = np.asarray(backtest_res.get("side", []), dtype=np.int8)
     filled_entry_idx = np.asarray(backtest_res.get("entry_idx", []), dtype=np.int64)
     filled_entry_price = np.asarray(backtest_res.get("entry_price", []), dtype=np.float64)
     filled_exit_idx = np.asarray(backtest_res.get("exit_idx", []), dtype=np.int64)
     filled_exit_price = np.asarray(backtest_res.get("exit_price", []), dtype=np.float64)
-    filled_rets = np.asarray(backtest_res.get("rets", []), dtype=np.float64)
+    filled_rets = np.asarray(backtest_res.get("rets", backtest_res.get("pnl_pct", [])), dtype=np.float64)
     filled_exit_reason = np.asarray(backtest_res.get("exit_reason", []), dtype=np.int8)
     filled_sl_hit = np.asarray(backtest_res.get("SL_hit", []), dtype=np.float64)
     filled_tp_hit = np.asarray(backtest_res.get("TP_hit", []), dtype=np.float64)
 
-    filled_map = {int(s): i for i, s in enumerate(filled_signal_idx)}
+    if filled_signal_idx.size == 0 or filled_side.size == 0:
+        logger.warning(
+            "trade_ml builder: empty filled stream | regime=%s era=%s layer=%s scope=%s sigs=%d keys=%s",
+            regime_id,
+            era_int,
+            signal_layer,
+            signal_scope_id,
+            int(n),
+            list(backtest_res.keys()),
+        )
+        return pl.DataFrame(schema=get_schema("trade_ml"))
+
+    m = min(
+        filled_signal_idx.size,
+        filled_side.size,
+        filled_entry_idx.size,
+        filled_entry_price.size,
+        filled_exit_idx.size,
+        filled_exit_price.size,
+        filled_rets.size,
+        filled_exit_reason.size,
+    )
+    if m == 0:
+        return pl.DataFrame(schema=get_schema("trade_ml"))
+
+    # Key fix: match on (signal_idx, side), not signal_idx alone.
+    filled_map = {
+        (int(filled_signal_idx[i]), int(filled_side[i])): i
+        for i in range(m)
+    }
+
+    keep_rows = []
+    unmatched = 0
 
     for i in range(n):
-        sidx = int(sig_idxs[i])
-        j = filled_map.get(sidx, -1)
+        key = (int(sig_idxs[i]), int(side_arr[i]))
+        j = filled_map.get(key, -1)
         if j < 0:
+            unmatched += 1
             continue
 
         fill_status[i] = 1
@@ -252,45 +264,59 @@ def build_trade_ml_rows_from_backtest(
 
         if 0 <= entry_idx[i] < main_time_ns_arr.shape[0]:
             entry_time_ns[i] = int(main_time_ns_arr[entry_idx[i]])
-
         if 0 <= exit_idx[i] < main_time_ns_arr.shape[0]:
             exit_time_ns[i] = int(main_time_ns_arr[exit_idx[i]])
 
         if entry_idx[i] >= 0:
-            fill_delay_bars[i] = int(entry_idx[i] - sidx)
+            fill_delay_bars[i] = int(entry_idx[i] - sig_idxs[i])
+
+        keep_rows.append(i)
+
+    if not keep_rows:
+        logger.warning(
+            "trade_ml builder: all rows dropped after matching | regime=%s era=%s layer=%s scope=%s sigs=%d filled=%d unmatched=%d",
+            regime_id,
+            era_int,
+            signal_layer,
+            signal_scope_id,
+            int(n),
+            int(m),
+            int(unmatched),
+        )
+        return pl.DataFrame(schema=get_schema("trade_ml"))
+
+    keep_rows = np.asarray(keep_rows, dtype=np.int64)
 
     df = pl.DataFrame(
         {
-            "regime_id": np.full(n, int(regime_id), dtype=np.int32),
-            "signal_layer": np.full(n, int(signal_layer), dtype=np.int8),
-            "signal_scope_id": np.full(n, signal_scope_id, dtype=object),
-            "era_int": np.full(n, int(era_int), dtype=np.int64),
-            "side": np.full(n, int(side_flag), dtype=np.int8),
-            "SL": np.full(n, float(sl_val), dtype=np.float32),
-            "TP": np.full(n, float(tp_val), dtype=np.float32),
-            "SL_hit": sl_hit.astype(np.float32),
-            "TP_hit": tp_hit.astype(np.float32),
-            "use_limit_entry": np.full(n, bool(use_limit_entry), dtype=bool),
-            "limit_order_expiry_bars": np.full(n, int(limit_order_expiry_bars), dtype=np.int32),
-            "trade_window_interval": np.full(n, int(trade_window_interval), dtype=np.int32),
-            "signal_idx": sig_idxs.astype(np.int64),
-            "signal_time_ns": signal_time_ns.astype(np.int64),
-            "signal_price": signal_price.astype(np.float32),
-            "order_idx": sig_idxs.astype(np.int64),
-            "order_time_ns": signal_time_ns.astype(np.int64),
-            "order_price": order_price.astype(np.float32),
-            "order_mode": order_mode.astype(np.int8),
-            "fill_status": fill_status.astype(np.int8),
-            "entry_idx": entry_idx.astype(np.int64),
-            "entry_time_ns": entry_time_ns.astype(np.int64),
-            "entry_price": entry_price.astype(np.float32),
-            "exit_idx": exit_idx.astype(np.int64),
-            "exit_time_ns": exit_time_ns.astype(np.int64),
-            "exit_price": exit_price.astype(np.float32),
-            "exit_reason": exit_reason.astype(np.int8),
-            "fill_delay_bars": fill_delay_bars.astype(np.int32),
-            "pnl_pct": pnl_pct.astype(np.float32),
+            "regime_id": np.full(keep_rows.size, int(regime_id), dtype=np.int32),
+            "signal_layer": np.full(keep_rows.size, int(signal_layer), dtype=np.int8),
+            "signal_scope_id": np.full(keep_rows.size, signal_scope_id, dtype=object),
+            "era_int": np.full(keep_rows.size, int(era_int), dtype=np.int64),
+            "side": side_arr[keep_rows].astype(np.int8),
+            "SL": np.full(keep_rows.size, float(sl_val), dtype=np.float32),
+            "TP": np.full(keep_rows.size, float(tp_val), dtype=np.float32),
+            "SL_hit": sl_hit[keep_rows].astype(np.float32),
+            "TP_hit": tp_hit[keep_rows].astype(np.float32),
+            "signal_idx": sig_idxs[keep_rows].astype(np.int64),
+            "signal_time_ns": signal_time_ns[keep_rows].astype(np.int64),
+            "signal_price": signal_price[keep_rows].astype(np.float32),
+            "order_idx": sig_idxs[keep_rows].astype(np.int64),
+            "order_time_ns": signal_time_ns[keep_rows].astype(np.int64),
+            "order_price": order_price[keep_rows].astype(np.float32),
+            "order_mode": order_mode[keep_rows].astype(np.int8),
+            "fill_status": fill_status[keep_rows].astype(np.int8),
+            "entry_idx": entry_idx[keep_rows].astype(np.int64),
+            "entry_time_ns": entry_time_ns[keep_rows].astype(np.int64),
+            "entry_price": entry_price[keep_rows].astype(np.float32),
+            "exit_idx": exit_idx[keep_rows].astype(np.int64),
+            "exit_time_ns": exit_time_ns[keep_rows].astype(np.int64),
+            "exit_price": exit_price[keep_rows].astype(np.float32),
+            "exit_reason": exit_reason[keep_rows].astype(np.int8),
+            "fill_delay_bars": fill_delay_bars[keep_rows].astype(np.int32),
+            "pnl_pct": pnl_pct[keep_rows].astype(np.float32),
         }
     )
 
+    df = df.filter(pl.col("fill_status") == 1)
     return enforce_schema(df, "trade_ml", strict=False)
