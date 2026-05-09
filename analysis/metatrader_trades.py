@@ -200,43 +200,41 @@ def _excursion_stats_from_path(
     tp_ratio: float,
     sl_ratio: float,
 ) -> Dict[str, Any]:
-    # Default return for no revisit
     nan_out = {"mae_r": np.nan, "mfe_r": np.nan, "had_reset": False}
     
-    # We need at least the entry bar + 1 future bar to check for a revisit
-    if highs.size < 2:
+    if not np.isfinite(entry_price) or entry_price <= 0.0 or highs.size < 2:
         return nan_out
 
     # Exclude the very last bar (the exit event)
-    lookback_limit = len(highs) - 1
-    h_slice = highs[:lookback_limit]
-    l_slice = lows[:lookback_limit]
+    lookback_limit = len(highs) - 1 
 
-    # Find all bars AFTER index 0 that touch the entry price
-    # (i > 0 ensures we are looking at future swing-backs, not the initial entry)
-    revisit_indices = np.where((l_slice[1:] <= entry_price) & (h_slice[1:] >= entry_price))[0]
-    
-    if revisit_indices.size == 0:
+    eligible_mae_raw = []
+    eligible_mfe_raw = []
+
+    # Granular Bar-by-Bar Check (Aligned to your preferred logic)
+    for i in range(lookback_limit):
+        # Check if price ever returns to entry level FROM this bar onwards
+        if side == 1: # BUY
+            # Does price touch entry at index i or any time after?
+            has_reset = any(lows[i:lookback_limit] <= entry_price)
+            curr_mae_raw = entry_price - lows[i]
+            curr_mfe_raw = highs[i] - entry_price
+        else: # SELL
+            has_reset = any(highs[i:lookback_limit] >= entry_price)
+            curr_mae_raw = highs[i] - entry_price
+            curr_mfe_raw = entry_price - lows[i]
+
+        if has_reset:
+            eligible_mae_raw.append(max(0.0, curr_mae_raw))
+            eligible_mfe_raw.append(max(0.0, curr_mfe_raw))
+
+    if not eligible_mae_raw:
         return nan_out
 
-    # The index relative to the original slice is +1
-    last_revisit_idx = revisit_indices[-1] + 1
-    
-    # Window of noise: From initial entry (0) to the last touch (last_revisit_idx)
-    h_window = h_slice[:last_revisit_idx + 1]
-    l_window = l_slice[:last_revisit_idx + 1]
-
-    if side == 1: # BUY
-        raw_mfe = np.max(h_window) - entry_price
-        raw_mae = entry_price - np.min(l_window)
-    else: # SELL
-        raw_mfe = entry_price - np.min(l_window)
-        raw_mae = np.max(h_window) - entry_price
-
-    # 1.0 = 100% of the distance required to hit TPSL
+    # Normalize by the TP/SL distance (1.0 = 100%)
     return {
-        "mfe_r": (max(0.0, raw_mfe) / entry_price) / tp_ratio if tp_ratio > 0 else np.nan,
-        "mae_r": (max(0.0, raw_mae) / entry_price) / sl_ratio if sl_ratio > 0 else np.nan,
+        "mae_r": float((max(eligible_mae_raw) / entry_price) / sl_ratio) if sl_ratio > 0 else np.nan,
+        "mfe_r": float((max(eligible_mfe_raw) / entry_price) / tp_ratio) if tp_ratio > 0 else np.nan,
         "had_reset": True
     }
 
@@ -701,7 +699,6 @@ def run() -> pd.DataFrame:
         all_trades_ever = closed_positions_from_deals(deals_df)
         save_trade_history(deals_df, all_trades_ever)
 
-        # Filter for analysis
         analysis_trades = all_trades_ever[all_trades_ever["symbol"].isin(SYMBOL_RULES.keys())].copy()
         analysis_trades = analysis_trades.sort_values(["entry_time", "position_id"]).reset_index(drop=True)
         trades_df = filter_last_n_per_symbol(analysis_trades)
@@ -728,7 +725,7 @@ def run() -> pd.DataFrame:
                                                tr["gross_profit"], tr["commission"], tr["swap"], tr["fee"],
                                                rule["tp_pct"], rule["sl_pct"], rule["spread_pct"], symbol_bars)
 
-            # EXCURSION: Normalized by the Rule's TPSL Distance
+            # EXCURSION Logic
             # Actual Path
             act_path = symbol_bars[(symbol_bars["time"] >= entry_floor) & (symbol_bars["time"] <= exit_time)].copy()
             act_exc = _excursion_stats_from_path(side, entry_px, act_path["high"].values, act_path["low"].values, tp_ratio, sl_ratio)
@@ -742,9 +739,12 @@ def run() -> pd.DataFrame:
             results.append({
                 "position_id": tr["position_id"], "symbol": symbol, "side": side,
                 "entry_time": entry_time, "exit_time": exit_time,
-                "actual_net_pnl": tr["net_actual_pnl"], "actual_avgvol_pnl": tr["net_actual_pnl"] * (avg_vol/vol),
-                "sim_net_pnl": sim["sim_net_pnl"], "sim_avgvol_net_pnl": sim["sim_avgvol_net_pnl"],
+                "actual_net_pnl": tr["net_actual_pnl"], 
+                "actual_avgvol_pnl": tr["net_actual_pnl"] * (avg_vol/vol),
+                "sim_net_pnl": sim["sim_net_pnl"], 
+                "sim_avgvol_net_pnl": sim["sim_avgvol_net_pnl"],
                 "actual_trade_won": actual_won, "sim_trade_won": (sim["sim_close_type"] == "tp"),
+                # Logic: Fill only MFE for winners, MAE for losers in Actual columns
                 "actual_entry_revisit_mae_r": round_price(act_exc["mae_r"]) if not actual_won else np.nan,
                 "actual_entry_revisit_mfe_r": round_price(act_exc["mfe_r"]) if actual_won else np.nan,
                 "sim_entry_revisit_mae_r": round_price(sim_exc["mae_r"]),
@@ -752,35 +752,40 @@ def run() -> pd.DataFrame:
                 "sim_close_type": sim["sim_close_type"], "volume": vol, "avg_volume_used": avg_vol
             })
 
-            # Debug Position ID
+            # Debug specific ID
             if tr["position_id"] == 549566104:
-                print(f"\n--- DEBUG 549566104 ---")
-                print(f"Path Length (excl exit): {len(sim_path)-1} bars")
-                for i, row in sim_path.iterrows():
-                    mark = " [ENTRY TOUCH]" if (row['low'] <= entry_px <= row['high']) else ""
-                    print(f"  {row['time']} | H:{row['high']} L:{row['low']}{mark}")
-                print(f"Result -> MAE R: {sim_exc['mae_r']} | MFE R: {sim_exc['mfe_r']}")
+                print(f"\nDEBUG 549566104 | Revisit Found: {sim_exc['had_reset']}")
+                print(f"Sim MAE R: {sim_exc['mae_r']} | MFE R: {sim_exc['mfe_r']}")
 
         res_df = pd.DataFrame(results)
         if res_df.empty: return res_df
 
-        # Save Detail Files
+        # Save Detailed Reports
         append_csv_dedup(res_df.drop(columns=[c for c in res_df.columns if "revisit" in c]), PNL_DETAIL_FILE, ["position_id"])
+        
         exc_cols_final = ["position_id", "symbol", "side", "entry_time", "exit_time", "actual_trade_won", "sim_trade_won", 
                           "actual_entry_revisit_mae_r", "actual_entry_revisit_mfe_r", 
                           "sim_entry_revisit_mae_r", "sim_entry_revisit_mfe_r", "sim_close_type"]
         append_csv_dedup(res_df[exc_cols_final], EXCURSION_DETAIL_FILE, ["position_id"])
 
-        # Summaries
-        ov = {"trades": len(res_df), "act_pnl": res_df["actual_net_pnl"].sum(), "act_avgvol_pnl": res_df["actual_avgvol_pnl"].sum(),
-              "sim_pnl": res_df["sim_net_pnl"].sum(), "sim_avgvol_pnl": res_df["sim_avgvol_net_pnl"].sum()}
+        # Summary Generation (Actual/Sim vs Actual/Avg Volume)
+        ov = {"trades": len(res_df), 
+              "actual_pnl": res_df["actual_net_pnl"].sum(), 
+              "actual_avgvol_pnl": res_df["actual_avgvol_pnl"].sum(),
+              "sim_pnl": res_df["sim_net_pnl"].sum(), 
+              "sim_avgvol_pnl": res_df["sim_avgvol_net_pnl"].sum()}
         pd.DataFrame([ov]).to_csv(OVERVIEW_FILE, index=False)
 
         s_rows = []
         for sym, g in res_df.groupby("symbol"):
-            s_rows.append({"symbol": sym, "trades": len(g), "avg_vol": g["avg_volume_used"].mean(), "actual_avg_vol": g["volume"].mean(),
-                           "actual_pnl": g["actual_net_pnl"].sum(), "avgvol_act_pnl": g["actual_avgvol_pnl"].sum(),
-                           "sim_pnl": g["sim_net_pnl"].sum(), "avgvol_sim_pnl": g["sim_avgvol_net_pnl"].sum()})
+            s_rows.append({
+                "symbol": sym, "trades": len(g), 
+                "avg_vol": g["avg_volume_used"].mean(), "actual_avg_vol": g["volume"].mean(),
+                "actual_pnl": g["actual_net_pnl"].sum(), 
+                "avgvol_actual_pnl": g["actual_avgvol_pnl"].sum(),
+                "sim_pnl": g["sim_net_pnl"].sum(), 
+                "avgvol_sim_pnl": g["sim_avgvol_net_pnl"].sum()
+            })
         pd.DataFrame(s_rows).to_csv(SUMMARY_FILE, index=False)
 
         return res_df
