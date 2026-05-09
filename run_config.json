@@ -4,30 +4,26 @@
   "sl_tp_in_pct": true,
   "min_rr": 0,
   "sl_tp_interval_months": 3,
-
   "sl_range": {
-    "min": 1.8,
-    "max": 2.0,
+    "min": 2.1,
+    "max": 2.1,
     "step": 0.2
   },
   "tp_range": {
-    "min": 0.6,
-    "max": 0.6,
+    "min": 1.0,
+    "max": 1.0,
     "step": 0.2
   },
-  
   "exit_windows_h": [4, 24],
   "trade_flip_on_entry": [false],
   "trade_overlap": [false, true],
-  "trade_window_interval": [20],
+  "trade_window_interval": [2, 8, 20],
   "limit_order_expiry_bars": [12],
   "use_limit_entry": true,
-
   "use_trailing_sl": [false],
   "trailing_sl_pct": [0.2],
   "trailing_sl_interval": [3],
   "trailing_sl_stop_at_pos": [false],
-
   "signal_structure": {
     "ma": {
       "enabled": false,
@@ -49,8 +45,8 @@
       "by_timeframe": {
         "15m": {
           "k": [12],
-          "d": [8],
-          "s": [4],
+          "d": [2, 3, 4, 6, 8],
+          "s": [2, 3, 4, 6, 8],
           "thresholds": [[30, 70]],
           "threshold_tolerance": 10
         }
@@ -60,6 +56,9 @@
       "enabled": true,
       "by_timeframe": {
         "5m": {
+          "entry_lookback_units": [1]
+        },
+        "15m": {
           "entry_lookback_units": [1, 2]
         }
       }
@@ -75,11 +74,10 @@
       }
     }
   },
-
   "BTC_SETTINGS": {
     "spread": 0.0002
   },
-  "max_dd_threshold": 0.10,
+  "max_dd_threshold": 0.1,
   "MAX_EMPTY_ERA_STREAK": 80,
   "EQUITY_PARTITION_BY": "era_int",
   "risk_pct": 0.005,

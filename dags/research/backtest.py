@@ -1,3 +1,5 @@
+# backtest.py
+
 from __future__ import annotations
 
 import os
@@ -952,7 +954,8 @@ def backtest_signals_sl_tp_rets(
     spread: float = 0.0,
     spread_is_percent: bool = True,
     conservative_sl_first: bool = True,
-    side_flag: int = 1,
+    side_flag: Optional[int] = None,          # Change to Optional
+    side_arr: Optional[np.ndarray] = None,   # Add this parameter
     use_limit_entry: bool = True,
     trade_overlap: bool = True,
     trade_flip_on_entry: bool = False,
@@ -976,7 +979,12 @@ def backtest_signals_sl_tp_rets(
             "max_consecutive_losses": 0,
         }
 
-    side_arr = np.full(sig_idxs.shape[0], side_flag, dtype=np.int8)
+    # FIX: Use the provided side_arr if available, otherwise fallback to side_flag
+    if side_arr is None:
+        effective_side = 1 if side_flag is None else side_flag
+        side_arr = np.full(sig_idxs.shape[0], effective_side, dtype=np.int8)
+    else:
+        side_arr = np.asarray(side_arr, dtype=np.int8)
 
     return backtest_from_arrays(
         close=main_close_arr,

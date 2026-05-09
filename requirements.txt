@@ -11,4 +11,5 @@ adbc-driver-manager
 psycopg2-binary
 python-dotenv
 lightgbm
-MetaTrader5
+matplotlib
+seaborn

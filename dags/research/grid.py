@@ -659,6 +659,17 @@ def process_era_combos(
                         master_rows_written += 1
                     continue
 
+                # --- FIX: Determine side flag from signals ---
+                # If signals are all one side, use that side. 
+                # If mixed, we usually use 0 or handle accordingly based on your kernel's spec.
+                unique_sides = np.unique(all_sig_sides_all)
+                if unique_sides.size == 1:
+                    effective_side_flag = int(unique_sides[0])
+                else:
+                    # If mixed (like in regime 27), the kernel usually needs a specific flag
+                    # to process both, or 1 to indicate "use the side in the array"
+                    effective_side_flag = 1 
+
                 res = backtest_signals_sl_tp_rets(
                     main_close_arr=main_close_arr,
                     main_high_arr=main_high_arr,
@@ -675,7 +686,7 @@ def process_era_combos(
                     base_minutes=int(run_cfg.get("BASE_MINUTES", 5)),
                     spread=float(run_cfg.get("BTC_SETTINGS", {}).get("spread", 0.0)),
                     conservative_sl_first=bool(run_cfg.get("conservative_sl_first", True)),
-                    side_flag=1,
+                    side_flag=effective_side_flag,
                     use_limit_entry=use_limit_entry_eff,
                     trade_overlap=trade_overlap,
                     trade_flip_on_entry=trade_flip_on_entry,
@@ -875,12 +886,12 @@ def process_era_combos(
                     equity_arr=equity_arr,
                     closed_entry_idxs=closed_entry_idxs,
                     closed_exit_idxs=closed_exit_idxs,
+                    closed_side_arr=trade_sides,
                     sl_val=float(sl_val),
                     tp_val=float(tp_val),
                     regime_id=regime_id,
                     signal_layer=signal_layer,
                     era_int=era["era_int"],
-                    side_flag=1,
                     stager=equity_stager,
                     max_dd=current_max_dd,
                     signal_scope=signal_scope_id,
@@ -917,8 +928,8 @@ def process_era_combos(
         raise
     finally:
         try:
-            equity_stager.flush_all()
-            trade_ml_stager.flush_all()
+            #equity_stager.flush_all()
+            #trade_ml_stager.flush_all()
             _flush_master_rows_buffer(results_dir, batch_id)
         except Exception as e:
             logger.debug("Flush local stage failed: %s", e)

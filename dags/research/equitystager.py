@@ -198,11 +198,10 @@ def compute_equity_preview(
     equity_gate_fn: Callable[[np.ndarray, float, float], Tuple[np.ndarray, float, bool]],
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]:
     """
-    Convert closed-trade exits into equity curve inputs.
-
-    The kernel-specific math is injected so this file stays isolated from grid.py.
+    Convert closed-trade exits into equity curve inputs with Account Risk Scaling.
     """
-    pnl_pct_arr = pnl_fn(
+    # 1. Calculate raw market returns (price move %)
+    pnl_market_arr = pnl_fn(
         entry_prices=np.asarray(closed_entry_prices_arr, dtype=np.float64),
         exit_prices=np.asarray(closed_exit_prices_arr, dtype=np.float64),
         spread_arr=np.asarray(main_spread_arr[closed_entry_idxs], dtype=np.float64)
@@ -222,7 +221,7 @@ def compute_equity_preview(
         trading_fee_rate=float(run_cfg.get("trading_fees", 0.0004) or 0.0004),
     )
 
-    if pnl_pct_arr is None or pnl_pct_arr.size == 0:
+    if pnl_market_arr is None or pnl_market_arr.size == 0:
         return (
             np.empty(0, dtype=np.float64),
             np.empty(0, dtype=np.int64),
@@ -231,13 +230,35 @@ def compute_equity_preview(
             False,
         )
 
-    pnl_pct_arr = np.nan_to_num(pnl_pct_arr, nan=0.0, posinf=1e37, neginf=-1e37)
+    # --- POSITION SIZING LOGIC ---
+    # risk_pct (e.g. 0.005 for 0.5% account loss)
+    target_risk = float(run_cfg.get("risk_pct", 0.005))
+    
+    # Calculate SL distance in decimal (e.g. 2.1 becomes 0.021)
+    if bool(run_cfg.get("sl_tp_in_pct", True)):
+        sl_dist_decimal = abs(float(sl_val)) / 100.0
+    else:
+        # If absolute price distance is used, we estimate distance via first entry price
+        # (Usually sl_tp_in_pct is true for grid searches)
+        first_px = float(closed_entry_prices_arr[0]) if closed_entry_prices_arr.size else 1.0
+        sl_dist_decimal = abs(float(sl_val)) / first_px
+
+    # Leverage = Account Risk / Market Risk
+    leverage = target_risk / sl_dist_decimal if sl_dist_decimal > 0 else 1.0
+    
+    # Scale PnL: if price moved -2.1% and leverage is 0.238, account loses -0.5%
+    pnl_account_arr = pnl_market_arr * leverage
+    # -----------------------------
+
+    pnl_account_arr = np.nan_to_num(pnl_account_arr, nan=0.0, posinf=1e37, neginf=-1e37)
     max_dd_threshold = float(run_cfg.get("max_dd_threshold", 0.5))
-    equity_arr, max_dd, breached = equity_gate_fn(pnl_pct_arr, 100.0, max_dd_threshold)
+    
+    # Check DD gate using the scaled account returns
+    equity_arr, max_dd, breached = equity_gate_fn(pnl_account_arr, 100.0, max_dd_threshold)
     equity_arr = np.nan_to_num(equity_arr, nan=0.0, posinf=1e37, neginf=-1e37)
 
     exit_times_ns = np.asarray(main_time_ns_arr[closed_exit_idxs], dtype=np.int64)
-    return pnl_pct_arr, exit_times_ns, equity_arr, float(max_dd), bool(breached)
+    return pnl_account_arr, exit_times_ns, equity_arr, float(max_dd), bool(breached)
 
 
 def stage_equity_from_preview(
@@ -255,6 +276,7 @@ def stage_equity_from_preview(
     stager: EquityStager,
     max_dd: float,
     signal_scope: str = "",
+    side_flag: int | None = None,
 ) -> Tuple[float, int, float]:
     """
     Stage equity rows only after the DD gate already passed.

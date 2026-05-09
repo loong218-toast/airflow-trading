@@ -1,43 +1,44 @@
+# post_grid/feature_perf.py
 from __future__ import annotations
 
+import os
+import sys
 from pathlib import Path
-from typing import Optional
-
 import polars as pl
 
-from feature_perf_io import compare_root, load_master_df, load_session_run_config, write_csv
-from feature_perf_metrics import (
+# 1. FIX: Use absolute imports relative to the 'dags' folder
+from post_grid.feature_perf_io import compare_root, load_master_df, load_session_run_config, write_csv
+from post_grid.feature_perf_metrics import (
     aggregate_master_combos,
     build_baseline_vs_signal_comparisons,
     get_risk_pct,
     prepare_master,
     summarize_comparisons,
 )
-
-
-DATA_LAKE_ROOT = Path(r"C:\Users\Owner\airflow-trading\data_lake")
-SESSION_NAME = "Opt_Session_20260427_110253_01"
-
-RUN_CONFIG_FILENAME = "run_config.json"
-MASTER_FILENAME = "master_metrics.parquet"
-
-TRADE_OVERLAP_FILTER: Optional[bool] = False
-TRADE_FLIP_ON_ENTRY_FILTER: Optional[bool] = None
-
-MIN_MASTER_BALANCE = 100.0
-MIN_TOTAL_POS = 1
-
-TOP_N_ROWS_TO_PRINT = 40
+from post_grid.post_grid_config import (
+    DATA_LAKE_ROOT,
+    MASTER_FILENAME,
+    MIN_MASTER_BALANCE,
+    MIN_TOTAL_POS,
+    RUN_CONFIG_FILENAME,
+    SESSION_NAME,
+    TRADE_FLIP_ON_ENTRY_FILTER,
+    TRADE_OVERLAP_FILTER,
+)
 
 pl.Config.set_tbl_cols(40)
 pl.Config.set_tbl_rows(80)
 pl.Config.set_tbl_width_chars(500)
 pl.Config.set_fmt_str_lengths(80)
 
-
 def main() -> None:
+    # 2. FIX: Move Variable.get INSIDE main. 
+    # This prevents Airflow from hitting the DB every 30 seconds during DAG parsing.
+    from airflow.sdk import Variable
+    current_session = Variable.get("SESSION_NAME", default=os.getenv("SESSION_NAME", SESSION_NAME))
+
     run_cfg, run_cfg_path, session_dir = load_session_run_config(
-        session_name=SESSION_NAME,
+        session_name=current_session, 
         data_lake_root=DATA_LAKE_ROOT,
         run_config_filename=RUN_CONFIG_FILENAME,
     )

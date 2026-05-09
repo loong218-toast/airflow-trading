@@ -225,7 +225,6 @@ def aggregate_master_combos(
         .group_by(group_cols + ["era_int"])
         .agg(
             pl.col("regime_id").first().alias("regime_id"),
-
             pl.col("balance").mean().alias("era_balance"),
             pl.col("max_drawdown").mean().alias("era_max_drawdown"),
             pl.col("max_consecutive_losses").mean().alias("era_max_consecutive_losses"),
@@ -245,9 +244,7 @@ def aggregate_master_combos(
         per_era
         .group_by(group_cols)
         .agg(
-            pl.len().alias("master_rows"),
-            pl.col("regime_id").n_unique().alias("regime_count"),
-            pl.col("regime_id").first().alias("regime_id_first"),
+            pl.col("regime_id").first().alias("regime_id"),
             pl.col("era_int").n_unique().alias("era_count"),
             pl.col("era_hit").mean().alias("era_consistency_score"),
             pl.col("era_hit").sum().alias("era_hit_count"),
@@ -260,8 +257,6 @@ def aggregate_master_combos(
             pl.col("era_max_drawdown").max().alias("worst_max_drawdown"),
             pl.col("era_max_consecutive_losses").mean().alias("mean_max_consecutive_losses"),
             pl.col("era_max_consecutive_losses").max().alias("worst_max_consecutive_losses"),
-            pl.col("era_session_return_pct").mean().alias("mean_session_return_pct"),
-            pl.col("era_session_return_pct").median().alias("median_session_return_pct"),
             pl.col("era_mean_return_pct_per_trade").mean().alias("mean_return_pct_per_trade"),
             pl.col("era_mean_return_pct_per_trade").median().alias("median_return_pct_per_trade"),
             pl.col("era_mean_expectancy_r_per_trade").mean().alias("mean_expectancy_r_per_trade"),
@@ -286,7 +281,11 @@ def aggregate_master_combos(
         .drop("_total_pos_sum_f")
     )
 
-    return _round_float_cols(rolled, 5)
+    first_cols = ["regime_id", "SL", "TP", "signal_scope_id", "signal_layer"]
+    first_cols = [c for c in first_cols if c in rolled.columns]
+    remaining_cols = [c for c in rolled.columns if c not in first_cols]
+
+    return _round_float_cols(rolled.select(first_cols + remaining_cols), 5)
 
 
 def build_baseline_vs_signal_comparisons(df_combo_agg: pl.DataFrame) -> pl.DataFrame:
@@ -310,12 +309,10 @@ def build_baseline_vs_signal_comparisons(df_combo_agg: pl.DataFrame) -> pl.DataF
     metric_cols = [
         "signal_scope_id",
         "signal_layer",
-        "regime_count",
-        "regime_id_first",
+        "regime_id",
         "era_count",
         "era_consistency_score",
         "era_hit_count",
-        "master_rows",
         "total_pos_sum",
         "win_pos_sum",
         "mean_balance",
@@ -326,12 +323,10 @@ def build_baseline_vs_signal_comparisons(df_combo_agg: pl.DataFrame) -> pl.DataF
         "worst_max_drawdown",
         "mean_max_consecutive_losses",
         "worst_max_consecutive_losses",
-        "mean_session_return_pct",
-        "median_session_return_pct",
-        "mean_return_pct_per_trade",
         "median_return_pct_per_trade",
-        "mean_expectancy_r_per_trade",
+        "mean_return_pct_per_trade",
         "median_expectancy_r_per_trade",
+        "mean_expectancy_r_per_trade",
         "net_expectancy_pct",
         "net_expectancy_r",
         "expected_balance_from_mean",
@@ -370,7 +365,7 @@ def build_baseline_vs_signal_comparisons(df_combo_agg: pl.DataFrame) -> pl.DataF
             (pl.col("net_expectancy_pct") - pl.col("net_expectancy_pct_baseline")).alias("net_expectancy_pct_diff"),
             (pl.col("era_consistency_score") - pl.col("era_consistency_score_baseline")).alias("era_consistency_diff"),
             (pl.col("era_hit_count") - pl.col("era_hit_count_baseline")).alias("era_hit_count_diff"),
-            (pl.col("master_rows") - pl.col("master_rows_baseline")).alias("row_count_diff"),
+            (pl.col("era_count") - pl.col("era_count_baseline")).alias("era_count_diff"),
             (pl.col("win_rate") - pl.col("win_rate_baseline")).alias("win_rate_diff"),
             (pl.col("mean_max_drawdown") - pl.col("mean_max_drawdown_baseline")).alias("mean_drawdown_diff"),
             (pl.col("worst_max_drawdown") - pl.col("worst_max_drawdown_baseline")).alias("worst_drawdown_diff"),
@@ -412,7 +407,42 @@ def summarize_comparisons(df_cmp: pl.DataFrame) -> pl.DataFrame:
             pl.col("net_expectancy_pct_diff").mean().alias("avg_net_expectancy_pct_diff"),
             pl.col("era_consistency_diff").mean().alias("avg_era_consistency_diff"),
             pl.col("era_hit_count_diff").mean().alias("avg_era_hit_count_diff"),
-            pl.col("row_count_diff").mean().alias("avg_row_count_diff"),
+            pl.col("era_count_diff").mean().alias("avg_era_count_diff"),
+            pl.col("win_rate_diff").mean().alias("avg_win_rate_diff"),
+            pl.col("mean_drawdown_diff").mean().alias("avg_mean_drawdown_diff"),
+            pl.col("worst_drawdown_diff").mean().alias("avg_worst_drawdown_diff"),
+            pl.col("mean_streak_diff").mean().alias("avg_mean_streak_diff"),
+            pl.col("worst_streak_diff").mean().alias("avg_worst_streak_diff"),
+            (pl.col("mean_balance_diff") > 0).mean().alias("signal_beats_baseline_rate"),
+        )
+        .sort(["baseline_scope_id", "avg_mean_balance_diff"], descending=[False, True] if "baseline_scope_id" in key_cols else [True])
+    )
+
+    return _round_float_cols(out, 5)
+
+
+def summarize_comparisons(df_cmp: pl.DataFrame) -> pl.DataFrame:
+    if df_cmp is None or df_cmp.is_empty():
+        return pl.DataFrame()
+
+    key_cols = [c for c in ["baseline_scope_id", "signal_scope_id_signal"] if c in df_cmp.columns]
+    if not key_cols:
+        return pl.DataFrame()
+
+    out = (
+        df_cmp
+        .group_by(key_cols)
+        .agg(
+            pl.len().alias("pairs"),
+            pl.col("mean_balance_diff").mean().alias("avg_mean_balance_diff"),
+            pl.col("median_balance_diff").mean().alias("avg_median_balance_diff"),
+            pl.col("mean_expectancy_r_diff").mean().alias("avg_expectancy_r_diff"),
+            pl.col("mean_return_diff_pct").mean().alias("avg_return_diff_pct"),
+            pl.col("net_expectancy_r_diff").mean().alias("avg_net_expectancy_r_diff"),
+            pl.col("net_expectancy_pct_diff").mean().alias("avg_net_expectancy_pct_diff"),
+            pl.col("era_consistency_diff").mean().alias("avg_era_consistency_diff"),
+            pl.col("era_hit_count_diff").mean().alias("avg_era_hit_count_diff"),
+            pl.col("era_count_diff").mean().alias("avg_era_count_diff"),
             pl.col("win_rate_diff").mean().alias("avg_win_rate_diff"),
             pl.col("mean_drawdown_diff").mean().alias("avg_mean_drawdown_diff"),
             pl.col("worst_drawdown_diff").mean().alias("avg_worst_drawdown_diff"),
