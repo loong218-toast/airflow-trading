@@ -20,8 +20,8 @@ BAR_TIMEFRAME = mt5.TIMEFRAME_M5
 # tp_pct, sl_pct, spread_pct are in percent units
 # last_n_trades = -1 means keep all trades for that symbol
 SYMBOL_RULES: Dict[str, Dict[str, float]] = {
-    "UK100": {"tp_pct": 0.07, "sl_pct": 0.18, "spread_pct": 0.01, "last_n_trades": 15},
-    "AUDJPY": {"tp_pct": 0.15, "sl_pct": 0.20, "spread_pct": 0.01, "last_n_trades": 10},
+    "UK100": {"tp_pct": 0.07, "sl_pct": 0.18, "spread_pct": 0.01, "last_n_trades": -1},
+    "AUDJPY": {"tp_pct": 0.15, "sl_pct": 0.20, "spread_pct": 0.01, "last_n_trades": -1},
     "USDCHF": {"tp_pct": 0.25, "sl_pct": 0.60, "spread_pct": 0.02, "last_n_trades": -1},
 }
 
@@ -199,42 +199,44 @@ def _excursion_stats_from_path(
     lows: np.ndarray,
     tp_ratio: float,
     sl_ratio: float,
-    exclude_last_bar: bool = True,
-) -> Dict[str, float]:
-    nan_out = {"pre_reset_mae_r": np.nan, "pre_reset_tp_r": np.nan, "had_reset": False}
-
-    if not np.isfinite(entry_price) or entry_price <= 0.0 or highs.size < 2:
+) -> Dict[str, Any]:
+    # Default return for no revisit
+    nan_out = {"mae_r": np.nan, "mfe_r": np.nan, "had_reset": False}
+    
+    # We need at least the entry bar + 1 future bar to check for a revisit
+    if highs.size < 2:
         return nan_out
 
-    # Horizon: All bars except the very last one
-    lookback_limit = len(highs) - 1 
+    # Exclude the very last bar (the exit event)
+    lookback_limit = len(highs) - 1
+    h_slice = highs[:lookback_limit]
+    l_slice = lows[:lookback_limit]
 
-    eligible_mae_raw = []
-    eligible_mfe_raw = []
-
-    for i in range(lookback_limit):
-        # 1. Identify Reset (Did price return to entry at index i or any time after?)
-        if side == 1: # BUY
-            has_reset = any(highs[i:lookback_limit] >= entry_price)
-            current_mae_raw = entry_price - lows[i]
-            current_mfe_raw = highs[i] - entry_price
-        else: # SELL
-            # For SELL, reset is price dropping back DOWN to entry
-            has_reset = any(lows[i:lookback_limit] <= entry_price)
-            current_mae_raw = highs[i] - entry_price
-            current_mfe_raw = entry_price - lows[i]
-
-        if has_reset:
-            eligible_mae_raw.append(max(0.0, current_mae_raw))
-            eligible_mfe_raw.append(max(0.0, current_mfe_raw))
-
-    if not eligible_mae_raw:
+    # Find all bars AFTER index 0 that touch the entry price
+    # (i > 0 ensures we are looking at future swing-backs, not the initial entry)
+    revisit_indices = np.where((l_slice[1:] <= entry_price) & (h_slice[1:] >= entry_price))[0]
+    
+    if revisit_indices.size == 0:
         return nan_out
 
-    # Pick the best (max) from all eligible bars
+    # The index relative to the original slice is +1
+    last_revisit_idx = revisit_indices[-1] + 1
+    
+    # Window of noise: From initial entry (0) to the last touch (last_revisit_idx)
+    h_window = h_slice[:last_revisit_idx + 1]
+    l_window = l_slice[:last_revisit_idx + 1]
+
+    if side == 1: # BUY
+        raw_mfe = np.max(h_window) - entry_price
+        raw_mae = entry_price - np.min(l_window)
+    else: # SELL
+        raw_mfe = entry_price - np.min(l_window)
+        raw_mae = np.max(h_window) - entry_price
+
+    # 1.0 = 100% of the distance required to hit TPSL
     return {
-        "pre_reset_mae_r": float((max(eligible_mae_raw) / entry_price) / sl_ratio) if sl_ratio > 0 else np.nan,
-        "pre_reset_tp_r": float((max(eligible_mfe_raw) / entry_price) / tp_ratio) if tp_ratio > 0 else np.nan,
+        "mfe_r": (max(0.0, raw_mfe) / entry_price) / tp_ratio if tp_ratio > 0 else np.nan,
+        "mae_r": (max(0.0, raw_mae) / entry_price) / sl_ratio if sl_ratio > 0 else np.nan,
         "had_reset": True
     }
 
@@ -669,18 +671,14 @@ def _build_trade_table_columns() -> tuple[list[str], list[str]]:
         "spread_pct",
         "actual_trade_won",
         "sim_trade_won",
-        "actual_pre_reset_mae_r",
-        "actual_pre_reset_mfe_r",
-        "actual_post_reset_mae_r",
-        "actual_post_reset_mfe_r",
+        "actual_entry_revisit_mae_r",
+        "actual_entry_revisit_mfe_r",
         "actual_mae_win_r",
         "actual_mae_loss_r",
         "actual_mfe_win_r",
         "actual_mfe_loss_r",
-        "sim_pre_reset_mae_r",
-        "sim_pre_reset_mfe_r",
-        "sim_post_reset_mae_r",
-        "sim_post_reset_mfe_r",
+        "sim_entry_revisit_mae_r",
+        "sim_entry_revisit_mfe_r",
         "sim_mae_win_r",
         "sim_mae_loss_r",
         "sim_mfe_win_r",
@@ -700,449 +698,92 @@ def run() -> pd.DataFrame:
     init_mt5()
     try:
         deals_df = load_deals(HISTORY_DAYS)
-        if deals_df.empty:
-            print("No deals found.")
-            return pd.DataFrame()
+        all_trades_ever = closed_positions_from_deals(deals_df)
+        save_trade_history(deals_df, all_trades_ever)
 
-        trades_df = closed_positions_from_deals(deals_df)
-        if trades_df.empty:
-            print("No closed positions found.")
-            return pd.DataFrame()
-
-        trades_df = filter_last_n_per_symbol(trades_df)
-        save_trade_history(deals_df, trades_df)
+        # Filter for analysis
+        analysis_trades = all_trades_ever[all_trades_ever["symbol"].isin(SYMBOL_RULES.keys())].copy()
+        analysis_trades = analysis_trades.sort_values(["entry_time", "position_id"]).reset_index(drop=True)
+        trades_df = filter_last_n_per_symbol(analysis_trades)
+        if trades_df.empty: return pd.DataFrame()
 
         bars_cache = build_bars_cache(trades_df)
-
-        avg_volume_by_symbol = (
-            trades_df.groupby("symbol")["volume"].mean().to_dict()
-            if not trades_df.empty and "volume" in trades_df.columns
-            else {}
-        )
-
-        def _metrics_for_path(
-            path: pd.DataFrame,
-            side: int,
-            entry_price: float,
-            tp_ratio: float,
-            sl_ratio: float,
-            exclude_last_bar: bool,
-        ) -> Dict[str, float]:
-            if path.empty:
-                return {
-                    "pre_reset_mae_r": np.nan,
-                    "pre_reset_tp_r": np.nan,
-                    "post_reset_mae_r": np.nan,
-                    "post_reset_tp_r": np.nan,
-                    "first_reset_idx": np.nan,
-                    "had_reset": False,
-                }
-
-            highs = path["high"].to_numpy(dtype=np.float64, copy=False)
-            lows = path["low"].to_numpy(dtype=np.float64, copy=False)
-
-            return _excursion_stats_from_path(
-                side=side,
-                entry_price=entry_price,
-                highs=highs,
-                lows=lows,
-                tp_ratio=tp_ratio,
-                sl_ratio=sl_ratio,
-                exclude_last_bar=exclude_last_bar,
-            )
-
+        avg_volume_map = all_trades_ever.groupby("symbol")["volume"].mean().to_dict()
         results: List[Dict[str, Any]] = []
-        skipped_no_rule = 0
-        skipped_no_data = 0  # <--- Add this counter
 
         for idx, tr in trades_df.iterrows():
-            if idx % 10 == 0:
-                print(f"Processing trade {idx + 1}/{len(trades_df)}...")
-
-            symbol = str(tr["symbol"])
-            
-            # --- ADD THIS SKIP LOGIC HERE ---
+            symbol, rule = str(tr["symbol"]), rule_for(str(tr["symbol"]))
             symbol_bars = bars_cache.get(symbol)
-            if symbol_bars is None or symbol_bars.empty:
-                print(f"Skipping {symbol} (Trade {tr.get('position_id')}): No M5 bars found in MT5 history.")
-                skipped_no_data += 1
-                continue
-            # --------------------------------
+            if symbol_bars is None or symbol_bars.empty or rule is None: continue
 
-            rule = rule_for(symbol)
-            if rule is None:
-                skipped_no_rule += 1
-                continue
+            entry_time, exit_time = ensure_utc(tr["entry_time"]), ensure_utc(tr["exit_time"])
+            entry_floor = floor_to_m5(entry_time)
+            entry_px, exit_px = float(tr["entry_price"]), float(tr["exit_price"])
+            side, vol = int(tr["side"]), float(tr["volume"])
+            avg_vol = float(avg_volume_map.get(symbol, vol))
+            tp_ratio, sl_ratio = pct_to_ratio(rule["tp_pct"]), pct_to_ratio(rule["sl_pct"])
 
-            entry_time = ensure_utc(tr["entry_time"])
-            exit_time = ensure_utc(tr["exit_time"])
-            entry_price = float(tr["entry_price"])
-            exit_price = float(tr["exit_price"])
-            side = int(tr["side"])
-            volume = float(tr["volume"]) if pd.notna(tr["volume"]) else np.nan
-            avg_volume = float(avg_volume_by_symbol.get(symbol, volume))
+            # Simulation
+            sim = simulate_trade_m5_avg_volume(symbol, side, vol, avg_vol, entry_time, entry_px, 
+                                               tr["gross_profit"], tr["commission"], tr["swap"], tr["fee"],
+                                               rule["tp_pct"], rule["sl_pct"], rule["spread_pct"], symbol_bars)
 
-            tp_ratio = pct_to_ratio(rule["tp_pct"])
-            sl_ratio = pct_to_ratio(rule["sl_pct"])
-
-            actual_net_pnl = float(tr["net_actual_pnl"])
-
-            # Price-based win/loss for excursion masking
-            actual_trade_won = _trade_won_by_price(
-                side=side,
-                entry_price=entry_price,
-                exit_price=exit_price,
-            )
-
-            # Actual trade excursion: normalize by the actual entry->exit price distance
-            actual_exit_ratio = _actual_exit_ratio(entry_price, exit_price)
-
-            # 1. Calculate Pure Price Distance (Denominator)
-            # This ensures (114.406 - 114.252) = 0.154 is your 1.0R benchmark
-            actual_price_dist = abs(exit_price - entry_price)
-            actual_price_ratio = actual_price_dist / entry_price if entry_price > 0 else 0.0001
-            if actual_price_ratio == 0: actual_price_ratio = 0.0001
-
-            actual_path = bars_cache.get(symbol, pd.DataFrame())
+            # EXCURSION: Normalized by the Rule's TPSL Distance
+            # Actual Path
+            act_path = symbol_bars[(symbol_bars["time"] >= entry_floor) & (symbol_bars["time"] <= exit_time)].copy()
+            act_exc = _excursion_stats_from_path(side, entry_px, act_path["high"].values, act_path["low"].values, tp_ratio, sl_ratio)
             
-            # --- ADD THIS SAFETY CHECK ---
-            if not actual_path.empty and "time" in actual_path.columns:
-                actual_path = actual_path[
-                    (actual_path["time"] >= entry_time) & (actual_path["time"] <= exit_time)
-                ].copy()
-            else:
-                actual_path = pd.DataFrame() # Ensure it's an empty DF if no data
-            # ------------------------------
-            actual_path = actual_path[
-                (actual_path["time"] >= entry_time) & (actual_path["time"] <= exit_time)
-            ].copy()
+            # Sim Path
+            sim_exit_t = ensure_utc(sim["sim_exit_time"]) if pd.notna(sim["sim_exit_time"]) else exit_time
+            sim_path = symbol_bars[(symbol_bars["time"] >= entry_floor) & (symbol_bars["time"] <= sim_exit_t)].copy()
+            sim_exc = _excursion_stats_from_path(side, entry_px, sim_path["high"].values, sim_path["low"].values, tp_ratio, sl_ratio)
 
-            # 2. Compute Actual Metrics 
-            # We set exclude_last_bar=True to ensure the "Full SL" move isn't counted as an "Almost SL"
-            actual_metrics = _metrics_for_path(
-                path=actual_path,
-                side=side,
-                entry_price=entry_price,
-                tp_ratio=actual_price_ratio, # Denominator: 0.154
-                sl_ratio=actual_price_ratio, # Denominator: 0.154
-                exclude_last_bar=True,       # IMPORTANT: Separates "Full SL" from "Almost SL"
-            )
+            actual_won = _trade_won_by_price(side, entry_px, exit_px)
+            results.append({
+                "position_id": tr["position_id"], "symbol": symbol, "side": side,
+                "entry_time": entry_time, "exit_time": exit_time,
+                "actual_net_pnl": tr["net_actual_pnl"], "actual_avgvol_pnl": tr["net_actual_pnl"] * (avg_vol/vol),
+                "sim_net_pnl": sim["sim_net_pnl"], "sim_avgvol_net_pnl": sim["sim_avgvol_net_pnl"],
+                "actual_trade_won": actual_won, "sim_trade_won": (sim["sim_close_type"] == "tp"),
+                "actual_entry_revisit_mae_r": round_price(act_exc["mae_r"]) if not actual_won else np.nan,
+                "actual_entry_revisit_mfe_r": round_price(act_exc["mfe_r"]) if actual_won else np.nan,
+                "sim_entry_revisit_mae_r": round_price(sim_exc["mae_r"]),
+                "sim_entry_revisit_mfe_r": round_price(sim_exc["mfe_r"]),
+                "sim_close_type": sim["sim_close_type"], "volume": vol, "avg_volume_used": avg_vol
+            })
 
-            if tr["position_id"] == 545210010:
-                print(f"--- DETAILED MATH CHECK ---")
-                # Look at the path excluding the last bar
-                path_to_check = actual_path.iloc[:-1]
-                
-                for i, row in path_to_check.iterrows():
-                    if row['high'] >= 114.37: # Check peaks near your area
-                        # Check if a reset happened AFTER this bar but before the end
-                        future_lows = path_to_check.iloc[i:]['low']
-                        reset_found = any(future_lows <= 114.252)
-                        print(f"Bar Time: {row['time']}, High: {row['high']}, Reset Found: {reset_found}")
+            # Debug Position ID
+            if tr["position_id"] == 549566104:
+                print(f"\n--- DEBUG 549566104 ---")
+                print(f"Path Length (excl exit): {len(sim_path)-1} bars")
+                for i, row in sim_path.iterrows():
+                    mark = " [ENTRY TOUCH]" if (row['low'] <= entry_px <= row['high']) else ""
+                    print(f"  {row['time']} | H:{row['high']} L:{row['low']}{mark}")
+                print(f"Result -> MAE R: {sim_exc['mae_r']} | MFE R: {sim_exc['mfe_r']}")
 
-            sim = simulate_trade_m5_avg_volume(
-                symbol=symbol,
-                side=side,
-                volume=volume,
-                avg_volume=avg_volume,
-                entry_time=entry_time,
-                entry_price=entry_price,
-                gross_profit_actual=float(tr["gross_profit"]),
-                commission=float(tr["commission"]),
-                swap=float(tr["swap"]),
-                fee=float(tr["fee"]),
-                tp_pct=rule["tp_pct"],
-                sl_pct=rule["sl_pct"],
-                spread_pct=rule["spread_pct"],
-                bars=bars_cache.get(symbol, pd.DataFrame()),
-            )
+        res_df = pd.DataFrame(results)
+        if res_df.empty: return res_df
 
-            sim_trade_won = bool(sim["sim_close_type"] == "tp")
+        # Save Detail Files
+        append_csv_dedup(res_df.drop(columns=[c for c in res_df.columns if "revisit" in c]), PNL_DETAIL_FILE, ["position_id"])
+        exc_cols_final = ["position_id", "symbol", "side", "entry_time", "exit_time", "actual_trade_won", "sim_trade_won", 
+                          "actual_entry_revisit_mae_r", "actual_entry_revisit_mfe_r", 
+                          "sim_entry_revisit_mae_r", "sim_entry_revisit_mfe_r", "sim_close_type"]
+        append_csv_dedup(res_df[exc_cols_final], EXCURSION_DETAIL_FILE, ["position_id"])
 
-            actual_tp_pct, actual_sl_pct = _infer_tp_sl_from_exit(
-                side=side,
-                entry_price=entry_price,
-                exit_price=exit_price,
-            )
+        # Summaries
+        ov = {"trades": len(res_df), "act_pnl": res_df["actual_net_pnl"].sum(), "act_avgvol_pnl": res_df["actual_avgvol_pnl"].sum(),
+              "sim_pnl": res_df["sim_net_pnl"].sum(), "sim_avgvol_pnl": res_df["sim_avgvol_net_pnl"].sum()}
+        pd.DataFrame([ov]).to_csv(OVERVIEW_FILE, index=False)
 
-            sim_exit_price = sim.get("sim_exit_price_used", np.nan)
-            sim_tp_pct, sim_sl_pct = _infer_tp_sl_from_exit(
-                side=side,
-                entry_price=entry_price,
-                exit_price=float(sim_exit_price) if pd.notna(sim_exit_price) else np.nan,
-            )
+        s_rows = []
+        for sym, g in res_df.groupby("symbol"):
+            s_rows.append({"symbol": sym, "trades": len(g), "avg_vol": g["avg_volume_used"].mean(), "actual_avg_vol": g["volume"].mean(),
+                           "actual_pnl": g["actual_net_pnl"].sum(), "avgvol_act_pnl": g["actual_avgvol_pnl"].sum(),
+                           "sim_pnl": g["sim_net_pnl"].sum(), "avgvol_sim_pnl": g["sim_avgvol_net_pnl"].sum()})
+        pd.DataFrame(s_rows).to_csv(SUMMARY_FILE, index=False)
 
-            sim_metrics = {
-                "pre_reset_mae_r": np.nan,
-                "pre_reset_tp_r": np.nan,
-                "post_reset_mae_r": np.nan,
-                "post_reset_tp_r": np.nan,
-                "first_reset_idx": np.nan,
-                "had_reset": False,
-            }
-
-            if sim["sim_close_type"] in {"tp", "sl"} and not pd.isna(sim["sim_exit_time"]):
-                sim_path = bars_cache.get(symbol, pd.DataFrame())
-                
-                # --- ADD THIS SAFETY CHECK ---
-                if not sim_path.empty and "time" in sim_path.columns:
-                    sim_path = sim_path[
-                        (sim_path["time"] >= entry_time) &
-                        (sim_path["time"] <= ensure_utc(sim["sim_exit_time"]))
-                    ].copy()
-                else:
-                    sim_path = pd.DataFrame()
-                # ------------------------------
-
-                sim_metrics = _metrics_for_path(
-                    path=sim_path,
-                    side=side,
-                    entry_price=entry_price,
-                    tp_ratio=tp_ratio,
-                    sl_ratio=sl_ratio,
-                    exclude_last_bar=True,
-                )
-
-            actual_pre_reset_mae_r = np.nan
-            actual_pre_reset_tp_r = np.nan
-            if actual_metrics["had_reset"]:
-                if actual_trade_won: # If trade was a Win, show MFE (TP R)
-                    actual_pre_reset_tp_r = round_price(actual_metrics["pre_reset_tp_r"])
-                else: # If trade was a Loss, show MAE
-                    actual_pre_reset_mae_r = round_price(actual_metrics["pre_reset_mae_r"])
-
-            # --- Logic for SIM (Show Both) ---
-            sim_pre_reset_mae_r = round_price(sim_metrics.get("pre_reset_mae_r", np.nan))
-            sim_pre_reset_tp_r = round_price(sim_metrics.get("pre_reset_tp_r", np.nan))
-
-            results.append(
-                {
-                    "position_id": int(tr["position_id"]) if pd.notna(tr.get("position_id", np.nan)) else np.nan,
-                    "symbol": symbol,
-                    "side": side,
-                    "entry_time": entry_time,
-                    "exit_time": exit_time,
-                    "entry_price": entry_price,
-                    "exit_price": exit_price,
-                    "volume": volume,
-                    "avg_volume_used": avg_volume,
-                    "tp_pct": rule["tp_pct"],
-                    "sl_pct": rule["sl_pct"],
-                    "spread_pct": rule["spread_pct"],
-                    "actual_net_pnl": actual_net_pnl,
-                    "actual_trade_won": actual_trade_won,
-                    "actual_tp_pct": actual_tp_pct,
-                    "actual_sl_pct": actual_sl_pct,
-
-                    "actual_pre_reset_mae_r": actual_pre_reset_mae_r,
-                    "actual_pre_reset_tp_r": actual_pre_reset_tp_r,
-
-                    # Sim: keep both
-                    "sim_pre_reset_mae_r": round_price(_safe_metric(sim_metrics, "pre_reset_mae_r")),
-                    "sim_pre_reset_tp_r": round_price(_safe_metric(sim_metrics, "pre_reset_tp_r")),
-                    "sim_post_reset_mae_r": round_price(_safe_metric(sim_metrics, "post_reset_mae_r")),
-                    "sim_post_reset_tp_r": round_price(_safe_metric(sim_metrics, "post_reset_tp_r")),
-
-                    "sim_net_pnl": sim["sim_net_pnl"],
-                    "sim_avgvol_net_pnl": sim["sim_avgvol_net_pnl"],
-                    "sim_trade_won": sim_trade_won,
-                    "sim_tp_pct": sim_tp_pct,
-                    "sim_sl_pct": sim_sl_pct,
-                    "net_delta": sim["net_delta"],
-                    "net_delta_avgvol": sim["net_delta_avgvol"],
-                    "sim_close_type": sim["sim_close_type"],
-                    "bar_outcome": sim["bar_outcome"],
-                }
-            )
-
-        out = pd.DataFrame(results)
-        if out.empty:
-            print("No results produced.")
-            return out
-
-        pnl_cols = [
-            "position_id",
-            "symbol",
-            "side",
-            "entry_time",
-            "exit_time",
-            "entry_price",
-            "exit_price",
-            "volume",
-            "avg_volume_used",
-            "tp_pct",
-            "sl_pct",
-            "spread_pct",
-            "actual_net_pnl",
-            "actual_trade_won",
-            "actual_tp_pct",
-            "actual_sl_pct",
-            "sim_net_pnl",
-            "sim_avgvol_net_pnl",
-            "sim_trade_won",
-            "sim_tp_pct",
-            "sim_sl_pct",
-            "net_delta",
-            "net_delta_avgvol",
-            "sim_close_type",
-            "bar_outcome",
-        ]
-
-        excursion_cols = [
-            "position_id",
-            "symbol",
-            "side",
-            "entry_time",
-            "exit_time",
-            "entry_price",
-            "exit_price",
-            "volume",
-            "avg_volume_used",
-            "tp_pct",
-            "sl_pct",
-            "spread_pct",
-            "actual_trade_won",
-            "sim_trade_won",
-            "actual_pre_reset_mae_r",
-            "actual_pre_reset_tp_r",
-            "sim_pre_reset_mae_r",
-            "sim_pre_reset_tp_r",
-            "sim_post_reset_mae_r",
-            "sim_post_reset_tp_r",
-            "sim_close_type",
-            "bar_outcome",
-        ]
-
-        pnl_df = out[[c for c in pnl_cols if c in out.columns]].copy()
-        excursion_df = out[[c for c in excursion_cols if c in out.columns]].copy()
-
-        pnl_df = pnl_df.sort_values(["symbol", "entry_time", "position_id"]).reset_index(drop=True)
-        excursion_df = excursion_df.sort_values(["symbol", "entry_time", "position_id"]).reset_index(drop=True)
-
-        for col in [
-            "volume",
-            "avg_volume_used",
-            "actual_net_pnl",
-            "actual_tp_pct",
-            "actual_sl_pct",
-            "sim_net_pnl",
-            "sim_avgvol_net_pnl",
-            "sim_tp_pct",
-            "sim_sl_pct",
-            "net_delta",
-            "net_delta_avgvol",
-            "actual_pre_reset_mae_r",
-            "actual_pre_reset_tp_r",
-            "sim_pre_reset_mae_r",
-            "sim_pre_reset_tp_r",
-            "sim_post_reset_mae_r",
-            "sim_post_reset_tp_r",
-        ]:
-            if col in pnl_df.columns:
-                pnl_df[col] = pnl_df[col].apply(round_price)
-            if col in excursion_df.columns:
-                excursion_df[col] = excursion_df[col].apply(round_price)
-
-        for col in ["tp_pct", "sl_pct", "spread_pct"]:
-            if col in pnl_df.columns:
-                pnl_df[col] = pnl_df[col].apply(round_pct)
-            if col in excursion_df.columns:
-                excursion_df[col] = excursion_df[col].apply(round_pct)
-
-        pnl_df.to_csv(PNL_DETAIL_FILE, index=False)
-        excursion_df.to_csv(EXCURSION_DETAIL_FILE, index=False)
-
-        resolved = pnl_df["sim_close_type"].isin(["tp", "sl"])
-        unresolved = pnl_df["sim_close_type"].eq("not_hit_in_data")
-
-        overall = {
-            "trades": int(len(pnl_df)),
-            "actual_avg_tp_pct": round_pct(pnl_df["actual_tp_pct"].dropna().mean()),
-            "actual_avg_sl_pct": round_pct(pnl_df["actual_sl_pct"].dropna().mean()),
-            "sim_avg_tp_pct": round_pct(pnl_df["sim_tp_pct"].dropna().mean()),
-            "sim_avg_sl_pct": round_pct(pnl_df["sim_sl_pct"].dropna().mean()),
-            "resolved_sim_trades": int(resolved.sum()),
-            "unresolved_sim_trades": int(unresolved.sum()),
-            "actual_total_net_pnl": round_price(pnl_df["actual_net_pnl"].sum()),
-            "sim_total_net_pnl": round_price(pnl_df.loc[resolved, "sim_net_pnl"].sum()),
-            "sim_avgvol_total_net_pnl": round_price(pnl_df.loc[resolved, "sim_avgvol_net_pnl"].sum()),
-            "total_net_delta": round_price(pnl_df.loc[resolved, "net_delta"].sum()),
-            "total_net_delta_avgvol": round_price(pnl_df.loc[resolved, "net_delta_avgvol"].sum()),
-            "avg_volume_used": round_price(pnl_df["avg_volume_used"].mean()),
-            "actual_avg_net_pnl": round_price(pnl_df["actual_net_pnl"].mean()),
-            "sim_avg_net_pnl": round_price(pnl_df.loc[resolved, "sim_net_pnl"].mean()),
-            "sim_avgvol_avg_net_pnl": round_price(pnl_df.loc[resolved, "sim_avgvol_net_pnl"].mean()),
-            "actual_avg_pre_reset_mae_r": round_price(excursion_df["actual_pre_reset_mae_r"].dropna().mean()),
-            "actual_avg_pre_reset_tp_r": round_price(excursion_df["actual_pre_reset_tp_r"].dropna().mean()),
-            "sim_avg_pre_reset_mae_r": round_price(excursion_df["sim_pre_reset_mae_r"].dropna().mean()),
-            "sim_avg_pre_reset_tp_r": round_price(excursion_df["sim_pre_reset_tp_r"].dropna().mean()),
-            "sim_avg_post_reset_mae_r": round_price(excursion_df["sim_post_reset_mae_r"].dropna().mean()),
-            "sim_avg_post_reset_tp_r": round_price(excursion_df["sim_post_reset_tp_r"].dropna().mean()),
-            "tp_hits": int((pnl_df["bar_outcome"].isin(["tp_first", "tp_same_bar"])).sum()),
-            "sl_hits": int((pnl_df["bar_outcome"].isin(["sl_first", "sl_same_bar"])).sum()),
-            "not_hit_in_data": int((pnl_df["sim_close_type"] == "not_hit_in_data").sum()),
-        }
-
-        overall_df = pd.DataFrame([overall])
-        overall_df.to_csv(OVERVIEW_FILE, index=False)
-
-        summary_rows = []
-        for sym, g in pnl_df.groupby("symbol"):
-            resolved_g = g["sim_close_type"].isin(["tp", "sl"])
-            exc_g = excursion_df[excursion_df["symbol"] == sym].copy()
-
-            summary_rows.append(
-                {
-                    "symbol": sym,
-                    "trades": int(len(g)),
-                    "resolved_sim_trades": int(resolved_g.sum()),
-                    "unresolved_sim_trades": int((g["sim_close_type"] == "not_hit_in_data").sum()),
-                    "avg_volume_used": round_price(g["avg_volume_used"].mean()),
-                    "actual_total_net_pnl": round_price(g["actual_net_pnl"].sum()),
-                    "sim_total_net_pnl": round_price(g.loc[resolved_g, "sim_net_pnl"].sum()),
-                    "sim_avgvol_total_net_pnl": round_price(g.loc[resolved_g, "sim_avgvol_net_pnl"].sum()),
-                    "total_net_delta": round_price(g.loc[resolved_g, "net_delta"].sum()),
-                    "total_net_delta_avgvol": round_price(g.loc[resolved_g, "net_delta_avgvol"].sum()),
-                    "actual_avg_net_pnl": round_price(g["actual_net_pnl"].mean()),
-                    "sim_avg_net_pnl": round_price(g.loc[resolved_g, "sim_net_pnl"].mean()),
-                    "sim_avgvol_avg_net_pnl": round_price(g.loc[resolved_g, "sim_avgvol_net_pnl"].mean()),
-                    "actual_avg_pre_reset_mae_r": round_price(exc_g["actual_pre_reset_mae_r"].dropna().mean()) if not exc_g.empty else np.nan,
-                    "actual_avg_pre_reset_tp_r": round_price(exc_g["actual_pre_reset_tp_r"].dropna().mean()) if not exc_g.empty else np.nan,
-                    "sim_avg_pre_reset_mae_r": round_price(exc_g["sim_pre_reset_mae_r"].dropna().mean()) if not exc_g.empty else np.nan,
-                    "sim_avg_pre_reset_tp_r": round_price(exc_g["sim_pre_reset_tp_r"].dropna().mean()) if not exc_g.empty else np.nan,
-                    "sim_avg_post_reset_mae_r": round_price(exc_g["sim_post_reset_mae_r"].dropna().mean()) if not exc_g.empty else np.nan,
-                    "sim_avg_post_reset_tp_r": round_price(exc_g["sim_post_reset_tp_r"].dropna().mean()) if not exc_g.empty else np.nan,
-                    "tp_hits": int((g["bar_outcome"].isin(["tp_first", "tp_same_bar"])).sum()),
-                    "sl_hits": int((g["bar_outcome"].isin(["sl_first", "sl_same_bar"])).sum()),
-                    "not_hit_in_data": int((g["sim_close_type"] == "not_hit_in_data").sum()),
-                    "tp_pct": round_pct(g["tp_pct"].iloc[0]),
-                    "sl_pct": round_pct(g["sl_pct"].iloc[0]),
-                    "spread_pct": round_pct(g["spread_pct"].iloc[0]),
-                    "last_n_trades": int(symbol_last_n(sym)),
-                }
-            )
-
-        summary = pd.DataFrame(summary_rows).sort_values("symbol").reset_index(drop=True)
-        summary.to_csv(SUMMARY_FILE, index=False)
-
-        print("\n=== OVERALL SUMMARY ===")
-        print(overall_df.to_string(index=False))
-
-        print("\n=== PER SYMBOL SUMMARY ===")
-        print(summary.to_string(index=False))
-
-        print("\n=== TRADE HISTORY SAVED ===")
-        print(f"Raw deals file         : {RAW_DEALS_FILE}")
-        print(f"Closed trades file     : {CLOSED_TRADES_FILE}")
-        print(f"Overall summary        : {OVERVIEW_FILE}")
-        print(f"Symbol summary         : {SUMMARY_FILE}")
-        print(f"PnL detail file        : {PNL_DETAIL_FILE}")
-        print(f"Excursion detail file  : {EXCURSION_DETAIL_FILE}")
-        print(f"Skipped no rule        : {skipped_no_rule}")
-        print(f"Skipped (No Bar Data)  : {skipped_no_data}")
-
-        return out
-
+        return res_df
     finally:
         mt5.shutdown()
 
