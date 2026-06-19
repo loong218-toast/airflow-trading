@@ -95,6 +95,9 @@ x-airflow-common:
 
     POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR: "load_as_storage"
     
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+    
   volumes:
     - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
     - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs

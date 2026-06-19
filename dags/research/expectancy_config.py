@@ -21,7 +21,7 @@ BASE_DIR = PROJECT_ROOT
 if load_dotenv is not None:
     load_dotenv()
 
-LOOKBACK_DAYS = 180
+LOOKBACK_DAYS = 90
 ENTRY_BUCKET_HOURS = 4
 USE_ENTRY_BUCKET_HOURS = False
 RISK_PCT = 0.005
@@ -44,14 +44,14 @@ AFTER_LOSS_SKIP_TRADES_LIST: List[Optional[int]] = [1]
 
 RANDOMIZE_ENTRY_PRICE = True
 RANDOM_ENTRY_SEED = 11121212
-ENTRY_NUDGE_MAX_FRACTION = 0.03
+ENTRY_NUDGE_MAX_FRACTION = 0.02
 ENTRY_NUDGE_CLIP_TO_CANDLE = True
 
 #SIMULATION_MODES = ["overlapping", "sequential_flip", "sequential_random"]
 SIMULATION_MODES = ["sequential_random"]
-SEQUENTIAL_SWITCH_ON_LOSS = True                  # If true, prefers opposite side after a loss
+SEQUENTIAL_SWITCH_ON_LOSS = False                  # If true, prefers opposite side after a loss
 
-TRADES_PER_HOUR = 4
+TRADES_PER_HOUR = 2
 
 if 24 % ENTRY_BUCKET_HOURS != 0:    
     raise ValueError("ENTRY_BUCKET_HOURS must divide 24 exactly.")
@@ -84,7 +84,7 @@ INSTRUMENT_CONFIG = {
         "mt5_symbol": "UK100",
         "tp_range": {"min": 0.05, "max": 0.60, "step": 0.01},
         "sl_range": {"min": 0.05, "max": 0.60, "step": 0.01},
-        "horizon_hours_list": [6],
+        "horizon_hours_list": [12],
     },
     "AUDJPY": {
         "pair": "AUDJPY",
@@ -117,7 +117,7 @@ PAIR = CFG["pair"]
 MT5_SYMBOL = CFG["mt5_symbol"]
 HORIZON_HOURS_LIST = CFG["horizon_hours_list"]
 
-MT5_CHUNK_DAYS = 90
+MT5_CHUNK_DAYS = 30
 
 MT5_PATH = os.getenv("MT5_PATH")
 MT5_LOGIN = os.getenv("MT5_LOGIN")

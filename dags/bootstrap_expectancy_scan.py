@@ -22,18 +22,25 @@ logger = logging.getLogger("airflow.task")
     catchup=False,
     max_active_runs=1,
     default_args={"owner": "loong", "retries": 0, "retry_delay": timedelta(minutes=10)},
-    tags=["expectancy", "bootstrap", "mt5"],
+    tags=["expectancy", "bootstrap", "mt5", "candlestick"],
 )
 def expectancy_bootstrap_scan_dag():
     @task()
     def run_bootstrap_task() -> dict[str, str]:
         from research.bootstrap_expectancy_analysis import run_bootstrap_expectancy_scan
 
-        result = run_bootstrap_expectancy_scan()
+        return run_bootstrap_expectancy_scan()
 
-        return result
+    @task()
+    def run_candlestick_task() -> dict[str, str]:
+        from research.candlestick_trade_chart import run_candlestick_trade_chart
 
-    run_bootstrap_task()
+        return run_candlestick_trade_chart()
+
+    bootstrap_result = run_bootstrap_task()
+    candlestick_result = run_candlestick_task()
+
+    bootstrap_result >> candlestick_result
 
 
 expectancy_bootstrap_scan_dag = expectancy_bootstrap_scan_dag()

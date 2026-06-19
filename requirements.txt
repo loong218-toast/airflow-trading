@@ -13,3 +13,4 @@ python-dotenv
 lightgbm
 matplotlib
 seaborn
+plotly
