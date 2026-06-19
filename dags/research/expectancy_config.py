@@ -1,5 +1,3 @@
-# expectancy_config.py
-
 from __future__ import annotations
 
 import os
@@ -22,8 +20,6 @@ if load_dotenv is not None:
     load_dotenv()
 
 LOOKBACK_DAYS = 90
-ENTRY_BUCKET_HOURS = 4
-USE_ENTRY_BUCKET_HOURS = False
 RISK_PCT = 0.005
 
 USE_MA_FILTER = False
@@ -33,12 +29,12 @@ MA_PERIOD_BARS = 96  # 32 MA 96 = 15m 384 = 1h
 # After-loss cooldown / stop logic:
 # - trigger_count list: how many consecutive SLs before the rule activates
 # - skip_trades list: how many future signals to skip after activation
-#   - use None to stop trading for the rest of the sample after the trigger
+# - use None to stop trading for the rest of the sample after the trigger
 USE_AFTER_LOSS_FILTER = False
 
 # Example sweep:
-#   AFTER_LOSS_TRIGGER_COUNT_LIST = [2, 3, 4]
-#   AFTER_LOSS_SKIP_TRADES_LIST = [None, 5, 10]
+# AFTER_LOSS_TRIGGER_COUNT_LIST = [2, 3, 4]
+# AFTER_LOSS_SKIP_TRADES_LIST = [None, 5, 10]
 AFTER_LOSS_TRIGGER_COUNT_LIST: List[int] = [1]
 AFTER_LOSS_SKIP_TRADES_LIST: List[Optional[int]] = [1]
 
@@ -47,14 +43,22 @@ RANDOM_ENTRY_SEED = 11121212
 ENTRY_NUDGE_MAX_FRACTION = 0.02
 ENTRY_NUDGE_CLIP_TO_CANDLE = True
 
-#SIMULATION_MODES = ["overlapping", "sequential_flip", "sequential_random"]
+# Simulation modes:
+# - overlapping: evaluate every eligible entry independently
+# - sequential_flip: take one trade at a time and favor the opposite side after a loss
+# - sequential_random: take one trade at a time and use a daily random side bias
 SIMULATION_MODES = ["sequential_random"]
-SEQUENTIAL_SWITCH_ON_LOSS = False                  # If true, prefers opposite side after a loss
+# SIMULATION_MODES = ["overlapping", "sequential_flip", "sequential_random"]
+SEQUENTIAL_SWITCH_ON_LOSS = False  # If true, prefers opposite side after a loss
 
 TRADES_PER_HOUR = 2
 
-if 24 % ENTRY_BUCKET_HOURS != 0:    
-    raise ValueError("ENTRY_BUCKET_HOURS must divide 24 exactly.")
+# Entry window filter in Malaysia time.
+# Bars inside this window are eligible to become entries.
+USE_ENTRY_TIME_WINDOW = True
+ENTRY_WINDOW_START_HOUR_MYT = 15
+ENTRY_WINDOW_END_HOUR_MYT = 23
+ENTRY_WINDOW_LABEL = f"{ENTRY_WINDOW_START_HOUR_MYT:02d}:00-{ENTRY_WINDOW_END_HOUR_MYT:02d}:00 MYT"
 
 MYT = timezone(timedelta(hours=8), name="MYT")
 
@@ -188,15 +192,6 @@ def _safe_name(value: str) -> str:
     return value.strip().replace(" ", "_").replace("/", "_").replace(".", "_").replace(":", "_")
 
 
-def _bucket_start_hour_from_time_ns_myt(time_ns: int, bucket_hours: int = ENTRY_BUCKET_HOURS) -> int:
-    ts_utc = pd.Timestamp(int(time_ns), unit="ns", tz="UTC")
-    ts_myt = ts_utc.tz_convert(MYT)
-    return int((ts_myt.hour // bucket_hours) * bucket_hours)
-
-
-def _bucket_label_from_start_hour(start_hour: int, bucket_hours: int = ENTRY_BUCKET_HOURS) -> str:
-    return f"{start_hour:02d}:00-{start_hour + bucket_hours:02d}:00 MYT"
-
 
 def _mean_median(values: List[float]) -> Tuple[Optional[float], Optional[float]]:
     if not values:
@@ -232,10 +227,15 @@ def _market_tag(instrument: str, pair: str, symbol: str) -> str:
     return "market"
 
 
-def make_output_file(instrument: str, pair: str, symbol: str, bucket_hours: Optional[int], use_bucket_hours: bool) -> Path:
+def make_output_file(
+    instrument: str,
+    pair: str,
+    symbol: str,
+    entry_window_label: Optional[str] = None,
+) -> Path:
     market = _market_tag(instrument, pair, symbol)
-    bucket_part = f"{int(bucket_hours)}h_myt_buckets" if use_bucket_hours else "no_myt_buckets"
-    return OUTPUT_DIR / f"expectancy_scan_{market}_{bucket_part}.csv"
+    window_part = _safe_name(entry_window_label or ENTRY_WINDOW_LABEL)
+    return OUTPUT_DIR / f"expectancy_scan_{market}_{window_part}.csv"
 
 
 def _rng_for_anchor(anchor_idx: int) -> np.random.Generator:

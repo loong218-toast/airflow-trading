@@ -1,5 +1,3 @@
-# expectancy_scan.py
-
 from __future__ import annotations
 
 import logging
@@ -9,7 +7,7 @@ from pathlib import Path
 
 import pandas as pd
 import pendulum
-from airflow.sdk import dag, task, Variable
+from airflow.sdk import dag, task
 
 PROJECT_ROOT = Path("/opt/airflow/airflow-trading")
 if str(PROJECT_ROOT) not in sys.path:
@@ -19,7 +17,7 @@ logger = logging.getLogger("airflow.task")
 
 
 @dag(
-    dag_id="expectancy_scan",
+    dag_id="expectancy_scan_v2",
     schedule=None,
     start_date=pendulum.datetime(2026, 1, 1, tz="UTC"),
     catchup=False,
@@ -30,22 +28,27 @@ logger = logging.getLogger("airflow.task")
 def expectancy_scan_dag():
     @task()
     def build_summary_task() -> str:
-        from research.expectancy_analysis import build_expectancy_summary_from_cache, save_expectancy_summary_csv
+        from research.expectancy_analysis import (
+            build_expectancy_summary_from_cache,
+            save_expectancy_summary_csv,
+        )
         from research.expectancy_config import (
+            AFTER_LOSS_SKIP_TRADES_LIST,
+            AFTER_LOSS_TRIGGER_COUNT_LIST,
             CACHE_FILE,
-            ENTRY_BUCKET_HOURS,
             HORIZON_HOURS_LIST,
             INSTRUMENT,
             MT5_SYMBOL,
             PAIR,
             SL_PCT_LIST,
             TARGET_PCT_LIST,
-            USE_ENTRY_BUCKET_HOURS,
+            TRADES_PER_HOUR,
+            USE_AFTER_LOSS_FILTER,
+            USE_ENTRY_TIME_WINDOW,
             USE_MA_FILTER,
+            ENTRY_WINDOW_START_HOUR_MYT,
+            ENTRY_WINDOW_END_HOUR_MYT,
         )
-
-        bucket_mode = USE_ENTRY_BUCKET_HOURS
-        time_bucket_hours = ENTRY_BUCKET_HOURS if bucket_mode else 24
 
         logger.info("Starting expectancy scan")
         logger.info("Cache file: %s", CACHE_FILE)
@@ -58,9 +61,14 @@ def expectancy_scan_dag():
             target_pct_list=TARGET_PCT_LIST,
             sl_pct_list=SL_PCT_LIST,
             horizon_hours_list=HORIZON_HOURS_LIST,
-            time_bucket_hours=time_bucket_hours,
-            include_entry_bucket_hours=bucket_mode,
+            use_entry_time_window=USE_ENTRY_TIME_WINDOW,
+            entry_window_start_hour=ENTRY_WINDOW_START_HOUR_MYT,
+            entry_window_end_hour=ENTRY_WINDOW_END_HOUR_MYT,
+            trades_per_hour=TRADES_PER_HOUR,
             use_ma_filter=USE_MA_FILTER,
+            use_after_loss_filter=USE_AFTER_LOSS_FILTER,
+            after_loss_trigger_count_list=AFTER_LOSS_TRIGGER_COUNT_LIST,
+            after_loss_skip_trades_list=AFTER_LOSS_SKIP_TRADES_LIST,
         )
 
         if summary_df.empty:
@@ -88,7 +96,7 @@ def expectancy_scan_dag():
     @task()
     def save_heatmaps_task(summary_file: str) -> list[str]:
         from research.expectancy_analysis import save_net_expectancy_tp_sl_plot
-        from research.expectancy_config import INSTRUMENT, MT5_SYMBOL, PAIR, USE_ENTRY_BUCKET_HOURS
+        from research.expectancy_config import INSTRUMENT, MT5_SYMBOL, PAIR
 
         summary_df = pd.read_csv(summary_file)
         plot_files = save_net_expectancy_tp_sl_plot(
@@ -96,7 +104,6 @@ def expectancy_scan_dag():
             instrument=INSTRUMENT,
             pair=PAIR,
             symbol=MT5_SYMBOL,
-            include_entry_bucket_hours=USE_ENTRY_BUCKET_HOURS,
         )
         logger.info("Heatmaps saved: %d", len(plot_files))
         return [str(p) for p in plot_files]

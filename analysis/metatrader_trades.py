@@ -20,7 +20,7 @@ BAR_TIMEFRAME = mt5.TIMEFRAME_M5
 # tp_pct, sl_pct, spread_pct are in percent units
 # last_n_trades = -1 means keep all trades for that symbol
 SYMBOL_RULES: Dict[str, Dict[str, float]] = {
-    "UK100": {"tp_pct": 0.07, "sl_pct": 0.45, "spread_pct": 0.01, "last_n_trades": -1},
+    "UK100": {"tp_pct": 0.40, "sl_pct": 0.14, "spread_pct": 0.01, "last_n_trades": -1},
     "AUDJPY": {"tp_pct": 0.07, "sl_pct": 0.28, "spread_pct": 0.01, "last_n_trades": -1},
     "USDCHF": {"tp_pct": 0.07, "sl_pct": 0.20, "spread_pct": 0.02, "last_n_trades": 10},
 }
