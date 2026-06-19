@@ -52,19 +52,16 @@ ENTRY_NUDGE_CLIP_TO_CANDLE = True
 # - overlapping: evaluate every eligible entry independently
 # - sequential_flip: take one trade at a time and favor the opposite side after a loss
 # - sequential_random: take one trade at a time and use a daily random side bias
-#SIMULATION_MODES = ["overlapping"]
 SIMULATION_MODES = ["sequential_random"]
 SEQUENTIAL_SWITCH_ON_LOSS = True  # If true, prefers opposite side after a loss
 
 # Entry window filter in Malaysia time.
 # Bars inside this window are eligible to become entries.
-USE_ENTRY_TIME_WINDOW = False
+USE_ENTRY_TIME_WINDOW = True
 ENTRY_WINDOW_START_HOUR_MYT = 15
 ENTRY_WINDOW_END_HOUR_MYT = 23
 ENTRY_WINDOW_LABEL = f"{ENTRY_WINDOW_START_HOUR_MYT:02d}:00-{ENTRY_WINDOW_END_HOUR_MYT:02d}:00 MYT"
 
-# Cap the number of entry candles considered per hour inside the entry window.
-# Set this to 2, 4, or any positive integer.
 TRADES_PER_HOUR = 4
 
 MYT = timezone(timedelta(hours=8), name="MYT")
@@ -91,8 +88,8 @@ INSTRUMENT_CONFIG = {
     "UK100": {
         "pair": "UK100",
         "mt5_symbol": "UK100",
-        "tp_range": {"min": 0.05, "max": 0.60, "step": 0.01},
-        "sl_range": {"min": 0.05, "max": 0.60, "step": 0.01},
+        "tp_range": {"min": 0.05, "max": 0.65, "step": 0.01},
+        "sl_range": {"min": 0.05, "max": 0.65, "step": 0.01},
         "horizon_hours_list": [12],
     },
     "AUDJPY": {
@@ -192,8 +189,11 @@ def _parse_utc_dt(dt_in: Any) -> Optional[datetime]:
 def _safe_name(value: str) -> str:
     return value.strip().replace(" ", "_").replace("/", "_").replace(".", "_").replace(":", "_")
 
-def _entry_window_pass(time_ns: int, start_hour: int, end_hour: int) -> bool:
-    hour = int(_time_ns_to_myt(np.array([time_ns], dtype=np.int64))[0].hour)
+def _entry_window_pass(time_ns: int, start_hour: int = ENTRY_WINDOW_START_HOUR_MYT, end_hour: int = ENTRY_WINDOW_END_HOUR_MYT) -> bool:
+    ts_utc = pd.Timestamp(int(time_ns), unit="ns", tz="UTC")
+    ts_myt = ts_utc.tz_convert(MYT)
+    hour = int(ts_myt.hour)
+
     if start_hour == end_hour:
         return True
     if start_hour < end_hour:
