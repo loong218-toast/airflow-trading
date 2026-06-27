@@ -33,6 +33,9 @@ from research.expectancy_config import (
     USE_AFTER_LOSS_FILTER,
     USE_ENTRY_TIME_WINDOW,
     USE_MA_FILTER,
+    USE_MAE_MFE_STATS,
+    USE_DAILY_SIDE_BIAS,
+    DAILY_BIAS_USE_MYT_DATE,
     _market_tag,
     _net_expectancy_risk_pct,
     _safe_name,
@@ -50,6 +53,8 @@ ENTRY_RESET_TOL_PCT = 0.0
 PLOT_MAX_R = 2.0
 PLOT_BIN_EDGES = np.linspace(0.0, PLOT_MAX_R, PLOT_BINS + 1)
 
+PROGRESS_LOG_EVERY = 50
+
 
 def _import_plotting():
     import matplotlib
@@ -64,6 +69,10 @@ def _import_plotting():
 
     return plt, sns
 
+def _group_key_label(key: Any) -> str:
+    if isinstance(key, tuple):
+        key = "_".join(str(x) for x in key)
+    return _safe_name(str(key))
 
 def _safe_div(n: float, d: float) -> Optional[float]:
     if d == 0:
@@ -122,12 +131,27 @@ def _bin_update(hist: np.ndarray, value: float) -> None:
     if 0 <= idx < hist.size:
         hist[idx] += 1
 
+def _log_scan_progress(done: int, total: int, label: str) -> None:
+    if total <= 0:
+        return
+    if done == 1 or done == total or done % PROGRESS_LOG_EVERY == 0:
+        pct = (done / total) * 100.0
+        logger.info("%s %d/%d (%.1f%%)", label, done, total, pct)
 
 def _utc_to_myt_hours(time_ns: np.ndarray) -> np.ndarray:
     dt_utc = pd.to_datetime(time_ns, unit="ns", utc=True)
     dt_myt = dt_utc.tz_convert(MYT)
     return dt_myt.hour.to_numpy(dtype=np.int8, copy=False)
 
+def _build_daily_side_bias_array(time_ns: np.ndarray, use_myt_date: bool = True) -> np.ndarray:
+    dt_utc = pd.to_datetime(time_ns, unit="ns", utc=True)
+    dates = dt_utc.tz_convert(MYT).date if use_myt_date else dt_utc.date
+
+    unique_dates = pd.Index(dates).unique()
+    rng = np.random.default_rng(RANDOM_ENTRY_SEED)
+    bias_map = {day: int(rng.choice([1, -1])) for day in unique_dates}
+
+    return np.array([bias_map[day] for day in dates], dtype=np.int8)
 
 def _entry_window_mask_fast(
     hours: np.ndarray,
@@ -519,19 +543,22 @@ def _build_trade_candidates(
                     path_highs = future_high_local[: exit_idx + 1]
                     path_lows = future_low_local[: exit_idx + 1]
 
-                entry_revisit_stats = _path_entry_revisit_excursion_stats(
-                    side=side,
-                    entry_price=anchor_price,
-                    highs=np.asarray(path_highs, dtype=np.float64),
-                    lows=np.asarray(path_lows, dtype=np.float64),
-                    tp_ratio=target_ratio,
-                    sl_ratio=sl_ratio,
-                    reset_tol_pct=ENTRY_RESET_TOL_PCT,
-                    exclude_last_bar=(trade_result in {"target", "sl"}),
-                )
-
-                entry_revisit_mae_r = entry_revisit_stats["entry_revisit_mae_r"]
-                entry_revisit_mfe_r = entry_revisit_stats["entry_revisit_mfe_r"]
+                if USE_MAE_MFE_STATS:
+                    entry_revisit_stats = _path_entry_revisit_excursion_stats(
+                        side=side,
+                        entry_price=anchor_price,
+                        highs=np.asarray(path_highs, dtype=np.float64),
+                        lows=np.asarray(path_lows, dtype=np.float64),
+                        tp_ratio=target_ratio,
+                        sl_ratio=sl_ratio,
+                        reset_tol_pct=ENTRY_RESET_TOL_PCT,
+                        exclude_last_bar=(trade_result in {"target", "sl"}),
+                    )
+                    entry_revisit_mae_r = entry_revisit_stats["entry_revisit_mae_r"]
+                    entry_revisit_mfe_r = entry_revisit_stats["entry_revisit_mfe_r"]
+                else:
+                    entry_revisit_mae_r = np.nan
+                    entry_revisit_mfe_r = np.nan
 
                 candidates_by_side[side].append(
                     {
@@ -684,18 +711,21 @@ def _update_stats_sequential(
     path_highs = high[entry_idx + 1 : exit_idx + 1]
     path_lows = low[entry_idx + 1 : exit_idx + 1]
 
-    revisit = _path_entry_revisit_excursion_stats(
-        side=trade["side"],
-        entry_price=trade["entry_px"],
-        highs=path_highs,
-        lows=path_lows,
-        tp_ratio=tp_ratio,
-        sl_ratio=sl_ratio,
-        exclude_last_bar=(res in {"target", "sl"}),
-    )
-
-    mae_r = revisit["entry_revisit_mae_r"]
-    mfe_r = revisit["entry_revisit_mfe_r"]
+    if USE_MAE_MFE_STATS:
+        revisit = _path_entry_revisit_excursion_stats(
+            side=trade["side"],
+            entry_price=trade["entry_px"],
+            highs=path_highs,
+            lows=path_lows,
+            tp_ratio=tp_ratio,
+            sl_ratio=sl_ratio,
+            exclude_last_bar=(res in {"target", "sl"}),
+        )
+        mae_r = revisit["entry_revisit_mae_r"]
+        mfe_r = revisit["entry_revisit_mfe_r"]
+    else:
+        mae_r = np.nan
+        mfe_r = np.nan
 
     if np.isfinite(mae_r):
         _bin_update(s["entry_revisit_mae_hist"], mae_r)
@@ -805,7 +835,11 @@ def _finalize_row(
         "use_entry_time_window": bool(use_entry_time_window),
         "entry_window_start_hour": int(entry_window_start_hour),
         "entry_window_end_hour": int(entry_window_end_hour),
-        "entry_window_label": f"{entry_window_start_hour:02d}:00-{entry_window_end_hour:02d}:00 MYT",
+        "entry_window_label": (
+            "24H"
+            if not use_entry_time_window
+            else f"{entry_window_start_hour:02d}:00-{entry_window_end_hour:02d}:00 MYT"
+        ),
         "target_pct": float(tp),
         "sl_pct": float(sl),
         "horizon_hours": int(h),
@@ -871,6 +905,12 @@ def analyze_target_sl_survival(
     n = len(close)
 
     ma_values = _compute_ma_values(close)
+    trade_rng = np.random.default_rng(RANDOM_ENTRY_SEED)
+    daily_bias_array = (
+        _build_daily_side_bias_array(time_ns, use_myt_date=DAILY_BIAS_USE_MYT_DATE)
+        if USE_DAILY_SIDE_BIAS
+        else None
+    )
 
     allowed_entry_indices = _build_allowed_entry_indices(
         time_ns=time_ns,
@@ -880,24 +920,20 @@ def analyze_target_sl_survival(
         trades_per_hour=trades_per_hour,
     )
 
-    dt_utc = pd.to_datetime(time_ns, unit="ns", utc=True)
-    utc_dates = pd.Series(dt_utc.date)
-    unique_dates = utc_dates.unique()
-
-    rng = np.random.default_rng(RANDOM_ENTRY_SEED)
-    daily_bias_map = {day: int(rng.choice([1, -1])) for day in unique_dates}
-    bias_array = utc_dates.map(daily_bias_map).to_numpy(dtype=np.int8)
-
     horizons = sorted({int(h) for h in horizon_hours_list if int(h) > 0})
     target_list = sorted({float(x) for x in target_pct_list if float(x) > 0.0})
     sl_list = sorted({float(x) for x in sl_pct_list if float(x) > 0.0})
+    strategy_modes = _strategy_mode_list()
+
+    combo_total = len(SIMULATION_MODES) * len(strategy_modes) * len(target_list) * len(sl_list)
+    combo_done = 0
 
     summary_rows: List[Dict[str, Any]] = []
 
     for sim_mode in SIMULATION_MODES:
         logger.info(">>> Mode: %s", sim_mode)
 
-        for filter_mode, apply_ma_f, apply_al_f in _strategy_mode_list():
+        for filter_mode, apply_ma_f, apply_al_f in strategy_modes:
             if apply_al_f:
                 trig_loop = _normalize_after_loss_trigger_count_list(after_loss_trigger_count_list)
                 skip_loop = _normalize_after_loss_skip_trades_list(after_loss_skip_trades_list)
@@ -910,6 +946,12 @@ def analyze_target_sl_survival(
 
                 for sl_pct in sl_list:
                     sl_ratio = sl_pct / 100.0
+                    combo_done += 1
+                    _log_scan_progress(
+                        combo_done,
+                        combo_total,
+                        f"Scanning {sim_mode} | {filter_mode} | TP={target_pct:g} | SL={sl_pct:g}",
+                    )
 
                     base_cands: Optional[Dict[int, List[Dict[str, Any]]]] = None
                     if sim_mode == "overlapping":
@@ -998,7 +1040,10 @@ def analyze_target_sl_survival(
                                             continue
 
                                         if sim_mode == "sequential_random":
-                                            side = int(bias_array[i])
+                                            if USE_DAILY_SIDE_BIAS:
+                                                side = int(daily_bias_array[i])
+                                            else:
+                                                side = int(trade_rng.choice([1, -1]))
                                         else:
                                             side = -last_side if (last_side != 0 and SEQUENTIAL_SWITCH_ON_LOSS) else 1
 
@@ -1153,7 +1198,7 @@ def save_net_expectancy_tp_sl_plot(
 
         vmin = float(group["net_expectancy_pct"].min())
         vmax = float(group["net_expectancy_pct"].max())
-        label = _safe_name(str(key))
+        label = _group_key_label(key)
 
         fig, axes = plt.subplots(
             1,

@@ -38,7 +38,7 @@ USE_AFTER_LOSS_FILTER = False
 AFTER_LOSS_TRIGGER_COUNT_LIST: List[int] = [1]
 AFTER_LOSS_SKIP_TRADES_LIST: List[Optional[int]] = [1]
 
-RANDOMIZE_ENTRY_PRICE = True
+RANDOMIZE_ENTRY_PRICE = False
 RANDOM_ENTRY_SEED = 11121212
 ENTRY_NUDGE_MAX_FRACTION = 0.02
 ENTRY_NUDGE_CLIP_TO_CANDLE = True
@@ -47,21 +47,36 @@ ENTRY_NUDGE_CLIP_TO_CANDLE = True
 # - overlapping: evaluate every eligible entry independently
 # - sequential_flip: take one trade at a time and favor the opposite side after a loss
 # - sequential_random: take one trade at a time and use a daily random side bias
+#SIMULATION_MODES = ["overlapping"]
 SIMULATION_MODES = ["sequential_random"]
 # SIMULATION_MODES = ["overlapping", "sequential_flip", "sequential_random"]
 SEQUENTIAL_SWITCH_ON_LOSS = False  # If true, prefers opposite side after a loss
 
-TRADES_PER_HOUR = 2
+TRADES_PER_HOUR = 4
 
 # Entry window filter in Malaysia time.
 # Bars inside this window are eligible to become entries.
-USE_ENTRY_TIME_WINDOW = True
+USE_ENTRY_TIME_WINDOW = False
 ENTRY_WINDOW_START_HOUR_MYT = 15
 ENTRY_WINDOW_END_HOUR_MYT = 23
-ENTRY_WINDOW_LABEL = f"{ENTRY_WINDOW_START_HOUR_MYT:02d}:00-{ENTRY_WINDOW_END_HOUR_MYT:02d}:00 MYT"
+
+def get_entry_window_label(
+    use_entry_time_window: bool = USE_ENTRY_TIME_WINDOW,
+    start_hour: int = ENTRY_WINDOW_START_HOUR_MYT,
+    end_hour: int = ENTRY_WINDOW_END_HOUR_MYT,
+) -> str:
+    if not use_entry_time_window:
+        return "24H"
+    return f"{start_hour:02d}:00-{end_hour:02d}:00 MYT"
+
+ENTRY_WINDOW_LABEL = get_entry_window_label()
 
 MYT = timezone(timedelta(hours=8), name="MYT")
 
+USE_MAE_MFE_STATS = False
+
+USE_DAILY_SIDE_BIAS = True
+DAILY_BIAS_USE_MYT_DATE = True
 
 def _default_utc_window(days_back: int = LOOKBACK_DAYS) -> tuple[str, str]:
     end_dt = datetime.now(timezone.utc).replace(microsecond=0)
@@ -88,7 +103,7 @@ INSTRUMENT_CONFIG = {
         "mt5_symbol": "UK100",
         "tp_range": {"min": 0.05, "max": 0.60, "step": 0.01},
         "sl_range": {"min": 0.05, "max": 0.60, "step": 0.01},
-        "horizon_hours_list": [12],
+        "horizon_hours_list": [24],
     },
     "AUDJPY": {
         "pair": "AUDJPY",
