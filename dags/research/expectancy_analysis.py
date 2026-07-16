@@ -1,3 +1,5 @@
+# expectancy_analysis.py
+
 from __future__ import annotations
 
 import logging
@@ -13,29 +15,29 @@ from research.expectancy_config import (
     AFTER_LOSS_TRIGGER_COUNT_LIST,
     CACHE_FILE,
     ENTRY_WINDOW_END_HOUR_MYT,
-    ENTRY_WINDOW_LABEL,
     ENTRY_WINDOW_START_HOUR_MYT,
     HORIZON_HOURS_LIST,
+    HORIZON_LABEL,
     INSTRUMENT,
     MA_PERIOD_BARS,
     MA_TYPE,
+    MIX_BUY_SELL,
     MT5_SYMBOL,
-    MYT,
     OUTPUT_DIR,
     PAIR,
     RANDOM_ENTRY_SEED,
+    LOOKBACK_DAYS,
+    get_lookback_days_list,
     RISK_PCT,
-    SEQUENTIAL_SWITCH_ON_LOSS,
-    SIMULATION_MODES,
-    TRADES_PER_HOUR,
     SL_PCT_LIST,
+    SPREAD_PCT,
     TARGET_PCT_LIST,
+    TRADES_PER_HOUR,
     USE_AFTER_LOSS_FILTER,
-    USE_ENTRY_TIME_WINDOW,
-    USE_MA_FILTER,
-    USE_MAE_MFE_STATS,
     USE_DAILY_SIDE_BIAS,
-    DAILY_BIAS_USE_MYT_DATE,
+    USE_ENTRY_TIME_WINDOW,
+    USE_MAE_MFE_STATS,
+    USE_MA_FILTER,
     _market_tag,
     _net_expectancy_risk_pct,
     _safe_name,
@@ -43,17 +45,40 @@ from research.expectancy_config import (
     sample_entry_price_nudged,
 )
 
+if USE_MAE_MFE_STATS:
+    from research.expectancy_mae_mfe import (
+        PLOT_BINS,
+        PLOT_BIN_EDGES,
+        PLOT_MAX_R,
+        ENTRY_RESET_TOL_PCT,
+        _accumulate_histograms,
+        _path_pre_resolution_excursion_stats,
+        save_mae_mfe_distribution_plots,
+        make_mae_mfe_stats,
+    )
+else:
+    PLOT_BINS = np.array([], dtype=np.float64)
+    PLOT_BIN_EDGES = np.array([], dtype=np.float64)
+    PLOT_MAX_R = 0.0
+    ENTRY_RESET_TOL_PCT = 0.0
+
+    def _accumulate_histograms(*args, **kwargs):
+        return None
+
+    def _path_pre_resolution_excursion_stats(*args, **kwargs):
+        return {"entry_revisit_mae_r": np.nan, "entry_revisit_mfe_r": np.nan}
+
+    def save_mae_mfe_distribution_plots(*args, **kwargs):
+        return []
+
+    def make_mae_mfe_stats():
+        return {}
+
 logger = logging.getLogger(__name__)
 
 MINUTE_NS = 60 * 1_000_000_000
 HOUR_NS = 60 * MINUTE_NS
 
-PLOT_BINS = 8
-ENTRY_RESET_TOL_PCT = 0.0
-PLOT_MAX_R = 2.0
-PLOT_BIN_EDGES = np.linspace(0.0, PLOT_MAX_R, PLOT_BINS + 1)
-
-PROGRESS_LOG_EVERY = 50
 
 
 def _import_plotting():
@@ -69,10 +94,6 @@ def _import_plotting():
 
     return plt, sns
 
-def _group_key_label(key: Any) -> str:
-    if isinstance(key, tuple):
-        key = "_".join(str(x) for x in key)
-    return _safe_name(str(key))
 
 def _safe_div(n: float, d: float) -> Optional[float]:
     if d == 0:
@@ -97,6 +118,7 @@ def clear_previous_outputs() -> None:
     for pattern in (
         "expectancy_scan_*.csv",
         "expectancy_heatmap_*.png",
+        "expectancy_resolved_heatmap_*.png",
         "mae_distribution_*.png",
         "mfe_distribution_*.png",
         "mae_win_distribution_*.png",
@@ -104,13 +126,22 @@ def clear_previous_outputs() -> None:
         "mfe_win_distribution_*.png",
         "mfe_loss_distribution_*.png",
     ):
-        for p in OUTPUT_DIR.glob(pattern):
+        for p in OUTPUT_DIR.rglob(pattern):
             if p.is_file():
                 try:
                     p.unlink()
                 except Exception:
                     pass
 
+def _horizon_output_dir(horizon_hours: int, lookback_days: int) -> Path:
+    from research.expectancy_config import INSTRUMENT, OUTPUT_BASE_DIR
+    out = OUTPUT_BASE_DIR / INSTRUMENT / f"lookback_{int(lookback_days)}d" / f"horizon{int(horizon_hours)}"
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+
+def _horizon_output_part(horizon_hours: int) -> str:
+    return f"horizon{int(horizon_hours)}"
 
 def _weighted_percentile_from_hist(hist: np.ndarray, percentile: float) -> Optional[float]:
     total = int(hist.sum())
@@ -131,86 +162,75 @@ def _bin_update(hist: np.ndarray, value: float) -> None:
     if 0 <= idx < hist.size:
         hist[idx] += 1
 
+
 def _log_scan_progress(done: int, total: int, label: str) -> None:
     if total <= 0:
         return
-    if done == 1 or done == total or done % PROGRESS_LOG_EVERY == 0:
+    if done == 1 or done == total or done % 50 == 0:
         pct = (done / total) * 100.0
         logger.info("%s %d/%d (%.1f%%)", label, done, total, pct)
 
-def _utc_to_myt_hours(time_ns: np.ndarray) -> np.ndarray:
-    dt_utc = pd.to_datetime(time_ns, unit="ns", utc=True)
-    dt_myt = dt_utc.tz_convert(MYT)
-    return dt_myt.hour.to_numpy(dtype=np.int8, copy=False)
 
-def _build_daily_side_bias_array(time_ns: np.ndarray, use_myt_date: bool = True) -> np.ndarray:
-    dt_utc = pd.to_datetime(time_ns, unit="ns", utc=True)
-    dates = dt_utc.tz_convert(MYT).date if use_myt_date else dt_utc.date
-
-    unique_dates = pd.Index(dates).unique()
-    rng = np.random.default_rng(RANDOM_ENTRY_SEED)
-    bias_map = {day: int(rng.choice([1, -1])) for day in unique_dates}
-
-    return np.array([bias_map[day] for day in dates], dtype=np.int8)
-
-def _entry_window_mask_fast(
-    hours: np.ndarray,
-    use_entry_time_window: bool,
-    start_hour: int,
-    end_hour: int,
-) -> np.ndarray:
-    if not use_entry_time_window or start_hour == end_hour:
-        return np.ones(len(hours), dtype=bool)
-
-    if start_hour < end_hour:
-        return (hours >= start_hour) & (hours < end_hour)
-    return (hours >= start_hour) | (hours < end_hour)
+def _parse_time_ns_array(time_ns: np.ndarray) -> pd.DatetimeIndex:
+    return pd.to_datetime(time_ns, unit="ns", utc=True)
 
 
-def _build_allowed_entry_indices(
-    time_ns: np.ndarray,
-    use_entry_time_window: bool = USE_ENTRY_TIME_WINDOW,
-    start_hour: int = ENTRY_WINDOW_START_HOUR_MYT,
-    end_hour: int = ENTRY_WINDOW_END_HOUR_MYT,
-    trades_per_hour: Optional[int] = TRADES_PER_HOUR,
-) -> set[int]:
-    if time_ns.size == 0:
-        return set()
+def _utc_hour_of(time_ns: np.ndarray) -> np.ndarray:
+    return _parse_time_ns_array(time_ns).hour.to_numpy(dtype=np.int8, copy=False)
 
-    myt_hours = _utc_to_myt_hours(time_ns)
-    entry_mask = _entry_window_mask_fast(
-        myt_hours,
-        use_entry_time_window=use_entry_time_window,
-        start_hour=start_hour,
-        end_hour=end_hour,
-    )
 
-    eligible_idx = np.flatnonzero(entry_mask)
-    if eligible_idx.size == 0:
-        return set()
+def _utc_date_of(time_ns: np.ndarray) -> np.ndarray:
+    return _parse_time_ns_array(time_ns).date
 
-    if trades_per_hour is None or int(trades_per_hour) <= 0:
-        return set(int(i) for i in eligible_idx.tolist())
+def _build_market_time_ns(time_ns: np.ndarray) -> np.ndarray:
+    if time_ns.size < 2:
+        return time_ns.astype(np.int64, copy=False)
 
-    dt_utc = pd.to_datetime(time_ns[eligible_idx], unit="ns", utc=True)
-    df_tmp = pd.DataFrame({"idx": eligible_idx, "hour_group": dt_utc.floor("h")})
+    diffs = np.diff(time_ns).astype(np.int64, copy=False)
+    positive_diffs = diffs[diffs > 0]
+    if positive_diffs.size == 0:
+        return time_ns.astype(np.int64, copy=False)
 
-    rng = np.random.default_rng(RANDOM_ENTRY_SEED)
-    selected: set[int] = set()
+    bar_ns = int(np.median(positive_diffs))
 
-    for _, grp in df_tmp.groupby("hour_group", sort=True):
-        idxs = grp["idx"].to_numpy(dtype=int, copy=False)
-        if idxs.size <= int(trades_per_hour):
-            selected.update(idxs.tolist())
-        else:
-            chosen = rng.choice(idxs, size=int(trades_per_hour), replace=False)
-            selected.update(chosen.tolist())
+    # only compress long market-closure gaps
+    gap_threshold = max(2 * HOUR_NS, bar_ns * 3)
+    closure_gaps = np.where(diffs > gap_threshold, diffs - bar_ns, 0)
 
-    return selected
+    cumulative = np.concatenate(([0], np.cumsum(closure_gaps, dtype=np.int64)))
+    return time_ns.astype(np.int64, copy=False) - cumulative
+
+
+def _effective_entry_window_label() -> str:
+    if not USE_ENTRY_TIME_WINDOW:
+        return "24H"
+    return f"{ENTRY_WINDOW_START_HOUR_MYT:02d}:00-{ENTRY_WINDOW_END_HOUR_MYT:02d}:00 MYT"
+
+
+def _group_key_label(key: Any) -> str:
+    if isinstance(key, tuple):
+        key = "_".join(str(x) for x in key)
+    return _safe_name(str(key))
+
+
+def _side_mode_list() -> list[tuple[str, Optional[int]]]:
+    if MIX_BUY_SELL:
+        return [("mixed", None)]
+    return [("buy", 1), ("sell", -1)]
+
+
+def _suffix_part(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    return f"_{_safe_name(value)}"
+
+
+def _output_window_part() -> str:
+    return _safe_name(_effective_entry_window_label())
 
 
 def _new_stats() -> Dict[str, Any]:
-    return {
+    stats = {
         "anchors_total": 0,
         "trades_taken_count": 0,
         "skipped_after_loss_count": 0,
@@ -228,25 +248,35 @@ def _new_stats() -> Dict[str, Any]:
         "forced_exit_r_sum": 0.0,
         "forced_exit_r_count": 0,
         "forced_exit_r_positive_count": 0,
-        "entry_revisit_mae_sum": 0.0,
-        "entry_revisit_mae_count": 0,
-        "entry_revisit_mfe_sum": 0.0,
-        "entry_revisit_mfe_count": 0,
-        "entry_revisit_mae_win_sum": 0.0,
-        "entry_revisit_mae_win_count": 0,
-        "entry_revisit_mae_loss_sum": 0.0,
-        "entry_revisit_mae_loss_count": 0,
-        "entry_revisit_mfe_win_sum": 0.0,
-        "entry_revisit_mfe_win_count": 0,
-        "entry_revisit_mfe_loss_sum": 0.0,
-        "entry_revisit_mfe_loss_count": 0,
-        "entry_revisit_mae_hist": np.zeros(PLOT_BINS, dtype=np.int64),
-        "entry_revisit_mfe_hist": np.zeros(PLOT_BINS, dtype=np.int64),
-        "entry_revisit_mae_win_hist": np.zeros(PLOT_BINS, dtype=np.int64),
-        "entry_revisit_mae_loss_hist": np.zeros(PLOT_BINS, dtype=np.int64),
-        "entry_revisit_mfe_win_hist": np.zeros(PLOT_BINS, dtype=np.int64),
-        "entry_revisit_mfe_loss_hist": np.zeros(PLOT_BINS, dtype=np.int64),
     }
+
+    if USE_MAE_MFE_STATS:
+        stats.update(make_mae_mfe_stats())
+    else:
+        stats.update(
+            {
+                "entry_revisit_mae_sum": 0.0,
+                "entry_revisit_mae_count": 0,
+                "entry_revisit_mfe_sum": 0.0,
+                "entry_revisit_mfe_count": 0,
+                "entry_revisit_mae_win_sum": 0.0,
+                "entry_revisit_mae_win_count": 0,
+                "entry_revisit_mae_loss_sum": 0.0,
+                "entry_revisit_mae_loss_count": 0,
+                "entry_revisit_mfe_win_sum": 0.0,
+                "entry_revisit_mfe_win_count": 0,
+                "entry_revisit_mfe_loss_sum": 0.0,
+                "entry_revisit_mfe_loss_count": 0,
+                "entry_revisit_mae_hist": np.zeros(0, dtype=np.int64),
+                "entry_revisit_mfe_hist": np.zeros(0, dtype=np.int64),
+                "entry_revisit_mae_win_hist": np.zeros(0, dtype=np.int64),
+                "entry_revisit_mae_loss_hist": np.zeros(0, dtype=np.int64),
+                "entry_revisit_mfe_win_hist": np.zeros(0, dtype=np.int64),
+                "entry_revisit_mfe_loss_hist": np.zeros(0, dtype=np.int64),
+            }
+        )
+
+    return stats
 
 
 def _compute_ma_values(close: np.ndarray) -> np.ndarray:
@@ -303,61 +333,23 @@ def _ma_pass(side: int, price: float, ma_value: float) -> bool:
         return True
     return price < ma_value if side == 1 else price > ma_value
 
-
-def _path_entry_revisit_excursion_stats(
+def _spread_adjusted_barriers(
     side: int,
     entry_price: float,
-    highs: np.ndarray,
-    lows: np.ndarray,
-    tp_ratio: float,
+    target_ratio: float,
     sl_ratio: float,
-    reset_tol_pct: float = ENTRY_RESET_TOL_PCT,
-    exclude_last_bar: bool = True,
-) -> Dict[str, float]:
-    nan_out = {"entry_revisit_mae_r": np.nan, "entry_revisit_mfe_r": np.nan, "had_reset": False}
-
-    if not np.isfinite(entry_price) or entry_price <= 0.0:
-        return nan_out
-    if highs.size < 2 or lows.size < 2:
-        return nan_out
-
-    if exclude_last_bar and highs.size > 1 and lows.size > 1:
-        highs = highs[:-1]
-        lows = lows[:-1]
-
-    if highs.size == 0 or lows.size == 0:
-        return nan_out
-
-    eligible_mae_raw: List[float] = []
-    eligible_mfe_raw: List[float] = []
-
-    for i in range(len(highs)):
-        if side == 1:
-            reset_level = entry_price * (1.0 - reset_tol_pct)
-            has_reset = bool(np.any(highs[i:] >= reset_level))
-            current_mae_raw = entry_price - float(lows[i])
-            current_mfe_raw = float(highs[i]) - entry_price
-        else:
-            reset_level = entry_price * (1.0 + reset_tol_pct)
-            has_reset = bool(np.any(lows[i:] <= reset_level))
-            current_mae_raw = float(highs[i]) - entry_price
-            current_mfe_raw = entry_price - float(lows[i])
-
-        if has_reset:
-            eligible_mae_raw.append(max(0.0, current_mae_raw))
-            eligible_mfe_raw.append(max(0.0, current_mfe_raw))
-
-    if not eligible_mae_raw:
-        return nan_out
-
-    entry_revisit_mae_r = float((max(eligible_mae_raw) / entry_price) / sl_ratio) if sl_ratio > 0 else np.nan
-    entry_revisit_mfe_r = float((max(eligible_mfe_raw) / entry_price) / tp_ratio) if tp_ratio > 0 else np.nan
-
-    return {
-        "entry_revisit_mae_r": entry_revisit_mae_r,
-        "entry_revisit_mfe_r": entry_revisit_mfe_r,
-        "had_reset": True,
-    }
+    spread_pct: float,
+) -> tuple[float, float]:
+    # CONVERT spread_pct (0.007) to a ratio (0.00007)
+    spread_ratio = float(spread_pct) / 100.0 
+    
+    if side == 1:
+        target_price = entry_price * (1.0 + target_ratio + spread_ratio)
+        sl_price = entry_price * (1.0 - sl_ratio + spread_ratio)
+    else:
+        target_price = entry_price * (1.0 - target_ratio - spread_ratio)
+        sl_price = entry_price * (1.0 + sl_ratio - spread_ratio)
+    return target_price, sl_price
 
 
 def load_df_from_cache(cache_file: Path = CACHE_FILE) -> pl.DataFrame:
@@ -415,16 +407,161 @@ def _strategy_mode_list() -> List[tuple[str, bool, bool]]:
         out.append(("ma_after_loss", True, True))
     return out
 
-
 def _group_keys_from_df(summary_df: pd.DataFrame) -> List[str]:
     keys: List[str] = ["filter_mode"]
-    if "sim_mode" in summary_df.columns and summary_df["sim_mode"].nunique(dropna=True) > 1:
-        keys.append("sim_mode")
+    if "side_mode" in summary_df.columns and summary_df["side_mode"].nunique(dropna=True) > 1:
+        keys.append("side_mode")
+    if "vol_category" in summary_df.columns and summary_df["vol_category"].nunique(dropna=True) > 1:
+        keys.append("vol_category")
     return keys
+
+
+def _build_allowed_entry_indices(
+    time_ns: np.ndarray,
+    use_entry_time_window: bool = USE_ENTRY_TIME_WINDOW,
+    start_hour: int = ENTRY_WINDOW_START_HOUR_MYT,
+    end_hour: int = ENTRY_WINDOW_END_HOUR_MYT,
+    trades_per_hour: Optional[int] = TRADES_PER_HOUR,
+) -> set[int]:
+    if time_ns.size == 0:
+        return set()
+
+    hours_utc = _utc_hour_of(time_ns)
+    if not use_entry_time_window or start_hour == end_hour:
+        entry_mask = np.ones(len(hours_utc), dtype=bool)
+    elif start_hour < end_hour:
+        entry_mask = (hours_utc >= start_hour) & (hours_utc < end_hour)
+    else:
+        entry_mask = (hours_utc >= start_hour) | (hours_utc < end_hour)
+
+    eligible_idx = np.flatnonzero(entry_mask)
+    if eligible_idx.size == 0:
+        return set()
+
+    if trades_per_hour is None or int(trades_per_hour) <= 0:
+        return set(int(i) for i in eligible_idx.tolist())
+
+    dt_utc = pd.to_datetime(time_ns[eligible_idx], unit="ns", utc=True)
+    df_tmp = pd.DataFrame({"idx": eligible_idx, "hour_group": dt_utc.floor("h")})
+
+    rng = np.random.default_rng(RANDOM_ENTRY_SEED)
+    selected: set[int] = set()
+
+    for _, grp in df_tmp.groupby("hour_group", sort=True):
+        idxs = grp["idx"].to_numpy(dtype=int, copy=False)
+        if idxs.size <= int(trades_per_hour):
+            selected.update(idxs.tolist())
+        else:
+            chosen = rng.choice(idxs, size=int(trades_per_hour), replace=False)
+            selected.update(chosen.tolist())
+
+    return selected
+
+
+def save_net_expectancy_tp_sl_plot(
+    summary_df: pd.DataFrame,
+    instrument: str,
+    pair: str,
+    symbol: str,
+    lookback_days: int = LOOKBACK_DAYS,
+) -> List[Path]:
+    plt, sns = _import_plotting()
+    if summary_df.empty:
+        return []
+
+    market = _market_tag(instrument, pair, symbol)
+    saved: List[Path] = []
+
+    if "filter_mode" not in summary_df.columns:
+        return []
+
+    group_keys = _group_keys_from_df(summary_df)
+    groups = [(k, g.copy()) for k, g in summary_df.groupby(group_keys, sort=True)] if group_keys else [("ALL", summary_df.copy())]
+
+    metric_specs = [
+        ("net_expectancy_pct", "Net expectancy (%)", "expectancy_heatmap"),
+        ("expectancy_resolved_pct", "Resolved expectancy (%)", "expectancy_resolved_heatmap"),
+    ]
+
+    for key, group in groups:
+        if group.empty:
+            continue
+
+        label = _group_key_label(key)
+
+        for h in sorted(group["horizon_hours"].dropna().unique().tolist()):
+            sub_h = group[group["horizon_hours"] == h].copy()
+            if sub_h.empty:
+                continue
+
+            for metric_col, colorbar_label, file_prefix in metric_specs:
+                if metric_col not in sub_h.columns:
+                    continue
+
+                metric_df = sub_h[sub_h[metric_col].notna()].copy()
+                if metric_df.empty:
+                    continue
+
+                pivot = (
+                    metric_df.pivot_table(
+                        index="sl_pct",
+                        columns="target_pct",
+                        values=metric_col,
+                        aggfunc="mean",
+                    )
+                    .sort_index(ascending=False)
+                )
+
+                if pivot.empty:
+                    continue
+
+                vmin = float(np.nanmin(pivot.to_numpy(dtype=float)))
+                vmax = float(np.nanmax(pivot.to_numpy(dtype=float)))
+
+                fig, ax = plt.subplots(figsize=(7.5, 6.5), constrained_layout=True)
+
+                if sns is not None:
+                    hm = sns.heatmap(
+                        pivot,
+                        ax=ax,
+                        cmap="viridis",
+                        vmin=vmin,
+                        vmax=vmax,
+                        annot=False,
+                        linewidths=0.5,
+                        linecolor="white",
+                        cbar=False,
+                        square=True,
+                    )
+                    mappable = hm.collections[0] if getattr(hm, "collections", None) else hm
+                else:
+                    data = pivot.to_numpy(dtype=float)
+                    mappable = ax.imshow(data, aspect="auto", origin="upper", vmin=vmin, vmax=vmax, cmap="viridis")
+                    ax.set_xticks(np.arange(len(pivot.columns)))
+                    ax.set_xticklabels([f"{x:g}" for x in pivot.columns], rotation=0, fontsize=8)
+                    ax.set_yticks(np.arange(len(pivot.index)))
+                    ax.set_yticklabels([f"{x:g}" for x in pivot.index], rotation=0, fontsize=8)
+
+                ax.set_title(f"{market} | {key} | {int(h)}h", fontsize=12, pad=10)
+                ax.set_xlabel("Target %")
+                ax.set_ylabel("SL %")
+                ax.tick_params(axis="x", labelrotation=0, labelsize=8)
+                ax.tick_params(axis="y", labelrotation=0, labelsize=8)
+                fig.colorbar(mappable, ax=ax, shrink=0.9, pad=0.02, label=colorbar_label)
+
+                out_dir = _horizon_output_dir(int(h), lookback_days)
+                out = out_dir / f"{file_prefix}_{market}_{label}.png"
+                _save_figure(fig, out)
+                plt.close(fig)
+                saved.append(out)
+
+    return saved
+
 
 
 def _build_trade_candidates(
     time_ns: np.ndarray,
+    market_time_ns: np.ndarray,
     open_px: np.ndarray,
     high: np.ndarray,
     low: np.ndarray,
@@ -435,15 +572,27 @@ def _build_trade_candidates(
     sl_ratio: float,
     apply_ma_filter: bool,
     conservative_sl_first: bool,
+    allowed_anchor_mask: Optional[np.ndarray] = None,
+    spread_pct: float = 0.0,
 ) -> Dict[int, List[Dict[str, Any]]]:
     n = int(close.shape[0])
     candidates_by_side: Dict[int, List[Dict[str, Any]]] = {1: [], -1: []}
+    need_mae_mfe = USE_MAE_MFE_STATS
 
     horizon_end_by_h: Dict[int, np.ndarray] = {}
     for h in horizons:
-        horizon_end_by_h[h] = np.searchsorted(time_ns, time_ns + np.int64(h * HOUR_NS), side="right")
+        horizon_end_by_h[h] = np.searchsorted(
+            market_time_ns,
+            market_time_ns + np.int64(h * HOUR_NS),
+            side="right",
+        )
 
     for anchor_idx in range(n - 1):
+        if allowed_anchor_mask is not None and (
+            anchor_idx >= len(allowed_anchor_mask) or not bool(allowed_anchor_mask[anchor_idx])
+        ):
+            continue
+
         anchor_price = sample_entry_price_nudged(
             open_px=float(open_px[anchor_idx]),
             high_px=float(high[anchor_idx]),
@@ -455,7 +604,6 @@ def _build_trade_candidates(
             continue
 
         ma_value = float(ma_values[anchor_idx]) if anchor_idx < len(ma_values) else np.nan
-
         future_high_full = high[anchor_idx + 1 :]
         future_low_full = low[anchor_idx + 1 :]
         future_time_full = time_ns[anchor_idx + 1 :]
@@ -463,6 +611,14 @@ def _build_trade_candidates(
         for side in (1, -1):
             if apply_ma_filter and not _ma_pass(side, anchor_price, ma_value):
                 continue
+
+            target_price, sl_price = _spread_adjusted_barriers(
+                side=side,
+                entry_price=anchor_price,
+                target_ratio=target_ratio,
+                sl_ratio=sl_ratio,
+                spread_pct=spread_pct,
+            )
 
             for h in horizons:
                 sidx = int(horizon_end_by_h[h][anchor_idx])
@@ -478,13 +634,9 @@ def _build_trade_candidates(
                 future_time_local = future_time_full[:local_len]
 
                 if side == 1:
-                    target_price = anchor_price * (1.0 + target_ratio)
-                    sl_price = anchor_price * (1.0 - sl_ratio)
                     target_hits = np.flatnonzero(future_high_local >= target_price)
                     sl_hits = np.flatnonzero(future_low_local <= sl_price)
                 else:
-                    target_price = anchor_price * (1.0 - target_ratio)
-                    sl_price = anchor_price * (1.0 + sl_ratio)
                     target_hits = np.flatnonzero(future_low_local <= target_price)
                     sl_hits = np.flatnonzero(future_high_local >= sl_price)
 
@@ -508,9 +660,11 @@ def _build_trade_candidates(
                     target_first_then_sl = False
                     target_min = None
                     sl_min = None
-                    first_event_min = None
-                    path_highs = future_high_local[: exit_idx + 1]
-                    path_lows = future_low_local[: exit_idx + 1]
+                    # holding time = full horizon in 5m candles -> minutes
+                    first_event_min = float(local_len * 5.0)
+                    exit_idx = local_len - 1
+                    path_highs = future_high_local[: exit_idx + 1] if need_mae_mfe else None
+                    path_lows = future_low_local[: exit_idx + 1] if need_mae_mfe else None
                 else:
                     if target_in and sl_in:
                         if target_rel < sl_rel:
@@ -540,28 +694,22 @@ def _build_trade_candidates(
 
                     forced_exit_r = None
                     exit_idx = int(first_rel)
-                    path_highs = future_high_local[: exit_idx + 1]
-                    path_lows = future_low_local[: exit_idx + 1]
+                    path_highs = future_high_local[: exit_idx + 1] if need_mae_mfe else None
+                    path_lows = future_low_local[: exit_idx + 1] if need_mae_mfe else None
 
-                if USE_MAE_MFE_STATS:
-                    entry_revisit_stats = _path_entry_revisit_excursion_stats(
+                if need_mae_mfe:
+                    entry_revisit_stats = _path_pre_resolution_excursion_stats(
                         side=side,
                         entry_price=anchor_price,
                         highs=np.asarray(path_highs, dtype=np.float64),
                         lows=np.asarray(path_lows, dtype=np.float64),
                         tp_ratio=target_ratio,
                         sl_ratio=sl_ratio,
-                        reset_tol_pct=ENTRY_RESET_TOL_PCT,
-                        exclude_last_bar=(trade_result in {"target", "sl"}),
                     )
                     entry_revisit_mae_r = entry_revisit_stats["entry_revisit_mae_r"]
                     entry_revisit_mfe_r = entry_revisit_stats["entry_revisit_mfe_r"]
-                else:
-                    entry_revisit_mae_r = np.nan
-                    entry_revisit_mfe_r = np.nan
 
-                candidates_by_side[side].append(
-                    {
+                    candidate = {
                         "anchor_idx": int(anchor_idx),
                         "horizon_hours": int(h),
                         "side": int(side),
@@ -575,7 +723,21 @@ def _build_trade_candidates(
                         "entry_revisit_mae_r": float(entry_revisit_mae_r) if np.isfinite(entry_revisit_mae_r) else np.nan,
                         "entry_revisit_mfe_r": float(entry_revisit_mfe_r) if np.isfinite(entry_revisit_mfe_r) else np.nan,
                     }
-                )
+                else:
+                    candidate = {
+                        "anchor_idx": int(anchor_idx),
+                        "horizon_hours": int(h),
+                        "side": int(side),
+                        "result": trade_result,
+                        "target_first": bool(target_first),
+                        "target_first_then_sl": bool(target_first_then_sl),
+                        "target_minutes": None if target_min is None else float(target_min),
+                        "sl_minutes": None if sl_min is None else float(sl_min),
+                        "first_event_minutes": None if first_event_min is None else float(first_event_min),
+                        "forced_exit_r": None if forced_exit_r is None else float(forced_exit_r),
+                    }
+
+                candidates_by_side[side].append(candidate)
 
     for side in (1, -1):
         candidates_by_side[side].sort(key=lambda x: (x["anchor_idx"], x["horizon_hours"]))
@@ -621,42 +783,36 @@ def _apply_after_loss_policy(
 
 
 def _update_stats_from_dict(s: Dict[str, Any], c: Dict[str, Any], sl_ratio: float) -> None:
-    s["anchors_total"] += 1
     s["trades_taken_count"] += 1
-
-    if c.get("skipped_after_loss"):
-        s["skipped_after_loss_count"] += 1
-    if c.get("trigger_fired"):
-        s["loss_streak_trigger_count"] += 1
-
     res = c["result"]
+
     if res == "target":
         s["target_first_count"] += 1
         if c.get("target_first_then_sl"):
             s["target_first_then_sl_count"] += 1
-        val = c.get("target_minutes")
-        if val is not None:
-            s["target_minutes_sum"] += val
+        if c.get("target_minutes") is not None:
+            s["target_minutes_sum"] += c["target_minutes"]
             s["target_minutes_count"] += 1
     elif res == "sl":
         s["sl_first_count"] += 1
-        val = c.get("sl_minutes")
-        if val is not None:
-            s["sl_minutes_sum"] += val
+        if c.get("sl_minutes") is not None:
+            s["sl_minutes_sum"] += c["sl_minutes"]
             s["sl_minutes_count"] += 1
     else:
         s["censored_count"] += 1
-        val = c.get("forced_exit_r")
-        if val is not None:
-            s["forced_exit_r_sum"] += val
+        if c.get("forced_exit_r") is not None:
+            s["forced_exit_r_sum"] += c["forced_exit_r"]
             s["forced_exit_r_count"] += 1
-            if val > 0:
+            if c["forced_exit_r"] > 0:
                 s["forced_exit_r_positive_count"] += 1
 
-    val_first = c.get("first_event_minutes")
-    if val_first is not None:
-        s["first_event_minutes_sum"] += val_first
+    # record holding time for every trade
+    if c.get("first_event_minutes") is not None:
+        s["first_event_minutes_sum"] += c["first_event_minutes"]
         s["first_event_minutes_count"] += 1
+
+    if not USE_MAE_MFE_STATS:
+        return
 
     mae_r = c.get("entry_revisit_mae_r")
     mfe_r = c.get("entry_revisit_mfe_r")
@@ -697,6 +853,7 @@ def _update_stats_sequential(
     res: str,
     exit_idx: int,
     time_ns: np.ndarray,
+    market_time_ns: np.ndarray,
     high: np.ndarray,
     low: np.ndarray,
     close: np.ndarray,
@@ -708,40 +865,40 @@ def _update_stats_sequential(
 
     entry_idx = trade["entry_idx"]
 
-    path_highs = high[entry_idx + 1 : exit_idx + 1]
-    path_lows = low[entry_idx + 1 : exit_idx + 1]
+    dur = (time_ns[exit_idx] - trade["entry_ns"]) / MINUTE_NS
+    s["first_event_minutes_sum"] += dur
+    s["first_event_minutes_count"] += 1
 
     if USE_MAE_MFE_STATS:
-        revisit = _path_entry_revisit_excursion_stats(
+        path_highs = high[entry_idx + 1 : exit_idx + 1]
+        path_lows = low[entry_idx + 1 : exit_idx + 1]
+
+        revisit = _path_pre_resolution_excursion_stats(
             side=trade["side"],
             entry_price=trade["entry_px"],
             highs=path_highs,
             lows=path_lows,
             tp_ratio=tp_ratio,
             sl_ratio=sl_ratio,
-            exclude_last_bar=(res in {"target", "sl"}),
         )
         mae_r = revisit["entry_revisit_mae_r"]
         mfe_r = revisit["entry_revisit_mfe_r"]
+
+
+        if np.isfinite(mae_r):
+            _bin_update(s["entry_revisit_mae_hist"], mae_r)
+            s["entry_revisit_mae_sum"] += mae_r
+            s["entry_revisit_mae_count"] += 1
+        if np.isfinite(mfe_r):
+            _bin_update(s["entry_revisit_mfe_hist"], mfe_r)
+            s["entry_revisit_mfe_sum"] += mfe_r
+            s["entry_revisit_mfe_count"] += 1
     else:
         mae_r = np.nan
         mfe_r = np.nan
 
-    if np.isfinite(mae_r):
-        _bin_update(s["entry_revisit_mae_hist"], mae_r)
-        s["entry_revisit_mae_sum"] += mae_r
-        s["entry_revisit_mae_count"] += 1
-    if np.isfinite(mfe_r):
-        _bin_update(s["entry_revisit_mfe_hist"], mfe_r)
-        s["entry_revisit_mfe_sum"] += mfe_r
-        s["entry_revisit_mfe_count"] += 1
-
-    dur = (time_ns[exit_idx] - trade["entry_ns"]) / MINUTE_NS
-    s["first_event_minutes_sum"] += dur
-    s["first_event_minutes_count"] += 1
-
     if res == "target":
-        future_end = int(np.searchsorted(time_ns, trade["exp"], side="left"))
+        future_end = int(np.searchsorted(market_time_ns, trade["market_exp"], side="left"))
         if future_end > exit_idx + 1:
             if trade["side"] == 1:
                 later_sl = bool(np.any(low[exit_idx + 1 : future_end] <= trade["sl"]))
@@ -758,35 +915,37 @@ def _update_stats_sequential(
         s["target_minutes_sum"] += dur
         s["target_minutes_count"] += 1
 
-        if np.isfinite(mae_r):
-            _bin_update(s["entry_revisit_mae_win_hist"], mae_r)
-            s["entry_revisit_mae_win_sum"] += mae_r
-            s["entry_revisit_mae_win_count"] += 1
-        if np.isfinite(mfe_r):
-            _bin_update(s["entry_revisit_mfe_win_hist"], mfe_r)
-            s["entry_revisit_mfe_win_sum"] += mfe_r
-            s["entry_revisit_mfe_win_count"] += 1
+        if USE_MAE_MFE_STATS:
+            if np.isfinite(mae_r):
+                _bin_update(s["entry_revisit_mae_win_hist"], mae_r)
+                s["entry_revisit_mae_win_sum"] += mae_r
+                s["entry_revisit_mae_win_count"] += 1
+            if np.isfinite(mfe_r):
+                _bin_update(s["entry_revisit_mfe_win_hist"], mfe_r)
+                s["entry_revisit_mfe_win_sum"] += mfe_r
+                s["entry_revisit_mfe_win_count"] += 1
 
     elif res == "sl":
         s["sl_first_count"] += 1
         s["sl_minutes_sum"] += dur
         s["sl_minutes_count"] += 1
 
-        if np.isfinite(mae_r):
-            _bin_update(s["entry_revisit_mae_loss_hist"], mae_r)
-            s["entry_revisit_mae_loss_sum"] += mae_r
-            s["entry_revisit_mae_loss_count"] += 1
-        if np.isfinite(mfe_r):
-            _bin_update(s["entry_revisit_mfe_loss_hist"], mfe_r)
-            s["entry_revisit_mfe_loss_sum"] += mfe_r
-            s["entry_revisit_mfe_loss_count"] += 1
+        if USE_MAE_MFE_STATS:
+            if np.isfinite(mae_r):
+                _bin_update(s["entry_revisit_mae_loss_hist"], mae_r)
+                s["entry_revisit_mae_loss_sum"] += mae_r
+                s["entry_revisit_mae_loss_count"] += 1
+            if np.isfinite(mfe_r):
+                _bin_update(s["entry_revisit_mfe_loss_hist"], mfe_r)
+                s["entry_revisit_mfe_loss_sum"] += mfe_r
+                s["entry_revisit_mfe_loss_count"] += 1
 
     else:
         s["censored_count"] += 1
         pnl = (
             (close[exit_idx] - trade["entry_px"]) / trade["entry_px"]
             if trade["side"] == 1
-            else ((trade["entry_px"] - close[exit_idx]) / trade["entry_px"])
+            else (trade["entry_px"] - close[exit_idx]) / trade["entry_px"]
         )
         forced_exit_r = pnl / sl_ratio
         s["forced_exit_r_sum"] += forced_exit_r
@@ -794,9 +953,6 @@ def _update_stats_sequential(
         if forced_exit_r > 0:
             s["forced_exit_r_positive_count"] += 1
 
-    if trade.get("first_event_minutes") is not None:
-        s["first_event_minutes_sum"] += float(trade["first_event_minutes"])
-        s["first_event_minutes_count"] += 1
 
 
 def _finalize_row(
@@ -807,41 +963,66 @@ def _finalize_row(
     mode: str,
     tp: float,
     sl: float,
+    spread_pct: float,
     h: int,
     trig: Optional[int],
     skip: Optional[int],
     sim_mode: str,
-    entry_window_start_hour: int,
-    entry_window_end_hour: int,
-    use_entry_time_window: bool,
+    side_mode: str,
+    lookback_days: int = LOOKBACK_DAYS,
 ) -> Dict[str, Any]:
+
     taken = s["trades_taken_count"] or 1
     t_count = s["target_first_count"]
     s_count = s["sl_first_count"]
-    net_expectancy = _net_expectancy_risk_pct(
-        (t_count / taken) * 100.0,
-        tp,
-        (s_count / taken) * 100.0,
-        sl,
-        RISK_PCT,
+    resolved_count = t_count + s_count
+    censored_count = int(s["censored_count"])
+
+    resolved_expectancy_pct = np.nan
+    if resolved_count > 0:
+        resolved_expectancy_pct = _net_expectancy_risk_pct(
+            (t_count / resolved_count) * 100.0,
+            tp,
+            (s_count / resolved_count) * 100.0,
+            sl,
+            RISK_PCT,
+            spread_pct=0.0,
+        )
+
+    resolved_rate = resolved_count / taken
+    expectancy_resolved_pct = (
+        float(resolved_expectancy_pct) * resolved_rate
+        if np.isfinite(resolved_expectancy_pct)
+        else np.nan
     )
 
-    return {
+    forced_exit_r_mean = _safe_div(s["forced_exit_r_sum"], s["forced_exit_r_count"])
+    forced_exit_rate = censored_count / taken
+    spread_cost_pct = (float(spread_pct) / float(sl)) * (RISK_PCT * 100.0) if sl > 0 and spread_pct > 0 else 0.0
+
+    net_expectancy = expectancy_resolved_pct if np.isfinite(expectancy_resolved_pct) else 0.0
+    if forced_exit_r_mean is not None and np.isfinite(forced_exit_r_mean):
+        net_expectancy += forced_exit_rate * ((forced_exit_r_mean * RISK_PCT * 100.0) - spread_cost_pct)
+
+    avg_holding_time_minutes = _safe_div(s["first_event_minutes_sum"], s["first_event_minutes_count"])
+    avg_holding_time = _safe_div(avg_holding_time_minutes, 5.0) if avg_holding_time_minutes is not None else None
+    net_expectancy_rate = _safe_div(net_expectancy, avg_holding_time) if avg_holding_time is not None else None
+
+    row = {
         "instrument": instr,
         "source_symbol": sym,
         "pair": pair,
+        "lookback_d": int(lookback_days),
         "filter_mode": mode,
         "sim_mode": sim_mode,
-        "use_entry_time_window": bool(use_entry_time_window),
-        "entry_window_start_hour": int(entry_window_start_hour),
-        "entry_window_end_hour": int(entry_window_end_hour),
-        "entry_window_label": (
-            "24H"
-            if not use_entry_time_window
-            else f"{entry_window_start_hour:02d}:00-{entry_window_end_hour:02d}:00 MYT"
-        ),
+        "side_mode": side_mode,
+        "use_entry_time_window": bool(USE_ENTRY_TIME_WINDOW),
+        "entry_window_start_hour": int(ENTRY_WINDOW_START_HOUR_MYT),
+        "entry_window_end_hour": int(ENTRY_WINDOW_END_HOUR_MYT),
+        "entry_window_label": _effective_entry_window_label(),
         "target_pct": float(tp),
         "sl_pct": float(sl),
+        "spread_pct": float(spread_pct),
         "horizon_hours": int(h),
         "after_loss_trigger_count": trig,
         "after_loss_skip_trades": skip,
@@ -851,30 +1032,45 @@ def _finalize_row(
         "loss_streak_trigger_count": int(s["loss_streak_trigger_count"]),
         "target_first_count": int(t_count),
         "sl_first_count": int(s_count),
-        "censored_count": int(s["censored_count"]),
+        "censored_count": censored_count,
         "target_first_then_sl_count": int(s["target_first_then_sl_count"]),
+        "resolved_trades_count": int(resolved_count),
+        "resolved_trades_pct": resolved_rate * 100.0,
+        "censored_trades_pct": forced_exit_rate * 100.0,
         "target_first_rate_pct": (t_count / taken) * 100.0,
         "sl_first_rate_pct": (s_count / taken) * 100.0,
+        "expectancy_resolved_pct": float(expectancy_resolved_pct),
         "net_expectancy_pct": float(net_expectancy),
-        "net_expectancy_risk_pct": float(net_expectancy),
+        "net_expectancy_rate": np.nan if net_expectancy_rate is None else float(net_expectancy_rate),
+        "avg_holding_time": np.nan if avg_holding_time is None else float(avg_holding_time),
         "target_minutes_mean": _safe_div(s["target_minutes_sum"], s["target_minutes_count"]),
         "sl_minutes_mean": _safe_div(s["sl_minutes_sum"], s["sl_minutes_count"]),
-        "first_event_minutes_mean": _safe_div(s["first_event_minutes_sum"], s["first_event_minutes_count"]),
-        "forced_exit_r_mean": _safe_div(s["forced_exit_r_sum"], s["forced_exit_r_count"]),
+        "first_event_minutes_mean": avg_holding_time_minutes,
+        "forced_exit_r_mean": np.nan if forced_exit_r_mean is None else float(forced_exit_r_mean),
         "forced_exit_r_positive_count": int(s["forced_exit_r_positive_count"]),
-        "mae_r_mean": _safe_div(s["entry_revisit_mae_sum"], s["entry_revisit_mae_count"]),
-        "mfe_r_mean": _safe_div(s["entry_revisit_mfe_sum"], s["entry_revisit_mfe_count"]),
-        "mae_r_win_mean": _safe_div(s["entry_revisit_mae_win_sum"], s["entry_revisit_mae_win_count"]),
-        "mae_r_loss_mean": _safe_div(s["entry_revisit_mae_loss_sum"], s["entry_revisit_mae_loss_count"]),
-        "mfe_r_win_mean": _safe_div(s["entry_revisit_mfe_win_sum"], s["entry_revisit_mfe_win_count"]),
-        "mfe_r_loss_mean": _safe_div(s["entry_revisit_mfe_loss_sum"], s["entry_revisit_mfe_loss_count"]),
-        "entry_revisit_mae_hist": s["entry_revisit_mae_hist"].tolist(),
-        "entry_revisit_mfe_hist": s["entry_revisit_mfe_hist"].tolist(),
-        "entry_revisit_mae_win_hist": s["entry_revisit_mae_win_hist"].tolist(),
-        "entry_revisit_mae_loss_hist": s["entry_revisit_mae_loss_hist"].tolist(),
-        "entry_revisit_mfe_win_hist": s["entry_revisit_mfe_win_hist"].tolist(),
-        "entry_revisit_mfe_loss_hist": s["entry_revisit_mfe_loss_hist"].tolist(),
     }
+
+    if USE_MAE_MFE_STATS:
+        row.update(
+            {
+                "mae_r_mean": _safe_div(s["entry_revisit_mae_sum"], s["entry_revisit_mae_count"]),
+                "mfe_r_mean": _safe_div(s["entry_revisit_mfe_sum"], s["entry_revisit_mfe_count"]),
+                "mae_r_win_mean": _safe_div(s["entry_revisit_mae_win_sum"], s["entry_revisit_mae_win_count"]),
+                "mae_r_loss_mean": _safe_div(s["entry_revisit_mae_loss_sum"], s["entry_revisit_mae_loss_count"]),
+                "mfe_r_win_mean": _safe_div(s["entry_revisit_mfe_win_sum"], s["entry_revisit_mfe_win_count"]),
+                "mfe_r_loss_mean": _safe_div(s["entry_revisit_mfe_loss_sum"], s["entry_revisit_mfe_loss_count"]),
+                "entry_revisit_mae_hist": s["entry_revisit_mae_hist"].tolist(),
+                "entry_revisit_mfe_hist": s["entry_revisit_mfe_hist"].tolist(),
+                "entry_revisit_mae_win_hist": s["entry_revisit_mae_win_hist"].tolist(),
+                "entry_revisit_mae_loss_hist": s["entry_revisit_mae_loss_hist"].tolist(),
+                "entry_revisit_mfe_win_hist": s["entry_revisit_mfe_win_hist"].tolist(),
+                "entry_revisit_mfe_loss_hist": s["entry_revisit_mfe_loss_hist"].tolist(),
+            }
+        )
+
+    return row
+
+
 
 
 def analyze_target_sl_survival(
@@ -893,26 +1089,27 @@ def analyze_target_sl_survival(
     use_after_loss_filter: bool = USE_AFTER_LOSS_FILTER,
     after_loss_trigger_count_list: Optional[Sequence[int]] = AFTER_LOSS_TRIGGER_COUNT_LIST,
     after_loss_skip_trades_list: Optional[Sequence[Optional[int]]] = AFTER_LOSS_SKIP_TRADES_LIST,
+    use_daily_side_bias: bool = USE_DAILY_SIDE_BIAS,
+    use_utc_for_bias: bool = True,
+    spread_pct: float = SPREAD_PCT,
+    lookback_days: int = LOOKBACK_DAYS,
 ) -> pd.DataFrame:
     if df.is_empty():
         return pd.DataFrame()
+
+    from research.expectancy_config import SIMULATION_MODES
 
     time_ns = df.get_column("time_ns").to_numpy()
     open_px = df.get_column("open").to_numpy()
     high = df.get_column("high").to_numpy()
     low = df.get_column("low").to_numpy()
     close = df.get_column("close").to_numpy()
-    n = len(close)
-
     ma_values = _compute_ma_values(close)
-    trade_rng = np.random.default_rng(RANDOM_ENTRY_SEED)
-    daily_bias_array = (
-        _build_daily_side_bias_array(time_ns, use_myt_date=DAILY_BIAS_USE_MYT_DATE)
-        if USE_DAILY_SIDE_BIAS
-        else None
-    )
+    n = int(close.shape[0])
 
-    allowed_entry_indices = _build_allowed_entry_indices(
+    rng = np.random.default_rng(RANDOM_ENTRY_SEED)
+
+    valid_entry_indices = _build_allowed_entry_indices(
         time_ns=time_ns,
         use_entry_time_window=use_entry_time_window,
         start_hour=entry_window_start_hour,
@@ -920,166 +1117,207 @@ def analyze_target_sl_survival(
         trades_per_hour=trades_per_hour,
     )
 
+    valid_entry_mask = np.zeros(n, dtype=bool)
+    if valid_entry_indices:
+        idx_arr = np.fromiter(valid_entry_indices, dtype=np.int64, count=len(valid_entry_indices))
+        idx_arr = idx_arr[(idx_arr >= 0) & (idx_arr < n)]
+        valid_entry_mask[idx_arr] = True
+
+    dt_utc = pd.to_datetime(time_ns, unit="ns", utc=True)
+    date_series = dt_utc.date
+    if use_daily_side_bias:
+        bias_dates = date_series if use_utc_for_bias else date_series
+        unique_days = pd.Index(bias_dates).unique()
+        daily_bias_map = {day: int(rng.choice([1, -1])) for day in unique_days}
+        bias_array = np.array([daily_bias_map[day] for day in bias_dates], dtype=np.int8)
+    else:
+        bias_array = None
+
     horizons = sorted({int(h) for h in horizon_hours_list if int(h) > 0})
     target_list = sorted({float(x) for x in target_pct_list if float(x) > 0.0})
     sl_list = sorted({float(x) for x in sl_pct_list if float(x) > 0.0})
-    strategy_modes = _strategy_mode_list()
-
-    combo_total = len(SIMULATION_MODES) * len(strategy_modes) * len(target_list) * len(sl_list)
-    combo_done = 0
 
     summary_rows: List[Dict[str, Any]] = []
 
-    for sim_mode in SIMULATION_MODES:
-        logger.info(">>> Mode: %s", sim_mode)
+    market_time_ns = _build_market_time_ns(time_ns)
 
-        for filter_mode, apply_ma_f, apply_al_f in strategy_modes:
-            if apply_al_f:
-                trig_loop = _normalize_after_loss_trigger_count_list(after_loss_trigger_count_list)
-                skip_loop = _normalize_after_loss_skip_trades_list(after_loss_skip_trades_list)
-            else:
-                trig_loop = [None]
-                skip_loop = [None]
+    for side_mode, fixed_side in _side_mode_list():
+        logger.info(">>> Side mode: %s", side_mode)
 
-            for target_pct in target_list:
-                t_ratio = target_pct / 100.0
+        for sim_mode in SIMULATION_MODES:
+            logger.info(">>> Mode: %s", sim_mode)
 
-                for sl_pct in sl_list:
-                    sl_ratio = sl_pct / 100.0
-                    combo_done += 1
-                    _log_scan_progress(
-                        combo_done,
-                        combo_total,
-                        f"Scanning {sim_mode} | {filter_mode} | TP={target_pct:g} | SL={sl_pct:g}",
-                    )
+            for filter_mode, apply_ma_f, apply_al_f in _strategy_mode_list():
+                trig_loop = _normalize_after_loss_trigger_count_list(after_loss_trigger_count_list) if apply_al_f else [None]
+                skip_loop = _normalize_after_loss_skip_trades_list(after_loss_skip_trades_list) if apply_al_f else [None]
 
-                    base_cands: Optional[Dict[int, List[Dict[str, Any]]]] = None
-                    if sim_mode == "overlapping":
-                        base_cands = _build_trade_candidates(
-                            time_ns=time_ns,
-                            open_px=open_px,
-                            high=high,
-                            low=low,
-                            close=close,
-                            ma_values=ma_values,
-                            horizons=horizons,
-                            target_ratio=t_ratio,
-                            sl_ratio=sl_ratio,
-                            apply_ma_filter=apply_ma_f,
-                            conservative_sl_first=True,
-                        )
+                for target_pct in target_list:
+                    t_ratio = target_pct / 100.0
+                    for sl_pct in sl_list:
+                        sl_ratio = sl_pct / 100.0
 
-                    for trig_count in trig_loop:
-                        for skip_val in skip_loop:
-                            stats_map = {h: _new_stats() for h in horizons}
+                        base_cands = None
+                        if sim_mode in {"overlapping", "overlapping_random"}:
+                            allowed_anchor_mask = valid_entry_mask if sim_mode == "overlapping_random" else None
+                            base_cands = _build_trade_candidates(
+                                time_ns=time_ns,
+                                market_time_ns=market_time_ns,
+                                open_px=open_px,
+                                high=high,
+                                low=low,
+                                close=close,
+                                ma_values=ma_values,
+                                horizons=horizons,
+                                target_ratio=t_ratio,
+                                sl_ratio=sl_ratio,
+                                apply_ma_filter=apply_ma_f,
+                                conservative_sl_first=True,
+                                allowed_anchor_mask=allowed_anchor_mask,
+                                spread_pct=spread_pct,
+                            )
 
-                            if sim_mode == "overlapping":
-                                assert base_cands is not None
-                                for side in (1, -1):
-                                    side_cands = [c.copy() for c in base_cands[side]]
-                                    if apply_al_f:
-                                        _apply_after_loss_policy(side_cands, int(trig_count), skip_val)
-                                    else:
-                                        for c in side_cands:
-                                            c["taken"] = True
+                        for trig_count in trig_loop:
+                            for skip_val in skip_loop:
+                                stats_map = {h: _new_stats() for h in horizons}
 
-                                    for c in side_cands:
-                                        if c["anchor_idx"] not in allowed_entry_indices:
-                                            continue
-                                        if c.get("taken"):
-                                            _update_stats_from_dict(stats_map[c["horizon_hours"]], c, sl_ratio)
+                                if sim_mode in {"overlapping", "overlapping_random"}:
+                                    if base_cands is None:
+                                        continue
 
-                            else:
-                                for h in horizons:
-                                    s = stats_map[h]
-                                    active_trade = None
-                                    cooldown = 0
-                                    streak = 0
-                                    last_side = 0
-                                    h_ns = np.int64(h * HOUR_NS)
-
-                                    for i in range(n - 1):
-                                        if active_trade is not None:
-                                            side = active_trade["side"]
-                                            is_sl = (low[i] <= active_trade["sl"]) if side == 1 else (high[i] >= active_trade["sl"])
-                                            is_tp = (high[i] >= active_trade["tp"]) if side == 1 else (low[i] <= active_trade["tp"])
-
-                                            if is_sl or is_tp or (time_ns[i] >= active_trade["exp"]):
-                                                res = "sl" if is_sl else ("target" if is_tp else "censored")
-                                                _update_stats_sequential(
-                                                    s,
-                                                    active_trade,
-                                                    res,
-                                                    i,
-                                                    time_ns,
-                                                    high,
-                                                    low,
-                                                    close,
-                                                    t_ratio,
-                                                    sl_ratio,
-                                                )
-
-                                                if res == "sl":
-                                                    streak += 1
-                                                    last_side = side
-                                                    if apply_al_f and streak >= int(trig_count):
-                                                        cooldown = int(skip_val) if skip_val is not None else 999999
-                                                        streak = 0
-                                                else:
-                                                    streak = 0
-                                                    last_side = 0
-                                                active_trade = None
+                                    for side in (1, -1):
+                                        if fixed_side is not None and side != int(fixed_side):
                                             continue
 
-                                        if i not in allowed_entry_indices:
-                                            continue
+                                        side_cands = [c.copy() for c in base_cands[side]]
 
-                                        if apply_al_f and cooldown > 0:
-                                            cooldown -= 1
-                                            s["skipped_after_loss_count"] += 1
-                                            continue
-
-                                        if sim_mode == "sequential_random":
-                                            if USE_DAILY_SIDE_BIAS:
-                                                side = int(daily_bias_array[i])
-                                            else:
-                                                side = int(trade_rng.choice([1, -1]))
+                                        if apply_al_f:
+                                            _apply_after_loss_policy(side_cands, int(trig_count), skip_val)
                                         else:
-                                            side = -last_side if (last_side != 0 and SEQUENTIAL_SWITCH_ON_LOSS) else 1
+                                            for c in side_cands:
+                                                c["taken"] = True
 
-                                        entry_px = sample_entry_price_nudged(open_px[i], high[i], low[i], close[i], i)
-                                        if apply_ma_f and not _ma_pass(side, entry_px, ma_values[i]):
-                                            continue
+                                        for c in side_cands:
+                                            s = stats_map[c["horizon_hours"]]
+                                            if c.get("taken"):
+                                                _update_stats_from_dict(s, c, sl_ratio)
 
-                                        active_trade = {
-                                            "side": side,
-                                            "entry_px": entry_px,
-                                            "entry_ns": time_ns[i],
-                                            "entry_idx": i,
-                                            "exp": time_ns[i] + h_ns,
-                                            "tp": entry_px * (1.0 + (side * t_ratio)),
-                                            "sl": entry_px * (1.0 - (side * sl_ratio)),
-                                        }
+                                else:
+                                    for h in horizons:
+                                        s = stats_map[h]
+                                        active_t = None
+                                        cooldown_idx = 0
+                                        loss_streak = 0
+                                        last_lost_side = 0
+                                        h_ns = np.int64(h * HOUR_NS)
 
-                            for h, s in stats_map.items():
-                                summary_rows.append(
-                                    _finalize_row(
-                                        s,
-                                        instrument,
-                                        source_symbol,
-                                        pair,
-                                        filter_mode,
-                                        target_pct,
-                                        sl_pct,
-                                        h,
-                                        trig_count,
-                                        skip_val,
-                                        sim_mode,
-                                        entry_window_start_hour,
-                                        entry_window_end_hour,
-                                        use_entry_time_window,
+                                        for i in range(n - 1):
+                                            if active_t is not None:
+                                                side = active_t["side"]
+                                                is_sl = (low[i] <= active_t["sl"]) if side == 1 else (high[i] >= active_t["sl"])
+                                                is_tp = (high[i] >= active_t["tp"]) if side == 1 else (low[i] <= active_t["tp"])
+
+                                                if is_sl or is_tp or (market_time_ns[i] >= active_t["market_exp"]):
+                                                    res = "sl" if is_sl else ("target" if is_tp else "censored")
+                                                    _update_stats_sequential(
+                                                        s,
+                                                        active_t,
+                                                        res,
+                                                        i,
+                                                        time_ns,
+                                                        market_time_ns,
+                                                        high,
+                                                        low,
+                                                        close,
+                                                        t_ratio,
+                                                        sl_ratio,
+                                                        spread_pct,
+                                                    )
+                                                    if res == "sl":
+                                                        loss_streak += 1
+                                                        last_lost_side = side
+                                                        if apply_al_f and loss_streak >= int(trig_count):
+                                                            cooldown_idx = i + (int(skip_val) if skip_val is not None else 999999)
+                                                            loss_streak = 0
+                                                    else:
+                                                        loss_streak = 0
+                                                        last_lost_side = 0
+                                                    active_t = None
+                                                continue
+
+                                            if i < cooldown_idx:
+                                                continue
+                                            if not valid_entry_mask[i]:
+                                                continue
+                                            if apply_al_f and cooldown_idx > i:
+                                                s["skipped_after_loss_count"] += 1
+                                                continue
+
+                                            if fixed_side is not None:
+                                                check_order = [int(fixed_side)]
+                                            elif sim_mode == "sequential_random":
+                                                if bias_array is not None:
+                                                    check_order = [int(bias_array[i])]
+                                                else:
+                                                    check_order = [int(rng.choice([1, -1]))]
+                                            else:
+                                                check_order = [1, -1]
+                                                if last_lost_side != 0 and True:
+                                                    check_order = ([-1, 1] if last_lost_side == 1 else [1, -1])
+
+                                            entry_px = sample_entry_price_nudged(open_px[i], high[i], low[i], close[i], i)
+                                            if not np.isfinite(entry_px):
+                                                continue
+
+                                            chosen_side = None
+                                            for side in check_order:
+                                                if apply_ma_f and not _ma_pass(side, entry_px, ma_values[i]):
+                                                    continue
+                                                chosen_side = int(side)
+                                                break
+
+                                            if chosen_side is None:
+                                                continue
+
+                                            active_t = {
+                                                "side": chosen_side,
+                                                "entry_px": entry_px,
+                                                "entry_ns": time_ns[i],
+                                                "entry_idx": i,
+                                                "tp": _spread_adjusted_barriers(
+                                                    side=chosen_side,
+                                                    entry_price=entry_px,
+                                                    target_ratio=t_ratio,
+                                                    sl_ratio=sl_ratio,
+                                                    spread_pct=spread_pct,
+                                                )[0],
+                                                "sl": _spread_adjusted_barriers(
+                                                    side=chosen_side,
+                                                    entry_price=entry_px,
+                                                    target_ratio=t_ratio,
+                                                    sl_ratio=sl_ratio,
+                                                    spread_pct=spread_pct,
+                                                )[1],
+                                                    "market_exp": market_time_ns[i] + h_ns
+                                                }
+
+                                for h, s in stats_map.items():
+                                    summary_rows.append(
+                                        _finalize_row(
+                                            s,
+                                            instrument,
+                                            source_symbol,
+                                            pair,
+                                            filter_mode,
+                                            target_pct,
+                                            sl_pct,
+                                            spread_pct,
+                                            h,
+                                            trig_count,
+                                            skip_val,
+                                            sim_mode,
+                                            side_mode,
+                                        )
                                     )
-                                )
 
     return pd.DataFrame(summary_rows)
 
@@ -1100,6 +1338,10 @@ def build_expectancy_summary_from_cache(
     use_after_loss_filter: bool = USE_AFTER_LOSS_FILTER,
     after_loss_trigger_count_list: Optional[Sequence[int]] = AFTER_LOSS_TRIGGER_COUNT_LIST,
     after_loss_skip_trades_list: Optional[Sequence[Optional[int]]] = AFTER_LOSS_SKIP_TRADES_LIST,
+    use_daily_side_bias: bool = USE_DAILY_SIDE_BIAS,
+    use_utc_for_bias: bool = True,
+    spread_pct: float = SPREAD_PCT,
+    lookback_days: int = LOOKBACK_DAYS,
 ) -> pd.DataFrame:
     df = load_df_from_cache(cache_file)
     if df.is_empty():
@@ -1121,6 +1363,10 @@ def build_expectancy_summary_from_cache(
         use_after_loss_filter=use_after_loss_filter,
         after_loss_trigger_count_list=after_loss_trigger_count_list,
         after_loss_skip_trades_list=after_loss_skip_trades_list,
+        use_daily_side_bias=use_daily_side_bias,
+        use_utc_for_bias=use_utc_for_bias,
+        spread_pct=spread_pct,
+        lookback_days=lookback_days,
     )
 
     if summary_df.empty:
@@ -1148,7 +1394,13 @@ def build_expectancy_summary_from_cache(
             "horizon_hours",
         ]
 
-    summary_df = summary_df.round(4).sort_values(sort_cols).reset_index(drop=True)
+    summary_df = summary_df.sort_values(sort_cols).reset_index(drop=True)
+
+    round_map = {c: 4 for c in summary_df.select_dtypes(include="number").columns}
+    round_map["net_expectancy_rate"] = 8
+
+    summary_df = summary_df.round(round_map)
+    
     return summary_df
 
 
@@ -1156,182 +1408,90 @@ def save_expectancy_summary_csv(
     summary_df: pd.DataFrame,
     output_file: Optional[Path] = None,
     instrument: str = INSTRUMENT,
+    suffix: Optional[str] = None,
+    lookback_days: int = LOOKBACK_DAYS,
 ) -> Path:
-    if output_file is None:
-        output_file = OUTPUT_DIR / f"expectancy_scan_{_safe_name(instrument)}_{_safe_name(ENTRY_WINDOW_LABEL)}.csv"
+    summary_df["lookback_d"] = int(lookback_days)
 
-    output_file = Path(output_file)
-    output_file.parent.mkdir(parents=True, exist_ok=True)
-    _replace_file(output_file)
-
-    export_df = summary_df.drop(columns=get_columns_to_remove(), errors="ignore")
-    export_df.to_csv(output_file, index=False)
-    return output_file
-
-
-def save_net_expectancy_tp_sl_plot(
-    summary_df: pd.DataFrame,
-    instrument: str,
-    pair: str,
-    symbol: str,
-) -> List[Path]:
-    plt, sns = _import_plotting()
-    if summary_df.empty:
-        return []
-
-    market = _market_tag(instrument, pair, symbol)
-    saved: List[Path] = []
-
-    if "filter_mode" not in summary_df.columns:
-        return []
-
-    group_keys = _group_keys_from_df(summary_df)
-    groups = [(k, g.copy()) for k, g in summary_df.groupby(group_keys, sort=True)] if group_keys else [("ALL", summary_df.copy())]
-
-    for key, group in groups:
-        if group.empty or "net_expectancy_pct" not in group.columns:
-            continue
-
-        horizons = sorted(group["horizon_hours"].dropna().unique().tolist())
-        if not horizons:
-            continue
-
-        vmin = float(group["net_expectancy_pct"].min())
-        vmax = float(group["net_expectancy_pct"].max())
-        label = _group_key_label(key)
-
-        fig, axes = plt.subplots(
-            1,
-            len(horizons),
-            figsize=(7.5 * len(horizons), 6.5),
-            squeeze=False,
-            constrained_layout=True,
-        )
-        axes_row = axes[0]
-        first_mappable = None
-
-        for ax, h in zip(axes_row, horizons):
-            sub = group[group["horizon_hours"] == h].copy()
-            if sub.empty:
-                ax.set_axis_off()
-                continue
-
-            pivot = (
-                sub.pivot_table(
-                    index="sl_pct",
-                    columns="target_pct",
-                    values="net_expectancy_pct",
-                    aggfunc="mean",
-                ).sort_index(ascending=False)
-            )
-
-            if sns is not None:
-                hm = sns.heatmap(
-                    pivot,
-                    ax=ax,
-                    cmap="viridis",
-                    vmin=vmin,
-                    vmax=vmax,
-                    annot=False,
-                    linewidths=0.5,
-                    linecolor="white",
-                    cbar=False,
-                    square=True,
-                )
-                mappable = hm
-            else:
-                data = pivot.to_numpy(dtype=float)
-                im = ax.imshow(data, aspect="auto", origin="upper", vmin=vmin, vmax=vmax, cmap="viridis")
-                ax.set_xticks(np.arange(len(pivot.columns)))
-                ax.set_xticklabels([f"{x:g}" for x in pivot.columns], rotation=0, fontsize=8)
-                ax.set_yticks(np.arange(len(pivot.index)))
-                ax.set_yticklabels([f"{x:g}" for x in pivot.index], rotation=0, fontsize=8)
-                mappable = im
-
-            if first_mappable is None:
-                first_mappable = mappable.collections[0] if sns is not None and getattr(mappable, "collections", None) else mappable
-
-            ax.set_title(f"{market} | {key} | {int(h)}h", fontsize=12, pad=10)
-            ax.set_xlabel("Target %")
-            ax.set_ylabel("SL %")
-            ax.tick_params(axis="x", labelrotation=0, labelsize=8)
-            ax.tick_params(axis="y", labelrotation=0, labelsize=8)
-
-        if first_mappable is not None:
-            fig.colorbar(first_mappable, ax=axes_row.tolist(), shrink=0.9, pad=0.02, label="Net expectancy (%)")
-
-        out = OUTPUT_DIR / f"expectancy_heatmap_{market}_{label}.png"
-        _save_figure(fig, out)
-        plt.close(fig)
-        saved.append(out)
-
-    return saved
-
-
-def _accumulate_histograms(summary_df: pd.DataFrame, hist_col: str) -> np.ndarray:
-    total_hist = np.zeros(PLOT_BINS, dtype=np.float64)
-    if hist_col not in summary_df.columns:
-        return total_hist
-
-    for v in summary_df[hist_col].dropna():
-        if isinstance(v, str):
-            try:
-                arr = np.fromstring(v.strip("[]"), sep=",")
-                if arr.size == PLOT_BINS:
-                    total_hist += arr
-                continue
-            except Exception:
-                continue
-
-        if isinstance(v, (list, tuple, np.ndarray)) and len(v) == PLOT_BINS:
-            total_hist += np.asarray(v, dtype=np.float64)
-
-    return total_hist
-
-
-def save_mae_mfe_distribution_plots(
-    summary_df: pd.DataFrame,
-    instrument: str,
-    pair: str,
-    symbol: str,
-) -> List[Path]:
-    plt, _ = _import_plotting()
-    if summary_df.empty:
-        return []
-
-    market = _market_tag(instrument, pair, symbol)
-    saved: List[Path] = []
-
-    specs = [
-        ("entry_revisit_mae_hist", "Entry-revisit MAE (R)", f"mae_distribution_{market}.png"),
-        ("entry_revisit_mfe_hist", "Entry-revisit MFE (R)", f"mfe_distribution_{market}.png"),
-        ("entry_revisit_mae_win_hist", "Entry-revisit MAE win-only (R)", f"mae_win_distribution_{market}.png"),
-        ("entry_revisit_mae_loss_hist", "Entry-revisit MAE loss-only (R)", f"mae_loss_distribution_{market}.png"),
-        ("entry_revisit_mfe_win_hist", "Entry-revisit MFE win-only (R)", f"mfe_win_distribution_{market}.png"),
-        ("entry_revisit_mfe_loss_hist", "Entry-revisit MFE loss-only (R)", f"mfe_loss_distribution_{market}.png"),
+    preferred_cols = [
+        "instrument",
+        "source_symbol",
+        "pair",
+        "lookback_d",
+        "filter_mode",
+        "sim_mode",
+        "side_mode",
+        "use_entry_time_window",
+        "entry_window_start_hour",
+        "entry_window_end_hour",
+        "entry_window_label",
+        "target_pct",
+        "sl_pct",
+        "spread_pct",
+        "horizon_hours",
+        "after_loss_trigger_count",
+        "after_loss_skip_trades",
+        "anchors_total",
+        "trades_taken_count",
+        "skipped_after_loss_count",
+        "loss_streak_trigger_count",
+        "target_first_count",
+        "sl_first_count",
+        "censored_count",
+        "target_first_then_sl_count",
+        "resolved_trades_count",
+        "resolved_trades_pct",
+        "censored_trades_pct",
+        "target_first_rate_pct",
+        "sl_first_rate_pct",
+        "expectancy_resolved_pct",
+        "net_expectancy_pct",
+        "net_expectancy_rate",
+        "avg_holding_time",
+        "target_minutes_mean",
+        "sl_minutes_mean",
+        "first_event_minutes_mean",
+        "forced_exit_r_mean",
+        "forced_exit_r_positive_count",
     ]
 
-    centers = (PLOT_BIN_EDGES[:-1] + PLOT_BIN_EDGES[1:]) / 2.0
-    width = (PLOT_BIN_EDGES[1] - PLOT_BIN_EDGES[0]) * 0.9
+    summary_df = summary_df.reindex(
+        columns=[c for c in preferred_cols if c in summary_df.columns]
+        + [c for c in summary_df.columns if c not in preferred_cols]
+    )
 
-    for hist_col, y_label, fname in specs:
-        total_hist = _accumulate_histograms(summary_df, hist_col)
-        if total_hist.sum() <= 0:
-            continue
+    window_part = _output_window_part()
+    cols_to_remove = get_columns_to_remove()
 
-        fig, ax = plt.subplots(figsize=(10.5, 6.5))
-        ax.bar(centers, total_hist, width=width)
-        ax.set_title(f"{market} | {y_label}")
-        ax.set_xlabel(y_label)
-        ax.set_ylabel("Count")
-        ax.grid(True, axis="y", alpha=0.25)
+    if output_file is None:
+        output_file = OUTPUT_DIR / f"expectancy_scan_{_safe_name(instrument)}_{window_part}_lookback_{int(lookback_days)}d{_suffix_part(suffix)}.csv"
 
-        out = OUTPUT_DIR / fname
-        _save_figure(fig, out)
-        plt.close(fig)
-        saved.append(out)
+    output_file = Path(output_file)
+    _replace_file(output_file)
+    summary_df.drop(columns=cols_to_remove, errors="ignore").to_csv(
+        output_file,
+        index=False,
+        float_format="%.8f",
+    )
 
-    return saved
+    if "side_mode" in summary_df.columns and "horizon_hours" in summary_df.columns:
+        for (side_mode, h_val), group_df in summary_df.groupby(["side_mode", "horizon_hours"], sort=True):
+            h_int = int(h_val)
+            side_dir = _horizon_output_dir(h_int, lookback_days)
+            side_filename = (
+                f"expectancy_scan_{_safe_name(instrument)}horizon{h_int}_"
+                f"{window_part}_lookback_{int(lookback_days)}d_{_safe_name(str(side_mode))}.csv"
+            )
+            side_file_path = side_dir / side_filename
+
+            _replace_file(side_file_path)
+            group_df.drop(columns=cols_to_remove, errors="ignore").to_csv(
+                side_file_path,
+                index=False,
+                float_format="%.8f",
+            )
+
+    return output_file
 
 
 def save_expectancy_plots(
@@ -1339,40 +1499,47 @@ def save_expectancy_plots(
     instrument: str = INSTRUMENT,
     pair: str = PAIR,
     symbol: str = MT5_SYMBOL,
+    lookback_days: int = LOOKBACK_DAYS,
 ) -> List[Path]:
     plot_files: List[Path] = []
-    plot_files.extend(
-        save_mae_mfe_distribution_plots(
-            summary_df=summary_df,
-            instrument=instrument,
-            pair=pair,
-            symbol=symbol,
+
+    if USE_MAE_MFE_STATS:
+        plot_files.extend(
+            save_mae_mfe_distribution_plots(
+                summary_df=summary_df,
+                instrument=instrument,
+                pair=pair,
+                symbol=symbol,
+            )
         )
-    )
+
     plot_files.extend(
         save_net_expectancy_tp_sl_plot(
             summary_df=summary_df,
             instrument=instrument,
             pair=pair,
             symbol=symbol,
+            lookback_days=lookback_days,
         )
     )
     return plot_files
 
 
-def run_expectancy_scan() -> dict[str, str]:
+def run_expectancy_scan(lookback_days: int = LOOKBACK_DAYS) -> dict[str, str]:
     clear_previous_outputs()
 
     source_symbol = MT5_SYMBOL
 
     logger.info("Starting expectancy scan")
     logger.info("Cache file: %s", CACHE_FILE)
-    logger.info("Entry window: %s", ENTRY_WINDOW_LABEL)
+    logger.info("Entry window label: %s", _effective_entry_window_label())
+    logger.info("Use daily bias: %s", USE_DAILY_SIDE_BIAS)
+    logger.info("Use sequential mode(s): %s", ", ".join(SIMULATION_MODES))
 
     summary_df = build_expectancy_summary_from_cache(
         cache_file=CACHE_FILE,
         instrument=INSTRUMENT,
-        source_symbol=source_symbol,
+        source_symbol=MT5_SYMBOL,
         pair=PAIR,
         target_pct_list=TARGET_PCT_LIST,
         sl_pct_list=SL_PCT_LIST,
@@ -1385,18 +1552,26 @@ def run_expectancy_scan() -> dict[str, str]:
         use_after_loss_filter=USE_AFTER_LOSS_FILTER,
         after_loss_trigger_count_list=AFTER_LOSS_TRIGGER_COUNT_LIST,
         after_loss_skip_trades_list=AFTER_LOSS_SKIP_TRADES_LIST,
+        use_daily_side_bias=USE_DAILY_SIDE_BIAS,
+        use_utc_for_bias=True,
+        spread_pct=SPREAD_PCT,
+        lookback_days=lookback_days,
     )
 
     if summary_df.empty:
-        logger.warning("No summary produced.")
         return {}
 
-    output_file = save_expectancy_summary_csv(summary_df=summary_df, instrument=INSTRUMENT)
+    output_file = save_expectancy_summary_csv(
+        summary_df=summary_df,
+        instrument=INSTRUMENT,
+        lookback_days=lookback_days,
+    )
     plot_files = save_expectancy_plots(
         summary_df=summary_df,
         instrument=INSTRUMENT,
         pair=PAIR,
-        symbol=source_symbol,
+        symbol=MT5_SYMBOL,
+        lookback_days=lookback_days,
     )
 
     logger.info("Saved summary CSV to: %s", output_file)
@@ -1405,11 +1580,18 @@ def run_expectancy_scan() -> dict[str, str]:
         logger.info("Saved plot: %s", p)
 
     return {
+        "lookback_days": str(lookback_days),
         "summary_file": str(output_file),
         "cache_file": str(CACHE_FILE),
         "plots": [str(p) for p in plot_files],
     }
 
 
+def run_expectancy_scan_all_lookbacks() -> list[dict[str, str]]:
+    outputs = []
+    for lookback_days in get_lookback_days_list():
+        outputs.append(run_expectancy_scan(lookback_days=lookback_days))
+    return outputs
+
 if __name__ == "__main__":
-    run_expectancy_scan()
+    run_expectancy_scan_all_lookbacks()

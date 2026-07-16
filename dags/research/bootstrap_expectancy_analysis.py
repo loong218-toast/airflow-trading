@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import sys
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -23,14 +24,12 @@ DAGS_ROOT = PROJECT_ROOT / "dags" if (PROJECT_ROOT / "dags").exists() else Path(
 if str(DAGS_ROOT) not in sys.path:
     sys.path.insert(0, str(DAGS_ROOT))
 
-
 from research.exploration_config import CONFIG  # type: ignore
 from research.trade_core import (  # type: ignore
     bootstrap_mean_samples,
     build_trade_universe,
     load_cache_df,
     replace_file,
-    safe_name,
 )
 
 logger = logging.getLogger(__name__)
@@ -42,7 +41,7 @@ def save_histogram(
     title: str,
     xlabel: str,
     observed: float,
-    extra_vlines=None,
+    extra_vlines: Optional[list[float]] = None,
 ) -> None:
     import plotly.graph_objects as go
 
@@ -60,7 +59,9 @@ def save_histogram(
         )
     )
 
-    fig.add_vline(x=observed, line_width=2, line_dash="solid", line_color="black")
+    if np.isfinite(observed):
+        fig.add_vline(x=float(observed), line_width=2, line_dash="solid", line_color="black")
+
     for x in extra_vlines:
         if np.isfinite(x):
             fig.add_vline(x=float(x), line_width=1.5, line_dash="dash", line_color="gray")
@@ -74,7 +75,7 @@ def save_histogram(
         height=650,
     )
     out_html.parent.mkdir(parents=True, exist_ok=True)
-    fig.write_html(str(out_html), include_plotlyjs="cdn", full_html=True)
+    fig.write_html(str(out_html), include_plotlyjs=True, full_html=True)
 
 
 def build_summary(trade_df: pd.DataFrame, bootstrap_samples_r: np.ndarray) -> pd.DataFrame:
@@ -83,7 +84,9 @@ def build_summary(trade_df: pd.DataFrame, bootstrap_samples_r: np.ndarray) -> pd
 
     attempted_count = int(trade_df.attrs.get("attempted_count", len(trade_df)))
     resolved_count = int(trade_df.attrs.get("resolved_count", len(trade_df)))
-    censored_count = int(trade_df.attrs.get("censored_count", max(0, attempted_count - resolved_count)))
+    censored_count = int(
+        trade_df.attrs.get("censored_count", max(0, attempted_count - resolved_count))
+    )
 
     resolved_rate_pct = float((resolved_count / attempted_count) * 100.0) if attempted_count > 0 else np.nan
     censored_rate_pct = float((censored_count / attempted_count) * 100.0) if attempted_count > 0 else np.nan
@@ -112,6 +115,9 @@ def build_summary(trade_df: pd.DataFrame, bootstrap_samples_r: np.ndarray) -> pd
     else:
         b_mean = b_median = b_std = b_p05 = b_p10 = b_p25 = b_p75 = b_p90 = b_p95 = prob_negative_pct = np.nan
 
+    use_entry_bucket_hours = bool(getattr(CONFIG, "use_entry_bucket_hours", False))
+    entry_bucket_hours = int(getattr(CONFIG, "entry_bucket_hours", 4))
+
     row = {
         "instrument": CONFIG.instrument,
         "source_symbol": CONFIG.mt5_symbol,
@@ -122,7 +128,8 @@ def build_summary(trade_df: pd.DataFrame, bootstrap_samples_r: np.ndarray) -> pd
         "risk_pct": float(CONFIG.risk_pct),
         "use_ma_filter": bool(CONFIG.use_ma_filter),
         "randomize_entry_price": bool(CONFIG.randomize_entry_price),
-        "use_entry_bucket_hours": bool(CONFIG.use_entry_bucket_hours),
+        "use_entry_bucket_hours": use_entry_bucket_hours,
+        "entry_bucket_hours": entry_bucket_hours,
         "n_trades": int(len(trade_df)),
         "attempted_count": attempted_count,
         "resolved_count": resolved_count,

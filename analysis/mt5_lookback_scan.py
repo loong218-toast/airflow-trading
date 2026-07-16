@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import logging
 import time
 from datetime import datetime, timezone
@@ -16,12 +17,30 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s - %(me
 logger = logging.getLogger("mt5_lookback_scan")
 
 # --- PATH CONFIGURATION ---
-PROJECT_ROOT = Path("/opt/airflow/airflow-trading") if Path("/opt/airflow").exists() else Path("C:/Users/Owner/airflow-trading")
+
+DEFAULT_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(os.getenv("AIRFLOW_TRADING_ROOT", str(DEFAULT_PROJECT_ROOT))).expanduser().resolve()
+
 CACHE_DIR = PROJECT_ROOT / "data_lake" / "cache"
 METADATA_DIR = PROJECT_ROOT / "dags" / "research" / "bootstrap"
 
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 METADATA_DIR.mkdir(parents=True, exist_ok=True)
+
+MIRROR_ROOT_RAW = os.getenv("AIRFLOW_TRADING_MIRROR_ROOT", "").strip()
+MIRROR_CACHE_DIR = None
+MIRROR_METADATA_DIR = None
+
+if MIRROR_ROOT_RAW:
+    MIRROR_ROOT = Path(MIRROR_ROOT_RAW).expanduser().resolve()
+    MIRROR_CACHE_DIR = MIRROR_ROOT / "data_lake" / "cache"
+    MIRROR_METADATA_DIR = MIRROR_ROOT / "dags" / "research" / "bootstrap"
+    MIRROR_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    MIRROR_METADATA_DIR.mkdir(parents=True, exist_ok=True)
+
+logger.info("PROJECT_ROOT=%s", PROJECT_ROOT)
+logger.info("CACHE_DIR=%s", CACHE_DIR)
+logger.info("METADATA_DIR=%s", METADATA_DIR)
 
 TIMEFRAME = mt5.TIMEFRAME_M5
 TIMEFRAME_NAME = "m5"
@@ -34,6 +53,7 @@ INSTRUMENT_CONFIG = {
     "AUDJPY": {"pair": "AUDJPY", "mt5_symbol": "AUDJPY"},
     "USDCHF": {"pair": "USDCHF", "mt5_symbol": "USDCHF"},
     "XAUUSD": {"pair": "XAUUSD", "mt5_symbol": "XAUUSD"},
+    "EURJPY": {"pair": "EURJPY", "mt5_symbol": "EURJPY"},
 }
 
 def _safe_dt_from_unix(ts: int) -> str:
@@ -89,6 +109,12 @@ def download_and_cache_data(symbol: str, timeframe: int, total_bars: int) -> dic
     
     cache_filename = CACHE_DIR / f"{symbol}_{TIMEFRAME_NAME}_cache.csv"
     cache_df.to_csv(cache_filename, index=False)
+    logger.info("Saved cache to: %s", cache_filename)
+
+    if MIRROR_CACHE_DIR is not None and MIRROR_CACHE_DIR != CACHE_DIR:
+        mirror_file = MIRROR_CACHE_DIR / f"{symbol}_{TIMEFRAME_NAME}_cache.csv"
+        cache_df.to_csv(mirror_file, index=False)
+        logger.info("Mirrored cache to: %s", mirror_file)
     
     oldest_ts = int(df['time'].min())
     newest_ts = int(df['time'].max())
@@ -126,6 +152,12 @@ def main():
         df_summary = pd.DataFrame(rows)
         summary_file = METADATA_DIR / "mt5_lookback_scan.csv"
         df_summary.to_csv(summary_file, index=False)
+        logger.info("Saved summary to: %s", summary_file)
+
+        if MIRROR_METADATA_DIR is not None and MIRROR_METADATA_DIR != METADATA_DIR:
+            mirror_summary = MIRROR_METADATA_DIR / "mt5_lookback_scan.csv"
+            df_summary.to_csv(mirror_summary, index=False)
+            logger.info("Mirrored summary to: %s", mirror_summary)
         
         print("\n" + "="*75)
         print(f"{'SYMBOL':<10} | {'BARS':<8} | {'DAYS':<8} | {'STATUS'}")

@@ -1,8 +1,9 @@
+# exploration_config.py
+
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-
 
 def detect_project_root() -> Path:
     here = Path(__file__).resolve()
@@ -17,7 +18,6 @@ def detect_project_root() -> Path:
         here.parents[1],
     )
 
-
 PROJECT_ROOT = detect_project_root()
 DAGS_ROOT = PROJECT_ROOT / "dags" if (PROJECT_ROOT / "dags").exists() else Path("/opt/airflow/dags")
 DATA_LAKE_ROOT = PROJECT_ROOT / "data_lake"
@@ -28,15 +28,25 @@ TIMEZONE = "Asia/Kuala_Lumpur"
 
 @dataclass(frozen=True)
 class ExplorationConfig:
-    instrument: str = "BTCUSD"
-    pair: str = "BTCUSD"
-    mt5_symbol: str = "BTCUSD"
+    instrument: str = "USDCHF"
+    pair: str = "USDCHF"
+    mt5_symbol: str = "USDCHF"
 
-    target_pct: float = 0.07
-    sl_pct: float = 0.15
+    #instrument: str = "UK100"
+    #pair: str = "UK100"
+    #mt5_symbol: str = "UK100"
+
+    target_pct: float = 0.09
+    sl_pct: float = 0.25
     horizon_hours: int = 24
-
+    spread_pct: float = 0.005
     risk_pct: float = 0.005
+
+    use_trade_timer: tuple[bool, ...] = (False, True)
+    trade_timer_minutes: tuple[int, ...] = (150, 300,600)
+
+    simulation_mode: str = "overlapping_random"  # overlapping | overlapping_random | sequential_random
+    side_mode: str = "mixed"  # mixed | buy | sell
 
     use_ma_filter: bool = False
     ma_type: str = "ema"
@@ -46,10 +56,14 @@ class ExplorationConfig:
     entry_nudge_max_fraction: float = 0.12
     entry_nudge_clip_to_candle: bool = True
 
-    use_entry_bucket_hours: bool = False
-    entry_bucket_hours: int = 4
+    use_entry_time_window: bool = False
+    entry_window_start_hour_myt: int = 15
+    entry_window_end_hour_myt: int = 23
 
-    entries_per_hour: int = 2
+    entries_per_hour: int = 4
+
+    use_daily_side_bias: bool = False
+    use_utc_for_bias: bool = True
 
     bootstrap_rounds: int = 2000
     bootstrap_block_size: int = 8
@@ -57,6 +71,18 @@ class ExplorationConfig:
 
     save_trade_universe_csv: bool = False
     save_bootstrap_samples_csv: bool = False
+
+    chart_lookback_days: int = 180
+    chart_max_candles: int = 6000
+    chart_marker_size: int = 3
+
+    # Trailing exit sweep.
+    # Activation is expressed as a fraction of the SL distance:
+    #   0.6 == activate after price has moved % of the way to SL.
+    use_trailing_tp: bool = True
+    trailing_tp_activation_r: float = 0.6
+    trailing_tp_distance_r: tuple[float, ...] = (0.05,0.1, 0.2)  # trailing distance in R units
+    trailing_tp_interval: tuple[int, ...] = (24)  # update every N candles
 
     timezone: str = TIMEZONE
 
@@ -79,8 +105,8 @@ class ExplorationConfig:
             f"tp_{str(self.target_pct).replace('.', 'p')}_"
             f"sl_{str(self.sl_pct).replace('.', 'p')}_"
             f"h_{int(self.horizon_hours)}_"
+            f"{self.simulation_mode}_"
             f"{'ma' if self.use_ma_filter else 'no_ma'}"
         )
-
 
 CONFIG = ExplorationConfig()

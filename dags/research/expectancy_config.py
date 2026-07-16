@@ -1,9 +1,11 @@
+# expectancy_config.py
+
 from __future__ import annotations
 
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -19,8 +21,30 @@ BASE_DIR = PROJECT_ROOT
 if load_dotenv is not None:
     load_dotenv()
 
+# research/expectancy_config.py
+
 LOOKBACK_DAYS = 90
+LOOKBACK_DAYS_LIST = [15, 30, 90]
+
+def get_lookback_days_list(values: Optional[Sequence[int]] = None) -> List[int]:
+    source = LOOKBACK_DAYS_LIST if values is None else values
+
+    out: List[int] = []
+    seen = set()
+    for value in source:
+        v = int(value)
+        if v <= 0:
+            raise ValueError("LOOKBACK_DAYS values must be > 0")
+        if v in seen:
+            continue
+        seen.add(v)
+        out.append(v)
+
+    return out or [LOOKBACK_DAYS]
+
 RISK_PCT = 0.005
+
+MIX_BUY_SELL = False  # True = one mixed scan, False = split into buy-only and sell-only outputs
 
 USE_MA_FILTER = False
 MA_TYPE = "ema"  # ema or sma
@@ -38,27 +62,46 @@ USE_AFTER_LOSS_FILTER = False
 AFTER_LOSS_TRIGGER_COUNT_LIST: List[int] = [1]
 AFTER_LOSS_SKIP_TRADES_LIST: List[Optional[int]] = [1]
 
-RANDOMIZE_ENTRY_PRICE = False
+RANDOMIZE_ENTRY_PRICE = True
 RANDOM_ENTRY_SEED = 11121212
-ENTRY_NUDGE_MAX_FRACTION = 0.02
+ENTRY_NUDGE_MAX_FRACTION = 0.1
 ENTRY_NUDGE_CLIP_TO_CANDLE = True
 
 # Simulation modes:
 # - overlapping: evaluate every eligible entry independently
+# - overlapping_random: same as overlapping, but entries are randomly sampled per hour using TRADES_PER_HOUR
 # - sequential_flip: take one trade at a time and favor the opposite side after a loss
 # - sequential_random: take one trade at a time and use a daily random side bias
-#SIMULATION_MODES = ["overlapping"]
-SIMULATION_MODES = ["sequential_random"]
+
+SIMULATION_MODES = ["overlapping_random"]
+#SIMULATION_MODES = ["sequential_random"]
 # SIMULATION_MODES = ["overlapping", "sequential_flip", "sequential_random"]
 SEQUENTIAL_SWITCH_ON_LOSS = False  # If true, prefers opposite side after a loss
 
-TRADES_PER_HOUR = 4
+TRADES_PER_HOUR = 2
 
 # Entry window filter in Malaysia time.
 # Bars inside this window are eligible to become entries.
 USE_ENTRY_TIME_WINDOW = False
 ENTRY_WINDOW_START_HOUR_MYT = 15
 ENTRY_WINDOW_END_HOUR_MYT = 23
+
+def get_horizon_label(horizon_hours_list: list[int]) -> str:
+    horizons = sorted({int(h) for h in horizon_hours_list if int(h) > 0})
+    if not horizons:
+        return "horizonNA"
+    if len(horizons) == 1:
+        return f"horizon{horizons[0]}"
+    return "horizon" + "-".join(str(h) for h in horizons)
+
+def _default_utc_window(days_back: Optional[int] = None) -> tuple[str, str]:
+    days_back = LOOKBACK_DAYS if days_back is None else int(days_back)
+    end_dt = datetime.now(timezone.utc).replace(microsecond=0)
+    start_dt = end_dt - timedelta(days=days_back)
+    return (
+        start_dt.isoformat().replace("+00:00", "Z"),
+        end_dt.isoformat().replace("+00:00", "Z"),
+    )
 
 def get_entry_window_label(
     use_entry_time_window: bool = USE_ENTRY_TIME_WINDOW,
@@ -75,56 +118,60 @@ MYT = timezone(timedelta(hours=8), name="MYT")
 
 USE_MAE_MFE_STATS = False
 
-USE_DAILY_SIDE_BIAS = True
+USE_DAILY_SIDE_BIAS = False
 DAILY_BIAS_USE_MYT_DATE = True
-
-def _default_utc_window(days_back: int = LOOKBACK_DAYS) -> tuple[str, str]:
-    end_dt = datetime.now(timezone.utc).replace(microsecond=0)
-    start_dt = end_dt - timedelta(days=days_back)
-    return (
-        start_dt.isoformat().replace("+00:00", "Z"),
-        end_dt.isoformat().replace("+00:00", "Z"),
-    )
-
 
 GRID_START_DATE, GRID_END_DATE = _default_utc_window(LOOKBACK_DAYS)
 
-INSTRUMENT = "UK100"
+INSTRUMENT = "UK100"  # BTC, UK100, AUDJPY, USDCHF, XAUUSD
 INSTRUMENT_CONFIG = {
     "BTC": {
         "pair": "BTC",
         "mt5_symbol": "BTCUSD",
-        "tp_range": {"min": 0.7, "max": 0.7, "step": 0.1},
-        "sl_range": {"min": 1.4, "max": 1.4, "step": 0.1},
-        "horizon_hours_list": [24],
+        "spread_pct": 0.001,
+        "tp_range": {"min": 0.6, "max": 4.0, "step": 0.2},
+        "sl_range": {"min": 0.6, "max": 4.0, "step": 0.2},
+        "horizon_hours_list": [120],
     },
     "UK100": {
         "pair": "UK100",
-        "mt5_symbol": "UK100",
-        "tp_range": {"min": 0.05, "max": 0.60, "step": 0.01},
-        "sl_range": {"min": 0.05, "max": 0.60, "step": 0.01},
-        "horizon_hours_list": [24],
+        "mt5_symbol": "FTSE100",
+        "spread_pct": 0.007,
+        "tp_range": {"min": 0.05, "max": 0.70, "step": 0.02},
+        "sl_range": {"min": 0.05, "max": 0.70, "step": 0.02},
+        "horizon_hours_list": [12, 48],
     },
     "AUDJPY": {
         "pair": "AUDJPY",
         "mt5_symbol": "AUDJPY",
-        "tp_range": {"min": 0.15, "max": 0.15, "step": 0.01},
-        "sl_range": {"min": 0.20, "max": 0.20, "step": 0.01},
-        "horizon_hours_list": [8],
+        "spread_pct": 0.007,
+        "tp_range": {"min": 0.05, "max": 1.10, "step": 0.05},
+        "sl_range": {"min": 0.05, "max": 1.10, "step": 0.05},
+        "horizon_hours_list": [48],
     },
     "USDCHF": {
         "pair": "USDCHF",
         "mt5_symbol": "USDCHF",
-        "tp_range": {"min": 0.15, "max": 0.40, "step": 0.05},
-        "sl_range": {"min": 0.15, "max": 0.6, "step": 0.05},
-        "horizon_hours_list": [72],
+        "spread_pct": 0.005,
+        "tp_range": {"min": 0.05, "max": 0.50, "step": 0.02},
+        "sl_range": {"min": 0.05, "max": 0.50, "step": 0.02},
+        "horizon_hours_list": [48],
     },
     "XAUUSD": {
         "pair": "XAUUSD",
         "mt5_symbol": "XAUUSD",
-        "tp_range": {"min": 0.1, "max": 0.8, "step": 0.1},
-        "sl_range": {"min": 0.1, "max": 0.8, "step": 0.1},
-        "horizon_hours_list": [24],
+        "spread_pct": 0.02,
+        "tp_range": {"min": 0.2, "max": 4.2, "step": 0.1},
+        "sl_range": {"min": 0.2, "max": 4.2, "step": 0.1},
+        "horizon_hours_list": [48],
+    },
+    "EURJPY": {
+        "pair": "EURJPY",
+        "mt5_symbol": "EURJPY",
+        "spread_pct": 0.01,
+        "tp_range": {"min": 0.05, "max": 0.90, "step": 0.05},
+        "sl_range": {"min": 0.05, "max": 0.90, "step": 0.05},
+        "horizon_hours_list": [48],
     },
 }
 
@@ -134,7 +181,9 @@ if INSTRUMENT not in INSTRUMENT_CONFIG:
 CFG = INSTRUMENT_CONFIG[INSTRUMENT]
 PAIR = CFG["pair"]
 MT5_SYMBOL = CFG["mt5_symbol"]
+SPREAD_PCT = float(CFG.get("spread_pct", 0.0))
 HORIZON_HOURS_LIST = CFG["horizon_hours_list"]
+HORIZON_LABEL = get_horizon_label(HORIZON_HOURS_LIST)
 
 MT5_CHUNK_DAYS = 30
 
@@ -177,7 +226,6 @@ def _float_range_inclusive(start: float, stop: float, step: float) -> List[float
 
 TARGET_PCT_LIST = _float_range_inclusive(CFG["tp_range"]["min"], CFG["tp_range"]["max"], CFG["tp_range"]["step"])
 SL_PCT_LIST = _float_range_inclusive(CFG["sl_range"]["min"], CFG["sl_range"]["max"], CFG["sl_range"]["step"])
-
 
 def _parse_utc_dt(dt_in: Any) -> Optional[datetime]:
     if dt_in is None:
@@ -225,6 +273,7 @@ def _net_expectancy_risk_pct(
     sl_first_rate_pct: float,
     sl_pct: float,
     risk_pct: float = RISK_PCT,
+    spread_pct: float = 0.0,
 ) -> float:
     if sl_pct <= 0:
         raise ValueError("sl_pct must be > 0")
@@ -232,7 +281,8 @@ def _net_expectancy_risk_pct(
     tp_rate = target_first_rate_pct / 100.0
     sl_rate = sl_first_rate_pct / 100.0
     rr_multiple = float(target_pct) / float(sl_pct)
-    return (tp_rate * (risk_pct * rr_multiple * 100.0)) - (sl_rate * (risk_pct * 100.0))
+    spread_cost_pct = (float(spread_pct) / float(sl_pct)) * (risk_pct * 100.0) if spread_pct > 0 else 0.0
+    return (tp_rate * ((risk_pct * rr_multiple * 100.0) - spread_cost_pct)) - (sl_rate * ((risk_pct * 100.0) + spread_cost_pct))
 
 
 def _market_tag(instrument: str, pair: str, symbol: str) -> str:
@@ -289,4 +339,12 @@ def get_columns_to_remove() -> list[str]:
         "net_expectancy_risk_pct",
         "horizon_eligible_count",
         "horizon_eligible_rate_pct",
+        "after_loss_trigger_count",
+        "after_loss_skip_trades",
+        "anchors_total",
+        "target_first_count",
+        "sl_first_count",
+        "censored_count",
+        "target_first_then_sl_count",
+        "forced_exit_r_positive_count",
     ]

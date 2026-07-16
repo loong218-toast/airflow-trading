@@ -7,7 +7,7 @@ from pathlib import Path
 from airflow.sdk import Variable
 
 def profile_enabled() -> bool:
-    val = Variable.get("enable_cprofile", default="0").lower()
+    val = Variable.get("grid_enable_cprofile", default="0").lower()
     return val in ("1", "true", "yes")
 
 @contextmanager

@@ -1,3 +1,5 @@
+# metatrader_trades.py
+
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -19,11 +21,50 @@ BAR_TIMEFRAME = mt5.TIMEFRAME_M5
 # Per-symbol rules
 # tp_pct, sl_pct, spread_pct are in percent units
 # last_n_trades = -1 means keep all trades for that symbol
-SYMBOL_RULES: Dict[str, Dict[str, float]] = {
-    "UK100": {"tp_pct": 0.40, "sl_pct": 0.14, "spread_pct": 0.01, "last_n_trades": -1},
-    "AUDJPY": {"tp_pct": 0.07, "sl_pct": 0.28, "spread_pct": 0.01, "last_n_trades": -1},
-    "USDCHF": {"tp_pct": 0.07, "sl_pct": 0.20, "spread_pct": 0.02, "last_n_trades": 10},
+# MIX_BUY_SELL=True lets each symbol define separate buy/sell rules.
+MIX_BUY_SELL = True
+SYMBOL_RULES: Dict[str, Dict[str, Any]] = {
+    "FTSE100": {
+        "buy": {
+            "tp_pct": 0.28,
+            "sl_pct": 0.35,
+            "spread_pct": 0.007,
+        },
+        "sell": {
+            "tp_pct": 0.28,
+            "sl_pct": 0.35,
+            "spread_pct": 0.007,
+        },
+        "last_n_trades": -1,
+    },
+    "AUDJPY": {
+        "buy": {
+            "tp_pct": 0.40,
+            "sl_pct": 0.90,
+            "spread_pct": 0.007,
+        },
+        "sell": {
+            "tp_pct": 0.40,
+            "sl_pct": 0.90,
+            "spread_pct": 0.007,
+        },
+        "last_n_trades": -1,
+    },
+    "USDCHF": {
+        "buy": {
+            "tp_pct": 0.30,
+            "sl_pct": 0.80,
+            "spread_pct": 0.005,
+        },
+        "sell": {
+            "tp_pct": 0.30,
+            "sl_pct": 0.80,
+            "spread_pct": 0.005,
+        },
+        "last_n_trades": -1,
+    },
 }
+
 
 SYMBOL_FILTER: Optional[str] = None
 MAGIC_FILTER: Optional[int] = None
@@ -96,6 +137,16 @@ def round_pct(x: Any) -> Any:
         return x
     return round(float(x), 3)
 
+def _round_summary_numbers(df: pd.DataFrame, decimals: int = 3) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    for c in out.columns:
+        if c == "symbol":
+            continue
+        if pd.api.types.is_numeric_dtype(out[c]):
+            out[c] = out[c].round(decimals)
+    return out
 
 def _side_move_pct(side: int, entry_price: float, exit_price: float) -> float:
     if not np.isfinite(entry_price) or entry_price <= 0.0 or not np.isfinite(exit_price):
@@ -127,6 +178,26 @@ def symbol_last_n(symbol: str) -> int:
         return -1
     return int(rule.get("last_n_trades", -1))
 
+def trade_rule_for(symbol: str, side: int) -> Optional[Dict[str, Any]]:
+    rule = rule_for(symbol)
+    if rule is None:
+        return None
+
+    if not MIX_BUY_SELL or ("tp_pct" in rule and "sl_pct" in rule and "spread_pct" in rule):
+        return rule
+
+    side_key = "buy" if side == 1 else "sell"
+    side_rule = rule.get(side_key, {})
+    if not isinstance(side_rule, dict):
+        side_rule = {}
+
+    merged: Dict[str, Any] = {}
+    for key in ("tp_pct", "sl_pct", "spread_pct", "last_n_trades"):
+        if key in rule and key not in {"buy", "sell"}:
+            merged[key] = rule[key]
+    merged.update({k: v for k, v in side_rule.items() if v is not None})
+    return merged
+
 def _actual_exit_ratio(entry_price: float, exit_price: float) -> float:
     if not np.isfinite(entry_price) or entry_price <= 0.0 or not np.isfinite(exit_price):
         return np.nan
@@ -137,11 +208,16 @@ def append_csv_dedup(df: pd.DataFrame, file_path: Path, key_cols: List[str]) -> 
     if df.empty:
         return
 
+    df = df.copy()
+
     if file_path.exists():
         old = pd.read_csv(file_path)
+        old = old.reindex(columns=df.columns)
         combined = pd.concat([old, df], ignore_index=True)
     else:
         combined = df.copy()
+
+    combined = combined.reindex(columns=df.columns)
 
     keys = [c for c in key_cols if c in combined.columns]
     if keys:
@@ -401,19 +477,14 @@ def simulate_trade_m5(
         tp_price = ref_entry * (1.0 - tp_ratio)
         sl_price = ref_entry * (1.0 + sl_ratio)
 
-    bar_outcome = "not_hit_in_data"
-    sim_exit_price_used = np.nan
     sim_close_type = "not_hit_in_data"
+    sim_exit_price_used = np.nan
     sim_exit_time = pd.NaT
 
     if not replay.empty:
         for _, bar in replay.iterrows():
-            open_px = float(bar["open"])
-            close_px = float(bar["close"])
             high = float(bar["high"])
             low = float(bar["low"])
-
-            same_open_close = abs(open_px - close_px) <= 1e-12
 
             if side == 1:
                 tp_hit = high >= tp_price
@@ -423,28 +494,18 @@ def simulate_trade_m5(
                 sl_hit = high >= sl_price
 
             if tp_hit and sl_hit:
-                bar_outcome = "sl_same_bar"
                 sim_exit_price_used = sl_price
                 sim_close_type = "sl"
                 sim_exit_time = pd.Timestamp(bar["time"])
                 break
 
             if tp_hit:
-                bar_outcome = "tp_first"
                 sim_exit_price_used = tp_price
                 sim_close_type = "tp"
                 sim_exit_time = pd.Timestamp(bar["time"])
                 break
 
             if sl_hit:
-                bar_outcome = "sl_first"
-                sim_exit_price_used = sl_price
-                sim_close_type = "sl"
-                sim_exit_time = pd.Timestamp(bar["time"])
-                break
-
-            if same_open_close and (tp_hit or sl_hit):
-                bar_outcome = "sl_same_bar"
                 sim_exit_price_used = sl_price
                 sim_close_type = "sl"
                 sim_exit_time = pd.Timestamp(bar["time"])
@@ -452,7 +513,6 @@ def simulate_trade_m5(
 
     sim_gross_profit = np.nan
     sim_net_pnl = np.nan
-    net_delta = np.nan
     sim_pnl_pct = np.nan
 
     if sim_close_type in {"tp", "sl"}:
@@ -466,7 +526,6 @@ def simulate_trade_m5(
             sim_gross_profit = gross_profit_actual
 
         sim_net_pnl = sim_gross_profit + commission + swap + fee
-        net_delta = sim_net_pnl - (gross_profit_actual + commission + swap + fee)
 
     return {
         "ref_entry_price": round_price(ref_entry),
@@ -475,11 +534,9 @@ def simulate_trade_m5(
         "sim_exit_price_used": round_price(sim_exit_price_used),
         "sim_exit_time": sim_exit_time,
         "sim_close_type": sim_close_type,
-        "bar_outcome": bar_outcome,
         "sim_pnl_pct": round_pct(sim_pnl_pct),
         "sim_gross_profit": round_price(sim_gross_profit),
         "sim_net_pnl": round_price(sim_net_pnl),
-        "net_delta": round_price(net_delta),
     }
 
 
@@ -522,8 +579,7 @@ def simulate_trade_m5_avg_volume(
             **base,
             "avg_volume_used": round_price(avg_volume),
             "sim_avgvol_gross_profit": np.nan,
-            "sim_avgvol_net_pnl": np.nan,
-            "net_delta_avgvol": np.nan,
+            "sim_avgvol_pnl": np.nan,
         }
 
     sim_exit_price_used = float(base["sim_exit_price_used"])
@@ -544,15 +600,13 @@ def simulate_trade_m5_avg_volume(
         avg_swap = swap
         avg_fee = fee
 
-    sim_avgvol_net_pnl = sim_avgvol_gross_profit + avg_commission + avg_swap + avg_fee
-    net_delta_avgvol = sim_avgvol_net_pnl - (gross_profit_actual + commission + swap + fee)
+    sim_avgvol_pnl = sim_avgvol_gross_profit + avg_commission + avg_swap + avg_fee
 
     return {
         **base,
         "avg_volume_used": round_price(avg_volume),
         "sim_avgvol_gross_profit": round_price(sim_avgvol_gross_profit),
-        "sim_avgvol_net_pnl": round_price(sim_avgvol_net_pnl),
-        "net_delta_avgvol": round_price(net_delta_avgvol),
+        "sim_avgvol_pnl": round_price(sim_avgvol_pnl),
     }
 
 
@@ -575,12 +629,9 @@ def save_trade_history(deals_df: pd.DataFrame, closed_df: pd.DataFrame) -> None:
                 closed[col] = closed[col].apply(round_price)
         append_csv_dedup(closed, CLOSED_TRADES_FILE, key_cols=["position_id"])
 
-# =========================
-# SAVE HELPERS
-# =========================
 
-def _build_trade_table_columns() -> tuple[list[str], list[str]]:
-    pnl_cols = [
+def _trade_pnl_export_columns() -> list[str]:
+    return [
         "position_id",
         "symbol",
         "side",
@@ -590,56 +641,42 @@ def _build_trade_table_columns() -> tuple[list[str], list[str]]:
         "exit_price",
         "volume",
         "avg_volume_used",
-        "tp_pct",
-        "sl_pct",
-        "spread_pct",
         "actual_net_pnl",
-        "actual_trade_won",
-        "actual_tp_pct",
-        "actual_sl_pct",
+        "actual_avgvol_pnl",
         "sim_net_pnl",
-        "sim_avgvol_net_pnl",
-        "sim_trade_won",
-        "sim_tp_pct",
-        "sim_sl_pct",
-        "net_delta",
-        "net_delta_avgvol",
-        "sim_close_type",
-        "bar_outcome",
-    ]
-
-    excursion_cols = [
-        "position_id",
-        "symbol",
-        "side",
-        "entry_time",
-        "exit_time",
-        "entry_price",
-        "exit_price",
-        "volume",
-        "avg_volume_used",
-        "tp_pct",
-        "sl_pct",
-        "spread_pct",
+        "sim_avgvol_pnl",
         "actual_trade_won",
         "sim_trade_won",
         "actual_entry_revisit_mae_r",
         "actual_entry_revisit_mfe_r",
-        "actual_mae_win_r",
-        "actual_mae_loss_r",
-        "actual_mfe_win_r",
-        "actual_mfe_loss_r",
         "sim_entry_revisit_mae_r",
         "sim_entry_revisit_mfe_r",
-        "sim_mae_win_r",
-        "sim_mae_loss_r",
-        "sim_mfe_win_r",
-        "sim_mfe_loss_r",
-        "sim_close_type",
-        "bar_outcome",
     ]
 
-    return pnl_cols, excursion_cols
+
+def _prepare_trade_pnl_export(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    out = df.copy()
+    for col in ["avg_volume_used", "actual_avgvol_pnl", "sim_avgvol_pnl"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").round(3)
+
+    cols = [c for c in _trade_pnl_export_columns() if c in out.columns]
+    return out.loc[:, cols]
+
+
+def _prepare_symbol_summary_export(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    out = df.copy()
+    if "symbol" in out.columns:
+        cols = ["symbol"] + [c for c in out.columns if c != "symbol"]
+        out = out.loc[:, cols]
+    return out
+
 
 def _excursion_stats_from_path(
     side: int,
@@ -649,47 +686,91 @@ def _excursion_stats_from_path(
     tp_ratio: float,
     sl_ratio: float,
 ) -> Dict[str, Any]:
+    """Pre-resolution MAE/MFE.
+
+    This version does not use the old entry-revisit gate.
+    It measures the maximum adverse/favorable excursion on the path that the
+    caller already sliced to end at the first resolution event:
+    - TP hit
+    - SL hit
+    - or censor/time exit
+
+    That fixes:
+    - Case B: almost hit TP, then reversed to SL
+    - Case C: TP hit, then later price moved again (post-resolution bars are
+      not included because the caller should stop the path at the first exit)
+    """
     nan_out = {"mae_r": np.nan, "mfe_r": np.nan, "had_reset": False}
-    
-    if not np.isfinite(entry_price) or entry_price <= 0.0 or highs.size < 2:
+
+    if not np.isfinite(entry_price) or entry_price <= 0.0:
+        return nan_out
+    if tp_ratio <= 0.0 or sl_ratio <= 0.0:
+        return nan_out
+    if highs.size == 0 or lows.size == 0:
         return nan_out
 
-    num_bars = len(highs)
-    eligible_mae_rs = []
-    eligible_mfe_rs = []
-
-    # Iterate through all bars EXCEPT the very last one (the exit bar)
-    for i in range(num_bars - 1):
-        if side == 1: # BUY
-            has_revisit = any(lows[i:] <= entry_price)
-            curr_mae_raw = entry_price - lows[i]
-            curr_mfe_raw = highs[i] - entry_price
-        else: # SELL
-            has_revisit = any(highs[i:] >= entry_price)
-            curr_mae_raw = highs[i] - entry_price
-            curr_mfe_raw = entry_price - lows[i]
-
-        if has_revisit:
-            # Convert raw distances to R-multiples immediately
-            mae_r = (max(0.0, curr_mae_raw) / entry_price) / sl_ratio if sl_ratio > 0 else 0.0
-            mfe_r = (max(0.0, curr_mfe_raw) / entry_price) / tp_ratio if tp_ratio > 0 else 0.0
-            
-            eligible_mae_rs.append(mae_r)
-            eligible_mfe_rs.append(mfe_r)
-
-    if not eligible_mae_rs:
+    n = int(min(len(highs), len(lows)))
+    if n <= 0:
         return nan_out
 
-    # RANKING LOGIC: Pick the highest value in the list that is BELOW 1.0
-    # This filters out "Resolved" moves that happened to revisit entry
-    almost_mae = [r for r in eligible_mae_rs if r < 1.0]
-    almost_mfe = [r for r in eligible_mfe_rs if r < 1.0]
+    highs = np.asarray(highs[:n], dtype=np.float64)
+    lows = np.asarray(lows[:n], dtype=np.float64)
+
+    if side == 1:
+        mae_raw = np.maximum(0.0, entry_price - lows)
+        mfe_raw = np.maximum(0.0, highs - entry_price)
+    else:
+        mae_raw = np.maximum(0.0, highs - entry_price)
+        mfe_raw = np.maximum(0.0, entry_price - lows)
+
+    if mae_raw.size == 0 or mfe_raw.size == 0:
+        return nan_out
+
+    mae_max_raw = float(np.nanmax(mae_raw))
+    mfe_max_raw = float(np.nanmax(mfe_raw))
+
+    mae_r = (mae_max_raw / entry_price) / sl_ratio if sl_ratio > 0.0 else np.nan
+    mfe_r = (mfe_max_raw / entry_price) / tp_ratio if tp_ratio > 0.0 else np.nan
 
     return {
-        "mae_r": max(almost_mae) if almost_mae else np.nan,
-        "mfe_r": max(almost_mfe) if almost_mfe else np.nan,
-        "had_reset": True
+        "mae_r": float(mae_r) if np.isfinite(mae_r) else np.nan,
+        "mfe_r": float(mfe_r) if np.isfinite(mfe_r) else np.nan,
+        "had_reset": True,
     }
+
+
+def _summary_stats(df: pd.DataFrame) -> Dict[str, float]:
+    trades = len(df)
+    if trades == 0:
+        return {
+            "trades": 0,
+            "actual_win_rate": np.nan,
+            "sim_win_rate": np.nan,
+            "actual_net_expectancy": np.nan,
+            "sim_net_expectancy": np.nan,
+            "actual_avgvol_net_expectancy": np.nan,
+            "sim_avgvol_net_expectancy": np.nan,
+        }
+
+    actual_wins = pd.to_numeric(df["actual_trade_won"], errors="coerce").fillna(0.0)
+    sim_wins = pd.to_numeric(df["sim_trade_won"], errors="coerce").fillna(0.0)
+
+    actual_pnl = pd.to_numeric(df["actual_net_pnl"], errors="coerce").fillna(0.0)
+    sim_pnl = pd.to_numeric(df["sim_net_pnl"], errors="coerce").fillna(0.0)
+
+    actual_avgvol_pnl = pd.to_numeric(df["actual_avgvol_pnl"], errors="coerce").fillna(0.0)
+    sim_avgvol_pnl = pd.to_numeric(df["sim_avgvol_pnl"], errors="coerce").fillna(0.0)
+
+    return {
+        "trades": int(trades),
+        "actual_win_rate": float(actual_wins.mean() * 100.0),
+        "sim_win_rate": float(sim_wins.mean() * 100.0),
+        "actual_net_expectancy": float(actual_pnl.mean()),
+        "sim_net_expectancy": float(sim_pnl.mean()),
+        "actual_avgvol_net_expectancy": float(actual_avgvol_pnl.mean()),
+        "sim_avgvol_net_expectancy": float(sim_avgvol_pnl.mean()),
+    }
+
 
 def run() -> pd.DataFrame:
     init_mt5()
@@ -701,89 +782,154 @@ def run() -> pd.DataFrame:
         analysis_trades = all_trades_ever[all_trades_ever["symbol"].isin(SYMBOL_RULES.keys())].copy()
         analysis_trades = analysis_trades.sort_values(["entry_time", "position_id"]).reset_index(drop=True)
         trades_df = filter_last_n_per_symbol(analysis_trades)
-        if trades_df.empty: return pd.DataFrame()
+        if trades_df.empty:
+            return pd.DataFrame()
 
         bars_cache = build_bars_cache(trades_df)
         avg_volume_map = all_trades_ever.groupby("symbol")["volume"].mean().to_dict()
         results: List[Dict[str, Any]] = []
 
-        for idx, tr in trades_df.iterrows():
-            symbol, rule = str(tr["symbol"]), rule_for(str(tr["symbol"]))
+        for _, tr in trades_df.iterrows():
+            symbol = str(tr["symbol"])
+            side = int(tr["side"])
+            rule = trade_rule_for(symbol, side)
             symbol_bars = bars_cache.get(symbol)
-            if symbol_bars is None or symbol_bars.empty or rule is None: continue
+            if symbol_bars is None or symbol_bars.empty or rule is None:
+                continue
 
-            entry_time, exit_time = ensure_utc(tr["entry_time"]), ensure_utc(tr["exit_time"])
+            if not all(k in rule for k in ("tp_pct", "sl_pct", "spread_pct")):
+                continue
+
+            entry_time = ensure_utc(tr["entry_time"])
+            exit_time = ensure_utc(tr["exit_time"])
             entry_floor = floor_to_m5(entry_time)
-            entry_px, side, vol = float(tr["entry_price"]), int(tr["side"]), float(tr["volume"])
+            entry_px = float(tr["entry_price"])
+            vol = float(tr["volume"])
             avg_vol = float(avg_volume_map.get(symbol, vol))
-            tp_ratio, sl_ratio = pct_to_ratio(rule["tp_pct"]), pct_to_ratio(rule["sl_pct"])
 
-            sim = simulate_trade_m5_avg_volume(symbol, side, vol, avg_vol, entry_time, entry_px, 
-                                               tr["gross_profit"], tr["commission"], tr["swap"], tr["fee"],
-                                               rule["tp_pct"], rule["sl_pct"], rule["spread_pct"], symbol_bars)
+            tp_ratio = pct_to_ratio(rule["tp_pct"])
+            sl_ratio = pct_to_ratio(rule["sl_pct"])
+
+            sim = simulate_trade_m5_avg_volume(
+                symbol,
+                side,
+                vol,
+                avg_vol,
+                entry_time,
+                entry_px,
+                tr["gross_profit"],
+                tr["commission"],
+                tr["swap"],
+                tr["fee"],
+                rule["tp_pct"],
+                rule["sl_pct"],
+                rule["spread_pct"],
+                symbol_bars,
+            )
 
             act_path = symbol_bars[(symbol_bars["time"] >= entry_floor) & (symbol_bars["time"] <= exit_time)].copy()
-            act_exc = _excursion_stats_from_path(side, entry_px, act_path["high"].values, act_path["low"].values, tp_ratio, sl_ratio)
-            
+            act_exc = _excursion_stats_from_path(
+                side,
+                entry_px,
+                act_path["high"].values,
+                act_path["low"].values,
+                tp_ratio,
+                sl_ratio,
+            )
+
             sim_exit_t = ensure_utc(sim["sim_exit_time"]) if pd.notna(sim["sim_exit_time"]) else exit_time
             sim_path = symbol_bars[(symbol_bars["time"] >= entry_floor) & (symbol_bars["time"] <= sim_exit_t)].copy()
-            sim_exc = _excursion_stats_from_path(side, entry_px, sim_path["high"].values, sim_path["low"].values, tp_ratio, sl_ratio)
-
-            # --- DEBUG BLOCK (Fixed NameError) ---
-            DEBUG_POS_ID = 549566104 
-            if tr["position_id"] == DEBUG_POS_ID:
-                print(f"\n{'='*60}\nDEBUGGING POSITION: {DEBUG_POS_ID} | Side: {'BUY' if side==1 else 'SELL'}")
-                print(f"Entry Price: {entry_px} | 1.0R Distance (TP): {tp_ratio * entry_px:.4f}")
-                h_dbg, l_dbg, t_dbg = sim_path["high"].values, sim_path["low"].values, sim_path["time"].values
-                for i in range(len(h_dbg)):
-                    is_exit = (i == len(h_dbg) - 1)
-                    if side == 1:
-                        has_rev = any(l_dbg[i:] <= entry_px)
-                        r_mfe = ((h_dbg[i] - entry_px) / entry_px) / tp_ratio
-                    else:
-                        has_rev = any(h_dbg[i:] >= entry_px)
-                        r_mfe = ((entry_px - l_dbg[i]) / entry_px) / tp_ratio
-                    status = "EXIT" if is_exit else ("NOISE" if has_rev else "TREND")
-                    print(f"  {pd.Timestamp(t_dbg[i])} | MFE: {r_mfe:.3f}R | {status}")
-                print(f"FINAL (MAX < 1.0): {sim_exc['mfe_r']}\n{'='*60}")
+            sim_exc = _excursion_stats_from_path(
+                side,
+                entry_px,
+                sim_path["high"].values,
+                sim_path["low"].values,
+                tp_ratio,
+                sl_ratio,
+            )
 
             actual_won = _trade_won_by_price(side, entry_px, float(tr["exit_price"]))
-            results.append({
-                "position_id": tr["position_id"], "symbol": symbol, "side": side,
-                "entry_time": entry_time, "exit_time": exit_time,
-                "actual_net_pnl": tr["net_actual_pnl"], "actual_avgvol_pnl": tr["net_actual_pnl"] * (avg_vol/vol) if vol > 0 else 0,
-                "sim_net_pnl": sim["sim_net_pnl"], "sim_avgvol_net_pnl": sim["sim_avgvol_net_pnl"],
-                "actual_trade_won": actual_won, "sim_trade_won": (sim["sim_close_type"] == "tp"),
-                "actual_entry_revisit_mae_r": round_price(act_exc["mae_r"]) if not actual_won else np.nan,
-                "actual_entry_revisit_mfe_r": round_price(act_exc["mfe_r"]) if actual_won else np.nan,
-                "sim_entry_revisit_mae_r": round_price(sim_exc["mae_r"]),
-                "sim_entry_revisit_mfe_r": round_price(sim_exc["mfe_r"]),
-                "sim_close_type": sim["sim_close_type"], "volume": vol, "avg_volume_used": avg_vol
-            })
+
+            results.append(
+                {
+                    "position_id": tr["position_id"],
+                    "symbol": symbol,
+                    "side": side,
+                    "entry_time": entry_time,
+                    "exit_time": exit_time,
+                    "entry_price": entry_px,
+                    "exit_price": float(tr["exit_price"]),
+                    "volume": vol,
+                    "avg_volume_used": avg_vol,
+                    "actual_net_pnl": float(tr["net_actual_pnl"]),
+                    "actual_avgvol_pnl": float(tr["net_actual_pnl"]) * (avg_vol / vol) if vol > 0 else np.nan,
+                    "sim_net_pnl": sim["sim_net_pnl"],
+                    "sim_avgvol_pnl": sim["sim_avgvol_pnl"],
+                    "actual_trade_won": actual_won,
+                    "sim_trade_won": sim["sim_close_type"] == "tp",
+                    "actual_entry_revisit_mae_r": round_price(act_exc["mae_r"]),
+                    "actual_entry_revisit_mfe_r": round_price(act_exc["mfe_r"]),
+                    "sim_entry_revisit_mae_r": round_price(sim_exc["mae_r"]),
+                    "sim_entry_revisit_mfe_r": round_price(sim_exc["mfe_r"]),
+                }
+            )
 
         res_df = pd.DataFrame(results)
-        if res_df.empty: return res_df
+        if res_df.empty:
+            return res_df
 
-        append_csv_dedup(res_df.drop(columns=[c for c in res_df.columns if "revisit" in c]), PNL_DETAIL_FILE, ["position_id"])
-        exc_cols = ["position_id", "symbol", "side", "entry_time", "exit_time", "actual_trade_won", "sim_trade_won", 
-                    "actual_entry_revisit_mae_r", "actual_entry_revisit_mfe_r", 
-                    "sim_entry_revisit_mae_r", "sim_entry_revisit_mfe_r", "sim_close_type"]
-        append_csv_dedup(res_df[exc_cols], EXCURSION_DETAIL_FILE, ["position_id"])
+        pnl_export_df = _prepare_trade_pnl_export(res_df)
+        append_csv_dedup(pnl_export_df, PNL_DETAIL_FILE, ["position_id"])
 
-        ov = {"trades": len(res_df), "act_pnl": res_df["actual_net_pnl"].sum(), "act_avgvol_pnl": res_df["actual_avgvol_pnl"].sum(),
-              "sim_pnl": res_df["sim_net_pnl"].sum(), "sim_avgvol_pnl": res_df["sim_avgvol_net_pnl"].sum()}
-        pd.DataFrame([ov]).to_csv(OVERVIEW_FILE, index=False)
+        exc_export_cols = [
+            "position_id",
+            "symbol",
+            "side",
+            "entry_time",
+            "exit_time",
+            "actual_trade_won",
+            "sim_trade_won",
+            "actual_entry_revisit_mae_r",
+            "actual_entry_revisit_mfe_r",
+            "sim_entry_revisit_mae_r",
+            "sim_entry_revisit_mfe_r",
+        ]
+        append_csv_dedup(res_df.reindex(columns=exc_export_cols), EXCURSION_DETAIL_FILE, ["position_id"])
+
+        ov = _summary_stats(res_df)
+        ov.update(
+            {
+                "actual_total_net_pnl": float(pd.to_numeric(res_df["actual_net_pnl"], errors="coerce").fillna(0.0).sum()),
+                "sim_total_net_pnl": float(pd.to_numeric(res_df["sim_net_pnl"], errors="coerce").fillna(0.0).sum()),
+                "actual_total_avgvol_net_pnl": float(pd.to_numeric(res_df["actual_avgvol_pnl"], errors="coerce").fillna(0.0).sum()),
+                "sim_total_avgvol_net_pnl": float(pd.to_numeric(res_df["sim_avgvol_pnl"], errors="coerce").fillna(0.0).sum()),
+            }
+        )
+        _round_summary_numbers(pd.DataFrame([ov])).to_csv(OVERVIEW_FILE, index=False)
 
         s_rows = []
         for sym, g in res_df.groupby("symbol"):
-            s_rows.append({"symbol": sym, "trades": len(g), "avg_vol": g["avg_volume_used"].mean(), "actual_avg_vol": g["volume"].mean(),
-                           "actual_pnl": g["actual_net_pnl"].sum(), "avgvol_act_pnl": g["actual_avgvol_pnl"].sum(),
-                           "sim_pnl": g["sim_net_pnl"].sum(), "avgvol_sim_pnl": g["sim_avgvol_net_pnl"].sum()})
-        pd.DataFrame(s_rows).to_csv(SUMMARY_FILE, index=False)
+            stats = _summary_stats(g)
+            stats.update(
+                {
+                    "symbol": sym,
+                    "avg_vol": float(pd.to_numeric(g["avg_volume_used"], errors="coerce").mean()),
+                    "actual_avg_vol": float(pd.to_numeric(g["volume"], errors="coerce").mean()),
+                    "actual_total_net_pnl": float(pd.to_numeric(g["actual_net_pnl"], errors="coerce").fillna(0.0).sum()),
+                    "sim_total_net_pnl": float(pd.to_numeric(g["sim_net_pnl"], errors="coerce").fillna(0.0).sum()),
+                    "actual_total_avgvol_net_pnl": float(pd.to_numeric(g["actual_avgvol_pnl"], errors="coerce").fillna(0.0).sum()),
+                    "sim_total_avgvol_net_pnl": float(pd.to_numeric(g["sim_avgvol_pnl"], errors="coerce").fillna(0.0).sum()),
+                }
+            )
+            s_rows.append(stats)
+
+        summary_export = _prepare_symbol_summary_export(pd.DataFrame(s_rows))
+        _round_summary_numbers(summary_export).to_csv(SUMMARY_FILE, index=False)
 
         return res_df
     finally:
         mt5.shutdown()
+
 
 if __name__ == "__main__":
     run()
